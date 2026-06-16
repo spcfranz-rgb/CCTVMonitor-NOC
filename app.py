@@ -109,6 +109,7 @@ def init_db():
     
     conn.commit()
     conn.close()
+    print("Database initialized.")
 
 # ==========================================
 # BACKGROUND MONITORING TASK
@@ -128,6 +129,7 @@ def is_stream_active(url):
         return False
 
 def monitor_loop():
+    print("Starting background monitoring thread...")
     while True:
         try:
             conn = get_db()
@@ -184,6 +186,7 @@ def monitor_loop():
             client.disconnect()
             time.sleep(interval)
         except Exception as e:
+            print(f"Error in monitor loop: {e}")
             time.sleep(10)
 
 # ==========================================
@@ -194,15 +197,18 @@ def login():
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
+        
         conn = get_db()
         user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
         conn.close()
+        
         if user and check_password_hash(user['password'], password):
             user_obj = User(user['id'], user['username'], user['role'])
             login_user(user_obj)
             return redirect(url_for('index'))
         else:
             flash('Invalid username or password', 'danger')
+            
     return render_template('login.html')
 
 @app.route('/logout')
@@ -240,6 +246,7 @@ def api_status():
         status_data[f"switch_{s['id']}"] = s['status']
     for c in cameras:
         status_data[f"camera_{c['id']}"] = c['status']
+        
     return jsonify(status_data)
 
 @app.route('/api/ping', methods=['POST'])
@@ -249,13 +256,16 @@ def manual_ping():
     ip = request.form.get('ip')
     if not ip:
         return jsonify({'success': False, 'output': 'No IP address provided.'})
+
     try:
         cmd = ['ping', '-c', '4', '-W', '2', ip]
         process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+
         if process.returncode == 0:
             return jsonify({'success': True, 'output': process.stdout})
         else:
             return jsonify({'success': False, 'output': process.stdout or process.stderr or 'Ping failed.'})
+            
     except subprocess.TimeoutExpired:
         return jsonify({'success': False, 'output': 'Ping command timed out.'})
     except Exception as e:
@@ -323,6 +333,7 @@ def edit_switch(id):
         conn.close()
         flash('Switch updated.', 'success')
         return redirect(url_for('index'))
+    
     switch = conn.execute("SELECT * FROM switches WHERE id = ?", (id,)).fetchone()
     conn.close()
     return render_template('edit_switch.html', switch=switch)
@@ -449,6 +460,8 @@ def snapshot(id):
         elif mfg == 'Foscam':
             url = f"http://{ip}/cgi-bin/CGIProxy.fcgi?cmd=snapPicture2&usr={user}&pwd={pwd}"
             auth_in_url = True
+        elif mfg == 'Hanwha':
+            url = f"http://{ip}/stw-cgi/video.cgi?msubmenu=snapshot&action=view&Profile=1"
             
         if url:
             try:
@@ -497,6 +510,7 @@ def proxy_request(device_type, device_id, req_path, method, headers, data, cooki
     if not device:
         return "Device not found", 404
 
+    # --- SECURITY HARDENING: SSRF PROTECTION ---
     try:
         ip_obj = ipaddress.ip_address(device['ip'])
         if not ip_obj.is_private or ip_obj.is_loopback:
@@ -553,7 +567,10 @@ def proxy_absolute_paths(e):
     return "404 - Not Found", 404
 
 if __name__ == '__main__':
+    # Initialize the DB and Background tasks
     init_db()
     monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
     monitor_thread.start()
+    
+    # We leave this here so you can still run `python app.py` locally if not using Docker
     app.run(host='0.0.0.0', port=5000, debug=False)

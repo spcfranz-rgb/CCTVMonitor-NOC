@@ -102,6 +102,23 @@
             </div>
 
             <div class="card mb-4">
+                <div class="card-header"><h5 class="mb-0">Manual Diagnostic Tool</h5></div>
+                <div class="card-body">
+                    <div class="input-group mb-3">
+                        <input type="text" id="manualPingIp" class="form-control form-control-sm" placeholder="IP Address (e.g. 192.168.1.5)">
+                        <button class="btn btn-outline-info btn-sm" type="button" id="manualPingBtn" onclick="runManualPing()">Ping</button>
+                    </div>
+                    
+                    <div id="pingSpinner" class="text-center d-none mb-2">
+                        <div class="spinner-border spinner-border-sm text-info" role="status"></div>
+                        <span class="ms-2 small text-muted">Sending 4 packets...</span>
+                    </div>
+                    
+                    <pre id="pingOutput" class="bg-black text-light p-2 rounded small d-none" style="max-height: 200px; overflow-y: auto; font-size: 0.75rem; white-space: pre-wrap;"></pre>
+                </div>
+            </div>
+
+            <div class="card mb-4">
                 <div class="card-header"><h5 class="mb-0">User Management</h5></div>
                 <div class="card-body">
                     <table class="table table-sm align-middle">
@@ -291,6 +308,65 @@
         }
 
         setInterval(updateStatuses, 15000);
+    </script>
+
+    <script>
+        function runManualPing() {
+            const ipInput = document.getElementById('manualPingIp');
+            const btn = document.getElementById('manualPingBtn');
+            const spinner = document.getElementById('pingSpinner');
+            const output = document.getElementById('pingOutput');
+            const ip = ipInput.value.trim();
+
+            if (!ip) {
+                alert('Please enter an IP address.');
+                return;
+            }
+
+            btn.disabled = true;
+            ipInput.disabled = true;
+            spinner.classList.remove('d-none');
+            output.classList.add('d-none');
+            output.textContent = '';
+
+            const formData = new FormData();
+            formData.append('ip', ip);
+
+            fetch('/api/ping', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                output.textContent = data.output;
+                if (data.success) {
+                    output.classList.remove('text-danger');
+                    output.classList.add('text-success');
+                } else {
+                    output.classList.remove('text-success');
+                    output.classList.add('text-danger');
+                }
+                output.classList.remove('d-none');
+            })
+            .catch(error => {
+                output.textContent = 'Network Error: ' + error;
+                output.classList.remove('text-success');
+                output.classList.add('text-danger');
+                output.classList.remove('d-none');
+            })
+            .finally(() => {
+                btn.disabled = false;
+                ipInput.disabled = false;
+                spinner.classList.add('d-none');
+            });
+        }
+        
+        document.getElementById("manualPingIp").addEventListener("keypress", function(event) {
+            if (event.key === "Enter") {
+                event.preventDefault();
+                document.getElementById("manualPingBtn").click();
+            }
+        });
     </script>
 </body>
 </html>

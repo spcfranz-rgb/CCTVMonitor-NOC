@@ -121,7 +121,6 @@ def init_db():
         default_hash = generate_password_hash(default_pass)
         cursor.execute("INSERT INTO users (username, password, role) VALUES (?, ?, 'admin')", (default_user, default_hash))
     
-    # Ensure any stale flags are cleared on boot
     if os.path.exists(FORCE_CHECK_FLAG):
         try: os.remove(FORCE_CHECK_FLAG)
         except OSError: pass
@@ -185,7 +184,8 @@ def monitor_loop():
                 
                 is_up = is_pingable(switch_ip) or is_port_open(switch_ip, 80) or is_port_open(switch_ip, 443)
                 
-                switch_payload = "MAINTENANCE" if silenced else (1 if is_up else 0)
+                # STRING UPDATES FOR SWITCH
+                switch_payload = "MAINTENANCE" if silenced else ("UP" if is_up else "OFFLINE")
                 client.publish(f"{prefix}/{switch_name}/ping", switch_payload, retain=True)
                 
                 if is_up:
@@ -207,8 +207,9 @@ def monitor_loop():
                                 client.publish(f"{prefix}/{cam_name}/stream", "MAINTENANCE", retain=True)
                                 cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('UP (Silenced)' if stream_ok else 'STREAM ERR (Silenced)', cam_id))
                             else:
-                                client.publish(f"{prefix}/{cam_name}/ping", 1, retain=True)
-                                client.publish(f"{prefix}/{cam_name}/stream", 1 if stream_ok else 0, retain=True)
+                                # STRING UPDATES FOR HEALTHY CAMERA
+                                client.publish(f"{prefix}/{cam_name}/ping", "UP", retain=True)
+                                client.publish(f"{prefix}/{cam_name}/stream", "UP" if stream_ok else "STREAM_ERROR", retain=True)
                                 cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('UP' if stream_ok else 'DOWN (Stream Error)', cam_id))
                         else:
                             if cam_silenced:
@@ -216,8 +217,9 @@ def monitor_loop():
                                 client.publish(f"{prefix}/{cam_name}/stream", "MAINTENANCE", retain=True)
                                 cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('DOWN (Silenced)', cam_id))
                             else:
-                                client.publish(f"{prefix}/{cam_name}/ping", 0, retain=True)
-                                client.publish(f"{prefix}/{cam_name}/stream", 0, retain=True)
+                                # STRING UPDATES FOR DEAD CAMERA
+                                client.publish(f"{prefix}/{cam_name}/ping", "OFFLINE", retain=True)
+                                client.publish(f"{prefix}/{cam_name}/stream", "OFFLINE", retain=True)
                                 cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('DOWN (Offline)', cam_id))
                 else:
                     cursor.execute("UPDATE switches SET status = ? WHERE id = ?", ('DOWN' if not silenced else 'DOWN (Silenced)', switch_id))
@@ -239,8 +241,9 @@ def monitor_loop():
                         client.publish(f"{prefix}/{cam_name}/stream", "MAINTENANCE", retain=True)
                         cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('UP (Silenced)' if stream_ok else 'STREAM ERR (Silenced)', cam_id))
                     else:
-                        client.publish(f"{prefix}/{cam_name}/ping", 1, retain=True)
-                        client.publish(f"{prefix}/{cam_name}/stream", 1 if stream_ok else 0, retain=True)
+                        # STRING UPDATES FOR HEALTHY STANDALONE
+                        client.publish(f"{prefix}/{cam_name}/ping", "UP", retain=True)
+                        client.publish(f"{prefix}/{cam_name}/stream", "UP" if stream_ok else "STREAM_ERROR", retain=True)
                         cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('UP' if stream_ok else 'DOWN (Stream Error)', cam_id))
                 else:
                     if cam_silenced:
@@ -248,8 +251,9 @@ def monitor_loop():
                         client.publish(f"{prefix}/{cam_name}/stream", "MAINTENANCE", retain=True)
                         cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('DOWN (Silenced)', cam_id))
                     else:
-                        client.publish(f"{prefix}/{cam_name}/ping", 0, retain=True)
-                        client.publish(f"{prefix}/{cam_name}/stream", 0, retain=True)
+                        # STRING UPDATES FOR DEAD STANDALONE
+                        client.publish(f"{prefix}/{cam_name}/ping", "OFFLINE", retain=True)
+                        client.publish(f"{prefix}/{cam_name}/stream", "OFFLINE", retain=True)
                         cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('DOWN (Offline)', cam_id))
 
             conn.commit()
@@ -259,18 +263,16 @@ def monitor_loop():
         except Exception as e:
             print(f"Error in monitor loop: {e}")
             time.sleep(10)
-            continue # Ensure we don't proceed to sleep loop if we crashed
+            continue
             
         # 3. INTERRUPTIBLE SLEEP CYCLE
-        # We loop exactly 'interval' times, sleeping 1 second at a time.
-        # This allows us to instantly break the sleep if the IPC flag appears.
         for _ in range(interval):
             if os.path.exists(FORCE_CHECK_FLAG):
                 try:
                     os.remove(FORCE_CHECK_FLAG)
                 except OSError:
                     pass
-                break # Instantly triggers the next network scan
+                break
             time.sleep(1)
 
 # ==========================================
@@ -409,7 +411,8 @@ def test_alert():
         client = mqtt.Client("camera_monitor_test")
         client.connect(broker, port, 5)
         test_topic = f"{prefix}/test_device/ping"
-        client.publish(test_topic, 0, retain=False)
+        # UPDATED PAYLOAD FOR THE TEST BUTTON
+        client.publish(test_topic, "TEST_PING", retain=False)
         client.disconnect()
         flash(f'Success! Test alert sent to {test_topic}', 'success')
     except Exception as e:

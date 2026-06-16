@@ -4,10 +4,45 @@ import sqlite3
 import subprocess
 import threading
 import paho.mqtt.client as mqtt
-from flask import Flask, render_template, request, redirect, url_for
+from functools import wraps
+from flask import Flask, render_template, request, redirect, url_for, abort, flash
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
+# Secret key is required for Flask-Login session cookies
+app.secret_key = os.environ.get('SECRET_KEY', 'cctv-super-secret-key') 
 DB_PATH = '/app/data/cctv.db'
+
+# ==========================================
+# AUTHENTICATION SETUP
+# ==========================================
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+
+class User(UserMixin):
+    def __init__(self, id, username, role):
+        self.id = id
+        self.username = username
+        self.role = role
+
+@login_manager.user_loader
+def load_user(user_id):
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    conn.close()
+    if user:
+        return User(user['id'], user['username'], user['role'])
+    return None
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if current_user.role != 'admin':
+            abort(403) # Forbidden
+        return f(*args, **kwargs)
+    return decorated_function
 
 # ==========================================
 # DATABASE INITIALIZATION
@@ -33,7 +68,12 @@ def init_db():
         ip TEXT, stream_url TEXT, status TEXT DEFAULT 'UNKNOWN',
         FOREIGN KEY(switch_id) REFERENCES switches(id)
     )""")
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT, role TEXT
+    )""")
     
+    # Insert Default Settings
     cursor.execute("SELECT count(*) FROM settings")
     if cursor.fetchone()[0] == 0:
         settings = [
@@ -43,13 +83,19 @@ def init_db():
             ('check_interval', '60')
         ]
         cursor.executemany("INSERT INTO settings (key, value) VALUES (?, ?)", settings)
+        
+    # Insert Default Admin Account (admin / admin)
+    cursor.execute("SELECT count(*) FROM users")
+    if cursor.fetchone()[0] == 0:
+        default_hash = generate_password_hash('admin')
+        cursor.execute("INSERT INTO users (username, password, role) VALUES (?, ?, 'admin')", ('admin', default_hash))
     
     conn.commit()
     conn.close()
     print("Database initialized.")
 
 # ==========================================
-# BACKGROUND MONITORING TASK
+# BACKGROUND MONITORING TASK (Unchanged)
 # ==========================================
 def is_pingable(ip):
     response = subprocess.call(['ping', '-c', '1', '-W', '2', ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -83,7 +129,7 @@ def monitor_loop():
             try:
                 client.connect(broker, port, 60)
             except Exception as e:
-                print(f"MQTT Connect failed: {e}")
+                pass
             
             cursor.execute("SELECT id, name, ip FROM switches")
             switches = cursor.fetchall()
@@ -130,7 +176,33 @@ def monitor_loop():
 # ==========================================
 # FLASK WEB ROUTES
 # ==========================================
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        
+        conn = get_db()
+        user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        conn.close()
+        
+        if user and check_password_hash(user['password'], password):
+            user_obj = User(user['id'], user['username'], user['role'])
+            login_user(user_obj)
+            return redirect(url_for('index'))
+        else:
+            flash('Invalid username or password')
+            
+    return render_template('login.html')
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('login'))
+
 @app.route('/')
+@login_required
 def index():
     conn = get_db()
     switches = conn.execute("SELECT * FROM switches").fetchall()
@@ -142,11 +214,15 @@ def index():
     cursor = conn.cursor()
     cursor.execute("SELECT key, value FROM settings")
     settings_dict = {row['key']: row['value'] for row in cursor.fetchall()}
+    
+    users = conn.execute("SELECT id, username, role FROM users").fetchall()
     conn.close()
     
-    return render_template('index.html', switches=switches, cameras=cameras, settings=settings_dict)
+    return render_template('index.html', switches=switches, cameras=cameras, settings=settings_dict, users=users)
 
 @app.route('/update_settings', methods=['POST'])
+@login_required
+@admin_required
 def update_settings():
     conn = get_db()
     conn.execute("UPDATE settings SET value = ? WHERE key = 'mqtt_broker'", (request.form['mqtt_broker'],))
@@ -158,6 +234,8 @@ def update_settings():
     return redirect(url_for('index'))
 
 @app.route('/add_switch', methods=['POST'])
+@login_required
+@admin_required
 def add_switch():
     conn = get_db()
     conn.execute("INSERT INTO switches (name, ip) VALUES (?, ?)", (request.form['name'], request.form['ip']))
@@ -166,6 +244,8 @@ def add_switch():
     return redirect(url_for('index'))
 
 @app.route('/add_camera', methods=['POST'])
+@login_required
+@admin_required
 def add_camera():
     conn = get_db()
     conn.execute("INSERT INTO cameras (switch_id, name, ip, stream_url) VALUES (?, ?, ?, ?)", 
@@ -175,6 +255,8 @@ def add_camera():
     return redirect(url_for('index'))
 
 @app.route('/delete_camera/<int:id>')
+@login_required
+@admin_required
 def delete_camera(id):
     conn = get_db()
     conn.execute("DELETE FROM cameras WHERE id = ?", (id,))
@@ -183,10 +265,41 @@ def delete_camera(id):
     return redirect(url_for('index'))
 
 @app.route('/delete_switch/<int:id>')
+@login_required
+@admin_required
 def delete_switch(id):
     conn = get_db()
     conn.execute("DELETE FROM cameras WHERE switch_id = ?", (id,))
     conn.execute("DELETE FROM switches WHERE id = ?", (id,))
+    conn.commit()
+    conn.close()
+    return redirect(url_for('index'))
+
+@app.route('/add_user', methods=['POST'])
+@login_required
+@admin_required
+def add_user():
+    username = request.form['username']
+    password = generate_password_hash(request.form['password'])
+    role = request.form['role']
+    conn = get_db()
+    try:
+        conn.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", (username, password, role))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass # Username already exists
+    conn.close()
+    return redirect(url_for('index'))
+
+@app.route('/delete_user/<int:id>')
+@login_required
+@admin_required
+def delete_user(id):
+    # Prevent deleting yourself
+    if id == current_user.id:
+        return redirect(url_for('index'))
+    conn = get_db()
+    conn.execute("DELETE FROM users WHERE id = ?", (id,))
     conn.commit()
     conn.close()
     return redirect(url_for('index'))

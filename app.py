@@ -181,6 +181,38 @@ def monitor_loop():
 # ==========================================
 # FLASK WEB ROUTES
 # ==========================================
+@app.route('/edit_switch/<int:id>', methods=['GET', 'POST'])
+@login_required
+@admin_required
+def edit_switch(id):
+    conn = get_db()
+    if request.method == 'POST':
+        conn.execute("UPDATE switches SET name = ?, ip = ? WHERE id = ?", 
+                     (request.form['name'], request.form['ip'], id))
+        conn.commit()
+        conn.close()
+        return redirect(url_for('index'))
+    
+    switch = conn.execute("SELECT * FROM switches WHERE id = ?", (id,)).fetchone()
+    conn.close()
+    return render_template('edit_switch.html', switch=switch)
+
+@app.route('/edit_camera/<int:id>', methods=['GET', 'POST'])
+@login_required
+@admin_required
+def edit_camera(id):
+    conn = get_db()
+    if request.method == 'POST':
+        conn.execute("UPDATE cameras SET switch_id = ?, name = ?, ip = ?, stream_url = ? WHERE id = ?", 
+                     (request.form['switch_id'], request.form['name'], request.form['ip'], request.form['stream_url'], id))
+        conn.commit()
+        conn.close()
+        return redirect(url_for('index'))
+    
+    camera = conn.execute("SELECT * FROM cameras WHERE id = ?", (id,)).fetchone()
+    switches = conn.execute("SELECT * FROM switches").fetchall()
+    conn.close()
+    return render_template('edit_camera.html', camera=camera, switches=switches)
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':

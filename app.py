@@ -23,12 +23,13 @@ app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE'] = os.environ.get('REQUIRE_HTTPS', 'False').lower() == 'true'
 
 # ==========================================
-# AUTHENTICATION SETUP
+# AUTHENTICATION & GLOBALS
 # ==========================================
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = 'login'
 DB_PATH = '/app/data/cctv.db'
+FORCE_CHECK_FLAG = '/app/data/force_check.flag'
 
 class User(UserMixin):
     def __init__(self, id, username, role):
@@ -52,6 +53,13 @@ def admin_required(f):
             abort(403)
         return f(*args, **kwargs)
     return decorated_function
+
+def trigger_monitor_check():
+    """Drops an IPC flag to immediately wake up the background monitor process."""
+    try:
+        open(FORCE_CHECK_FLAG, 'w').close()
+    except Exception:
+        pass
 
 # ==========================================
 # DATABASE INITIALIZATION
@@ -113,6 +121,11 @@ def init_db():
         default_hash = generate_password_hash(default_pass)
         cursor.execute("INSERT INTO users (username, password, role) VALUES (?, ?, 'admin')", (default_user, default_hash))
     
+    # Ensure any stale flags are cleared on boot
+    if os.path.exists(FORCE_CHECK_FLAG):
+        try: os.remove(FORCE_CHECK_FLAG)
+        except OSError: pass
+
     conn.commit()
     conn.close()
     print("Database initialized.")
@@ -210,7 +223,7 @@ def monitor_loop():
                     cursor.execute("UPDATE switches SET status = ? WHERE id = ?", ('DOWN' if not silenced else 'DOWN (Silenced)', switch_id))
                     cursor.execute("UPDATE cameras SET status = ? WHERE switch_id = ?", ('UNREACHABLE (Switch Down)' if not silenced else 'UNREACHABLE (Silenced)', switch_id))
 
-            # 2. PROCESS STANDALONE CAMERAS (No switch attached)
+            # 2. PROCESS STANDALONE CAMERAS
             cursor.execute("SELECT * FROM cameras WHERE switch_id IS NULL OR switch_id = ''")
             standalone_cameras = cursor.fetchall()
             for cam in standalone_cameras:
@@ -242,10 +255,23 @@ def monitor_loop():
             conn.commit()
             conn.close()
             client.disconnect()
-            time.sleep(interval)
+            
         except Exception as e:
             print(f"Error in monitor loop: {e}")
             time.sleep(10)
+            continue # Ensure we don't proceed to sleep loop if we crashed
+            
+        # 3. INTERRUPTIBLE SLEEP CYCLE
+        # We loop exactly 'interval' times, sleeping 1 second at a time.
+        # This allows us to instantly break the sleep if the IPC flag appears.
+        for _ in range(interval):
+            if os.path.exists(FORCE_CHECK_FLAG):
+                try:
+                    os.remove(FORCE_CHECK_FLAG)
+                except OSError:
+                    pass
+                break # Instantly triggers the next network scan
+            time.sleep(1)
 
 # ==========================================
 # FLASK WEB ROUTES
@@ -282,7 +308,6 @@ def index():
     conn = get_db()
     switches = conn.execute("SELECT *, (silenced_until > ?) as is_silenced FROM switches", (now,)).fetchall()
     
-    # Use a LEFT JOIN so cameras without a switch still render on the page
     cameras = conn.execute("""
         SELECT c.*, s.name as switch_name, (c.silenced_until > ?) as is_silenced 
         FROM cameras c 
@@ -327,6 +352,8 @@ def toggle_silence(device_type, id):
         conn.execute("UPDATE cameras SET silenced_until = ? WHERE id = ?", (silence_until, id))
     conn.commit()
     conn.close()
+    
+    trigger_monitor_check()
     return jsonify({'success': True})
 
 @app.route('/api/ping', methods=['POST'])
@@ -359,7 +386,9 @@ def update_settings():
     conn.execute("UPDATE settings SET value = ? WHERE key = 'check_interval'", (request.form['check_interval'],))
     conn.commit()
     conn.close()
-    flash('Settings updated successfully.', 'success')
+    
+    trigger_monitor_check()
+    flash('Settings updated. Immediate network scan triggered.', 'success')
     return redirect(url_for('index'))
 
 @app.route('/test_alert', methods=['POST'])
@@ -396,6 +425,8 @@ def add_switch():
     conn.execute("INSERT INTO switches (name, ip) VALUES (?, ?)", (request.form['name'], request.form['ip']))
     conn.commit()
     conn.close()
+    
+    trigger_monitor_check()
     flash('Switch added.', 'success')
     return redirect(url_for('index'))
 
@@ -408,6 +439,8 @@ def edit_switch(id):
         conn.execute("UPDATE switches SET name = ?, ip = ? WHERE id = ?", (request.form['name'], request.form['ip'], id))
         conn.commit()
         conn.close()
+        
+        trigger_monitor_check()
         flash('Switch updated.', 'success')
         return redirect(url_for('index'))
     switch = conn.execute("SELECT * FROM switches WHERE id = ?", (id,)).fetchone()
@@ -423,6 +456,8 @@ def delete_switch(id):
     conn.execute("DELETE FROM switches WHERE id = ?", (id,))
     conn.commit()
     conn.close()
+    
+    trigger_monitor_check()
     flash('Switch deleted.', 'success')
     return redirect(url_for('index'))
 
@@ -431,7 +466,7 @@ def delete_switch(id):
 @admin_required
 def add_camera():
     switch_id = request.form.get('switch_id')
-    switch_id = switch_id if switch_id else None  # Converts an empty string to proper SQL NULL
+    switch_id = switch_id if switch_id else None
 
     conn = get_db()
     conn.execute("""
@@ -442,6 +477,8 @@ def add_camera():
           request.form.get('username', ''), request.form.get('password', '')))
     conn.commit()
     conn.close()
+    
+    trigger_monitor_check()
     flash('Camera added.', 'success')
     return redirect(url_for('index'))
 
@@ -452,7 +489,7 @@ def edit_camera(id):
     conn = get_db()
     if request.method == 'POST':
         switch_id = request.form.get('switch_id')
-        switch_id = switch_id if switch_id else None # Converts an empty string to proper SQL NULL
+        switch_id = switch_id if switch_id else None 
 
         conn.execute("""
             UPDATE cameras SET switch_id = ?, name = ?, ip = ?, stream_url = ?, 
@@ -462,6 +499,8 @@ def edit_camera(id):
               request.form.get('username', ''), request.form.get('password', ''), id))
         conn.commit()
         conn.close()
+        
+        trigger_monitor_check()
         flash('Camera updated.', 'success')
         return redirect(url_for('index'))
     
@@ -478,6 +517,8 @@ def delete_camera(id):
     conn.execute("DELETE FROM cameras WHERE id = ?", (id,))
     conn.commit()
     conn.close()
+    
+    trigger_monitor_check()
     flash('Camera deleted.', 'success')
     return redirect(url_for('index'))
 

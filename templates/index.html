@@ -155,4 +155,112 @@
                             <tr>
                                 <td>
                                     {{ c.name }}
-                                    <button class="btn btn-sm
+                                    <button class="btn btn-sm btn-outline-secondary ms-2 py-0" onclick="showPreview({{ c.id }}, '{{ c.name }}')">Preview</button>
+                                </td>
+                                <td>
+                                    {{ c.ip }}
+                                    <a href="/tunnel/camera/{{ c.id }}/" target="_blank" class="badge bg-info text-decoration-none ms-2">WebUI</a>
+                                </td>
+                                <td>{{ c.switch_name }}</td>
+                                <td>
+                                    <span class="badge {% if c.status == 'UP' %}bg-success{% elif 'DOWN' in c.status or 'UNREACHABLE' in c.status %}bg-danger{% else %}bg-secondary{% endif %}">
+                                        {{ c.status }}
+                                    </span>
+                                </td>
+                                {% if current_user.role == 'admin' %}
+                                <td class="text-end text-nowrap">
+                                    <a href="/edit_camera/{{ c.id }}" class="btn btn-outline-warning btn-sm">Edit</a>
+                                    <a href="/delete_camera/{{ c.id }}" class="btn btn-outline-danger btn-sm">X</a>
+                                </td>
+                                {% endif %}
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+
+                    {% if current_user.role == 'admin' %}
+                    <hr>
+                    <h6>Add Camera</h6>
+                    <form action="/add_camera" method="POST" class="row gx-2">
+                        <div class="col-md-3 mb-2">
+                            <select name="switch_id" class="form-select" required>
+                                <option value="" disabled selected>Select Switch...</option>
+                                {% for s in switches %}
+                                <option value="{{ s.id }}">{{ s.name }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="col-md-2 mb-2">
+                            <input type="text" name="name" class="form-control" placeholder="Cam Name" required>
+                        </div>
+                        <div class="col-md-2 mb-2">
+                            <input type="text" name="ip" class="form-control" placeholder="IP Address" required>
+                        </div>
+                        <div class="col-md-4 mb-2">
+                            <input type="text" name="stream_url" class="form-control" placeholder="RTSP URL" required>
+                        </div>
+                        <div class="col-md-1 mb-2">
+                            <button type="submit" class="btn btn-primary w-100">+</button>
+                        </div>
+                    </form>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal fade" id="previewModal" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog modal-lg modal-dialog-centered">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" id="previewModalLabel">Camera Preview</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body text-center bg-dark" style="min-height: 300px;">
+            
+            <div class="spinner-border text-primary mt-5" id="previewSpinner" role="status">
+                <span class="visually-hidden">Loading...</span>
+            </div>
+            
+            <img id="previewImage" src="" class="img-fluid d-none rounded" alt="Stream Preview">
+            
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        let modalInstance;
+
+        function showPreview(id, name) {
+            if (!modalInstance) {
+                modalInstance = new bootstrap.Modal(document.getElementById('previewModal'));
+            }
+            
+            document.getElementById('previewModalLabel').innerText = 'Preview: ' + name;
+            
+            const img = document.getElementById('previewImage');
+            const spinner = document.getElementById('previewSpinner');
+            
+            img.classList.add('d-none');
+            spinner.classList.remove('d-none');
+            
+            img.src = '/snapshot/' + id + '?t=' + new Date().getTime();
+            
+            img.onload = function() {
+                spinner.classList.add('d-none');
+                img.classList.remove('d-none');
+            };
+            
+            img.onerror = function() {
+                spinner.classList.add('d-none');
+                alert('Failed to load snapshot. The camera might be offline, or the RTSP URL is invalid.');
+                modalInstance.hide();
+            };
+            
+            modalInstance.show();
+        }
+    </script>
+</body>
+</html>

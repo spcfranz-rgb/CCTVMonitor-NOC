@@ -73,22 +73,24 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT, role TEXT
     )""")
     
-    # Insert Default Settings
+    # Insert Default Settings via Environment Variables
     cursor.execute("SELECT count(*) FROM settings")
     if cursor.fetchone()[0] == 0:
         settings = [
-            ('mqtt_broker', '192.168.1.50'),
-            ('mqtt_port', '1883'),
-            ('mqtt_prefix', 'zabbix/cctv'),
-            ('check_interval', '60')
+            ('mqtt_broker', os.environ.get('DEFAULT_MQTT_BROKER', '192.168.1.50')),
+            ('mqtt_port', os.environ.get('DEFAULT_MQTT_PORT', '1883')),
+            ('mqtt_prefix', os.environ.get('DEFAULT_MQTT_PREFIX', 'zabbix/cctv')),
+            ('check_interval', os.environ.get('DEFAULT_CHECK_INTERVAL', '60'))
         ]
         cursor.executemany("INSERT INTO settings (key, value) VALUES (?, ?)", settings)
         
-    # Insert Default Admin Account (admin / admin)
+    # Insert Default Admin Account via Environment Variables
     cursor.execute("SELECT count(*) FROM users")
     if cursor.fetchone()[0] == 0:
-        default_hash = generate_password_hash('admin')
-        cursor.execute("INSERT INTO users (username, password, role) VALUES (?, ?, 'admin')", ('admin', default_hash))
+        default_user = os.environ.get('DEFAULT_ADMIN_USER', 'admin')
+        default_pass = os.environ.get('DEFAULT_ADMIN_PASS', 'admin')
+        default_hash = generate_password_hash(default_pass)
+        cursor.execute("INSERT INTO users (username, password, role) VALUES (?, ?, 'admin')", (default_user, default_hash))
     
     conn.commit()
     conn.close()

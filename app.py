@@ -6,6 +6,7 @@ import threading
 import requests
 import ipaddress
 import paho.mqtt.client as mqtt
+from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 from urllib.parse import urlparse
 from functools import wraps
 from flask import Flask, render_template, request, redirect, url_for, abort, flash, Response, jsonify
@@ -75,6 +76,15 @@ def init_db():
         ip TEXT, stream_url TEXT, status TEXT DEFAULT 'UNKNOWN',
         FOREIGN KEY(switch_id) REFERENCES switches(id)
     )""")
+    
+    # Safely migrate existing databases to include the new HTTP API columns
+    try:
+        cursor.execute("ALTER TABLE cameras ADD COLUMN manufacturer TEXT DEFAULT 'Other'")
+        cursor.execute("ALTER TABLE cameras ADD COLUMN username TEXT DEFAULT ''")
+        cursor.execute("ALTER TABLE cameras ADD COLUMN password TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass # Columns already exist
+
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT, role TEXT
@@ -99,7 +109,6 @@ def init_db():
     
     conn.commit()
     conn.close()
-    print("Database initialized.")
 
 # ==========================================
 # BACKGROUND MONITORING TASK
@@ -119,7 +128,6 @@ def is_stream_active(url):
         return False
 
 def monitor_loop():
-    print("Starting background monitoring thread...")
     while True:
         try:
             conn = get_db()
@@ -176,7 +184,6 @@ def monitor_loop():
             client.disconnect()
             time.sleep(interval)
         except Exception as e:
-            print(f"Error in monitor loop: {e}")
             time.sleep(10)
 
 # ==========================================
@@ -187,18 +194,15 @@ def login():
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
-        
         conn = get_db()
         user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
         conn.close()
-        
         if user and check_password_hash(user['password'], password):
             user_obj = User(user['id'], user['username'], user['role'])
             login_user(user_obj)
             return redirect(url_for('index'))
         else:
             flash('Invalid username or password', 'danger')
-            
     return render_template('login.html')
 
 @app.route('/logout')
@@ -212,10 +216,7 @@ def logout():
 def index():
     conn = get_db()
     switches = conn.execute("SELECT * FROM switches").fetchall()
-    cameras = conn.execute("""
-        SELECT c.*, s.name as switch_name 
-        FROM cameras c JOIN switches s ON c.switch_id = s.id
-    """).fetchall()
+    cameras = conn.execute("SELECT c.*, s.name as switch_name FROM cameras c JOIN switches s ON c.switch_id = s.id").fetchall()
     
     cursor = conn.cursor()
     cursor.execute("SELECT key, value FROM settings")
@@ -239,7 +240,6 @@ def api_status():
         status_data[f"switch_{s['id']}"] = s['status']
     for c in cameras:
         status_data[f"camera_{c['id']}"] = c['status']
-        
     return jsonify(status_data)
 
 @app.route('/api/ping', methods=['POST'])
@@ -249,16 +249,13 @@ def manual_ping():
     ip = request.form.get('ip')
     if not ip:
         return jsonify({'success': False, 'output': 'No IP address provided.'})
-
     try:
         cmd = ['ping', '-c', '4', '-W', '2', ip]
         process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
-
         if process.returncode == 0:
             return jsonify({'success': True, 'output': process.stdout})
         else:
             return jsonify({'success': False, 'output': process.stdout or process.stderr or 'Ping failed.'})
-            
     except subprocess.TimeoutExpired:
         return jsonify({'success': False, 'output': 'Ping command timed out.'})
     except Exception as e:
@@ -326,7 +323,6 @@ def edit_switch(id):
         conn.close()
         flash('Switch updated.', 'success')
         return redirect(url_for('index'))
-    
     switch = conn.execute("SELECT * FROM switches WHERE id = ?", (id,)).fetchone()
     conn.close()
     return render_template('edit_switch.html', switch=switch)
@@ -348,173 +344,7 @@ def delete_switch(id):
 @admin_required
 def add_camera():
     conn = get_db()
-    conn.execute("INSERT INTO cameras (switch_id, name, ip, stream_url) VALUES (?, ?, ?, ?)", 
-                 (request.form['switch_id'], request.form['name'], request.form['ip'], request.form['stream_url']))
-    conn.commit()
-    conn.close()
-    flash('Camera added.', 'success')
-    return redirect(url_for('index'))
-
-@app.route('/edit_camera/<int:id>', methods=['GET', 'POST'])
-@login_required
-@admin_required
-def edit_camera(id):
-    conn = get_db()
-    if request.method == 'POST':
-        conn.execute("UPDATE cameras SET switch_id = ?, name = ?, ip = ?, stream_url = ? WHERE id = ?", 
-                     (request.form['switch_id'], request.form['name'], request.form['ip'], request.form['stream_url'], id))
-        conn.commit()
-        conn.close()
-        flash('Camera updated.', 'success')
-        return redirect(url_for('index'))
-    
-    camera = conn.execute("SELECT * FROM cameras WHERE id = ?", (id,)).fetchone()
-    switches = conn.execute("SELECT * FROM switches").fetchall()
-    conn.close()
-    return render_template('edit_camera.html', camera=camera, switches=switches)
-
-@app.route('/delete_camera/<int:id>')
-@login_required
-@admin_required
-def delete_camera(id):
-    conn = get_db()
-    conn.execute("DELETE FROM cameras WHERE id = ?", (id,))
-    conn.commit()
-    conn.close()
-    flash('Camera deleted.', 'success')
-    return redirect(url_for('index'))
-
-@app.route('/add_user', methods=['POST'])
-@login_required
-@admin_required
-def add_user():
-    username = request.form['username']
-    password = generate_password_hash(request.form['password'])
-    role = request.form['role']
-    conn = get_db()
-    try:
-        conn.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", (username, password, role))
-        conn.commit()
-        flash('User added.', 'success')
-    except sqlite3.IntegrityError:
-        flash('Username already exists.', 'danger')
-    conn.close()
-    return redirect(url_for('index'))
-
-@app.route('/delete_user/<int:id>')
-@login_required
-@admin_required
-def delete_user(id):
-    if id == current_user.id:
-        flash('You cannot delete yourself.', 'danger')
-        return redirect(url_for('index'))
-    conn = get_db()
-    conn.execute("DELETE FROM users WHERE id = ?", (id,))
-    conn.commit()
-    conn.close()
-    flash('User deleted.', 'success')
-    return redirect(url_for('index'))
-
-@app.route('/snapshot/<int:id>')
-@login_required
-def snapshot(id):
-    conn = get_db()
-    camera = conn.execute("SELECT stream_url FROM cameras WHERE id = ?", (id,)).fetchone()
-    conn.close()
-    
-    if not camera:
-        return "Camera not found", 404
-        
-    try:
-        cmd = ['ffmpeg', '-y', '-rtsp_transport', 'tcp', '-i', camera['stream_url'], '-vframes', '1', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-']
-        process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
-        
-        if process.returncode == 0:
-            return Response(process.stdout, mimetype='image/jpeg')
-        else:
-            return f"Failed to grab snapshot", 500
-    except subprocess.TimeoutExpired:
-        return "Timeout reaching camera", 504
-    except Exception as e:
-        return str(e), 500
-
-# ==========================================
-# WEB UI TUNNELING (REVERSE PROXY)
-# ==========================================
-def proxy_request(device_type, device_id, req_path, method, headers, data, cookies):
-    conn = get_db()
-    if device_type == 'switch':
-        device = conn.execute("SELECT ip FROM switches WHERE id = ?", (device_id,)).fetchone()
-    elif device_type == 'camera':
-        device = conn.execute("SELECT ip FROM cameras WHERE id = ?", (device_id,)).fetchone()
-    else:
-        return "Invalid device type", 404
-    conn.close()
-
-    if not device:
-        return "Device not found", 404
-
-    # --- SECURITY HARDENING: SSRF PROTECTION ---
-    try:
-        ip_obj = ipaddress.ip_address(device['ip'])
-        if not ip_obj.is_private or ip_obj.is_loopback:
-             return "Security Policy Violation: Target IP is not a valid local device.", 403
-    except ValueError:
-        return "Invalid IP Address format.", 400
-
-    query_string = request.query_string.decode('utf-8')
-    full_req_path = f"{req_path}?{query_string}" if query_string else req_path
-    target_url = f"http://{device['ip']}/{full_req_path.lstrip('/')}"
-    clean_headers = {k: v for k, v in headers if k.lower() not in ['host', 'origin', 'referer', 'accept-encoding']}
-    
-    try:
-        resp = requests.request(
-            method=method, url=target_url, headers=clean_headers, data=data,
-            cookies=cookies, allow_redirects=False, stream=True, timeout=15
-        )
-        
-        excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-        resp_headers = [(name, value) for (name, value) in resp.raw.headers.items() if name.lower() not in excluded_headers]
-        
-        for i, (name, value) in enumerate(resp_headers):
-            if name.lower() == 'location':
-                if value.startswith(f"http://{device['ip']}"):
-                    value = value.replace(f"http://{device['ip']}", f"/tunnel/{device_type}/{device_id}")
-                elif value.startswith('/'):
-                    value = f"/tunnel/{device_type}/{device_id}{value}"
-                resp_headers[i] = (name, value)
-
-        return Response(resp.iter_content(chunk_size=10*1024), resp.status_code, resp_headers)
-    except requests.exceptions.RequestException as e:
-        return f"Tunnel Error connecting to {device['ip']}: {str(e)}", 502
-
-@app.route('/tunnel/<device_type>/<int:device_id>/', defaults={'req_path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE'])
-@app.route('/tunnel/<device_type>/<int:device_id>/<path:req_path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-@login_required
-def tunnel(device_type, device_id, req_path):
-    return proxy_request(device_type, device_id, req_path, request.method, request.headers, request.get_data(), request.cookies)
-
-@app.errorhandler(404)
-def proxy_absolute_paths(e):
-    if not current_user.is_authenticated:
-        return "404 - Not Found", 404
-
-    referer = request.headers.get('Referer')
-    if referer:
-        parsed_referer = urlparse(referer)
-        parts = parsed_referer.path.split('/')
-        if len(parts) >= 4 and parts[1] == 'tunnel':
-            device_type = parts[2]
-            device_id = parts[3]
-            return proxy_request(device_type, device_id, request.path, request.method, request.headers, request.get_data(), request.cookies)
-    
-    return "404 - Not Found", 404
-
-if __name__ == '__main__':
-    # Initialize the DB and Background tasks
-    init_db()
-    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-    monitor_thread.start()
-    
-    # We leave this here so you can still run `python app.py` locally if not using Docker
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    conn.execute("""
+        INSERT INTO cameras (switch_id, name, ip, stream_url, manufacturer, username, password) 
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (request.form['switch_id'], request.form['name'], request.form['ip'],

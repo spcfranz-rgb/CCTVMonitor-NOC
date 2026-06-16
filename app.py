@@ -1,5 +1,6 @@
 import os
 import time
+import socket
 import sqlite3
 import subprocess
 import threading
@@ -77,13 +78,18 @@ def init_db():
         FOREIGN KEY(switch_id) REFERENCES switches(id)
     )""")
     
-    # Safely migrate existing databases to include the new HTTP API columns
     try:
         cursor.execute("ALTER TABLE cameras ADD COLUMN manufacturer TEXT DEFAULT 'Other'")
         cursor.execute("ALTER TABLE cameras ADD COLUMN username TEXT DEFAULT ''")
         cursor.execute("ALTER TABLE cameras ADD COLUMN password TEXT DEFAULT ''")
     except sqlite3.OperationalError:
-        pass # Columns already exist
+        pass
+        
+    try:
+        cursor.execute("ALTER TABLE switches ADD COLUMN silenced_until REAL DEFAULT 0")
+        cursor.execute("ALTER TABLE cameras ADD COLUMN silenced_until REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
@@ -118,6 +124,13 @@ def is_pingable(ip):
     response = subprocess.call(['ping', '-c', '1', '-W', '2', ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return response == 0
 
+def is_port_open(ip, port, timeout=2):
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
 def is_stream_active(url):
     try:
         response = subprocess.call(
@@ -148,38 +161,54 @@ def monitor_loop():
             except Exception:
                 pass
             
-            cursor.execute("SELECT id, name, ip FROM switches")
+            cursor.execute("SELECT * FROM switches")
             switches = cursor.fetchall()
+            now = time.time()
             
             for switch in switches:
-                switch_id, switch_name, switch_ip = switch['id'], switch['name'], switch['ip']
+                switch_id, switch_name, switch_ip, s_until = switch['id'], switch['name'], switch['ip'], switch['silenced_until']
+                silenced = s_until > now
                 
-                if is_pingable(switch_ip):
-                    client.publish(f"{prefix}/{switch_name}/ping", 1, retain=True)
-                    cursor.execute("UPDATE switches SET status = 'UP' WHERE id = ?", (switch_id,))
+                is_up = is_pingable(switch_ip) or is_port_open(switch_ip, 80) or is_port_open(switch_ip, 443)
+                
+                # Explicitly publish MAINTENANCE state to MQTT
+                switch_payload = "MAINTENANCE" if silenced else (1 if is_up else 0)
+                client.publish(f"{prefix}/{switch_name}/ping", switch_payload, retain=True)
+                
+                if is_up:
+                    cursor.execute("UPDATE switches SET status = ? WHERE id = ?", ('UP' if not silenced else 'UP (Silenced)', switch_id))
                     
-                    cursor.execute("SELECT id, name, ip, stream_url FROM cameras WHERE switch_id = ?", (switch_id,))
+                    cursor.execute("SELECT * FROM cameras WHERE switch_id = ?", (switch_id,))
                     cameras = cursor.fetchall()
                     
                     for cam in cameras:
-                        cam_id, cam_name, cam_ip, stream_url = cam['id'], cam['name'], cam['ip'], cam['stream_url']
+                        cam_id, cam_name, cam_ip, stream_url, c_until = cam['id'], cam['name'], cam['ip'], cam['stream_url'], cam['silenced_until']
+                        cam_silenced = c_until > now
                         
-                        if is_pingable(cam_ip):
-                            client.publish(f"{prefix}/{cam_name}/ping", 1, retain=True)
-                            if is_stream_active(stream_url):
-                                client.publish(f"{prefix}/{cam_name}/stream", 1, retain=True)
-                                cursor.execute("UPDATE cameras SET status = 'UP' WHERE id = ?", (cam_id,))
+                        cam_up = is_pingable(cam_ip) or is_port_open(cam_ip, 554) or is_port_open(cam_ip, 80)
+                        
+                        if cam_up:
+                            stream_ok = is_stream_active(stream_url)
+                            if cam_silenced:
+                                client.publish(f"{prefix}/{cam_name}/ping", "MAINTENANCE", retain=True)
+                                client.publish(f"{prefix}/{cam_name}/stream", "MAINTENANCE", retain=True)
+                                cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('UP (Silenced)' if stream_ok else 'STREAM ERR (Silenced)', cam_id))
                             else:
-                                client.publish(f"{prefix}/{cam_name}/stream", 0, retain=True)
-                                cursor.execute("UPDATE cameras SET status = 'DOWN (Stream Error)' WHERE id = ?", (cam_id,))
+                                client.publish(f"{prefix}/{cam_name}/ping", 1, retain=True)
+                                client.publish(f"{prefix}/{cam_name}/stream", 1 if stream_ok else 0, retain=True)
+                                cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('UP' if stream_ok else 'DOWN (Stream Error)', cam_id))
                         else:
-                            client.publish(f"{prefix}/{cam_name}/ping", 0, retain=True)
-                            client.publish(f"{prefix}/{cam_name}/stream", 0, retain=True)
-                            cursor.execute("UPDATE cameras SET status = 'DOWN (Offline)' WHERE id = ?", (cam_id,))
+                            if cam_silenced:
+                                client.publish(f"{prefix}/{cam_name}/ping", "MAINTENANCE", retain=True)
+                                client.publish(f"{prefix}/{cam_name}/stream", "MAINTENANCE", retain=True)
+                                cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('DOWN (Silenced)', cam_id))
+                            else:
+                                client.publish(f"{prefix}/{cam_name}/ping", 0, retain=True)
+                                client.publish(f"{prefix}/{cam_name}/stream", 0, retain=True)
+                                cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('DOWN (Offline)', cam_id))
                 else:
-                    client.publish(f"{prefix}/{switch_name}/ping", 0, retain=True)
-                    cursor.execute("UPDATE switches SET status = 'DOWN' WHERE id = ?", (switch_id,))
-                    cursor.execute("UPDATE cameras SET status = 'UNREACHABLE (Switch Down)' WHERE switch_id = ?", (switch_id,))
+                    cursor.execute("UPDATE switches SET status = ? WHERE id = ?", ('DOWN' if not silenced else 'DOWN (Silenced)', switch_id))
+                    cursor.execute("UPDATE cameras SET status = ? WHERE switch_id = ?", ('UNREACHABLE (Switch Down)' if not silenced else 'UNREACHABLE (Silenced)', switch_id))
 
             conn.commit()
             conn.close()
@@ -220,14 +249,14 @@ def logout():
 @app.route('/')
 @login_required
 def index():
+    now = time.time()
     conn = get_db()
-    switches = conn.execute("SELECT * FROM switches").fetchall()
-    cameras = conn.execute("SELECT c.*, s.name as switch_name FROM cameras c JOIN switches s ON c.switch_id = s.id").fetchall()
+    switches = conn.execute("SELECT *, (silenced_until > ?) as is_silenced FROM switches", (now,)).fetchall()
+    cameras = conn.execute("SELECT c.*, s.name as switch_name, (c.silenced_until > ?) as is_silenced FROM cameras c JOIN switches s ON c.switch_id = s.id", (now,)).fetchall()
     
     cursor = conn.cursor()
     cursor.execute("SELECT key, value FROM settings")
     settings_dict = {row['key']: row['value'] for row in cursor.fetchall()}
-    
     users = conn.execute("SELECT id, username, role FROM users").fetchall()
     conn.close()
     
@@ -249,6 +278,22 @@ def api_status():
         
     return jsonify(status_data)
 
+@app.route('/toggle_silence/<device_type>/<int:id>', methods=['POST'])
+@login_required
+@admin_required
+def toggle_silence(device_type, id):
+    hours = float(request.form.get('hours', 0))
+    silence_until = time.time() + (hours * 3600) if hours > 0 else 0
+    
+    conn = get_db()
+    if device_type == 'switch':
+        conn.execute("UPDATE switches SET silenced_until = ? WHERE id = ?", (silence_until, id))
+    elif device_type == 'camera':
+        conn.execute("UPDATE cameras SET silenced_until = ? WHERE id = ?", (silence_until, id))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
 @app.route('/api/ping', methods=['POST'])
 @login_required
 @admin_required
@@ -256,16 +301,13 @@ def manual_ping():
     ip = request.form.get('ip')
     if not ip:
         return jsonify({'success': False, 'output': 'No IP address provided.'})
-
     try:
         cmd = ['ping', '-c', '4', '-W', '2', ip]
         process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
-
         if process.returncode == 0:
             return jsonify({'success': True, 'output': process.stdout})
         else:
             return jsonify({'success': False, 'output': process.stdout or process.stderr or 'Ping failed.'})
-            
     except subprocess.TimeoutExpired:
         return jsonify({'success': False, 'output': 'Ping command timed out.'})
     except Exception as e:
@@ -333,7 +375,6 @@ def edit_switch(id):
         conn.close()
         flash('Switch updated.', 'success')
         return redirect(url_for('index'))
-    
     switch = conn.execute("SELECT * FROM switches WHERE id = ?", (id,)).fetchone()
     conn.close()
     return render_template('edit_switch.html', switch=switch)
@@ -445,12 +486,10 @@ def snapshot(id):
     user = camera['username']
     pwd = camera['password']
     
-    # 1. Try Native HTTP Snapshot First (Instant & Low CPU)
     if mfg and mfg != 'Other':
         url = None
         auth_in_url = False
         
-        # Build the proper API string based on manufacturer
         if mfg == 'Hikvision':
             url = f"http://{ip}/ISAPI/Streaming/channels/101/picture"
         elif mfg in ['Dahua', 'Amcrest']:
@@ -468,27 +507,22 @@ def snapshot(id):
                 if auth_in_url:
                     resp = requests.get(url, timeout=3)
                 else:
-                    # Most modern CCTV cameras use Digest Authentication by default.
                     resp = requests.get(url, auth=HTTPDigestAuth(user, pwd), timeout=3)
-                    # If it rejects Digest, fall back to Basic Auth.
                     if resp.status_code != 200:
                         resp = requests.get(url, auth=HTTPBasicAuth(user, pwd), timeout=3)
                         
                 if resp.status_code == 200 and 'image' in resp.headers.get('Content-Type', ''):
                     return Response(resp.content, mimetype='image/jpeg')
             except Exception as e:
-                # Silently catch the error. The code will proceed downward to the FFmpeg fallback.
                 print(f"HTTP Snapshot failed for {ip}: {e}. Falling back to FFmpeg.")
 
-    # 2. FFmpeg Fallback (If 'Other', or if the HTTP API call above failed)
     try:
         cmd = ['ffmpeg', '-y', '-rtsp_transport', 'tcp', '-i', camera['stream_url'], '-vframes', '1', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-']
         process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
-        
         if process.returncode == 0:
             return Response(process.stdout, mimetype='image/jpeg')
         else:
-            return f"Failed to grab snapshot via HTTP or RTSP", 500
+            return f"Failed to grab snapshot", 500
     except subprocess.TimeoutExpired:
         return "Timeout reaching camera", 504
     except Exception as e:
@@ -510,7 +544,6 @@ def proxy_request(device_type, device_id, req_path, method, headers, data, cooki
     if not device:
         return "Device not found", 404
 
-    # --- SECURITY HARDENING: SSRF PROTECTION ---
     try:
         ip_obj = ipaddress.ip_address(device['ip'])
         if not ip_obj.is_private or ip_obj.is_loopback:
@@ -567,10 +600,7 @@ def proxy_absolute_paths(e):
     return "404 - Not Found", 404
 
 if __name__ == '__main__':
-    # Initialize the DB and Background tasks
     init_db()
     monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
     monitor_thread.start()
-    
-    # We leave this here so you can still run `python app.py` locally if not using Docker
     app.run(host='0.0.0.0', port=5000, debug=False)

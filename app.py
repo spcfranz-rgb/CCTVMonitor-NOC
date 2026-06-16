@@ -242,6 +242,28 @@ def api_status():
         
     return jsonify(status_data)
 
+@app.route('/api/ping', methods=['POST'])
+@login_required
+@admin_required
+def manual_ping():
+    ip = request.form.get('ip')
+    if not ip:
+        return jsonify({'success': False, 'output': 'No IP address provided.'})
+
+    try:
+        cmd = ['ping', '-c', '4', '-W', '2', ip]
+        process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+
+        if process.returncode == 0:
+            return jsonify({'success': True, 'output': process.stdout})
+        else:
+            return jsonify({'success': False, 'output': process.stdout or process.stderr or 'Ping failed.'})
+            
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'output': 'Ping command timed out.'})
+    except Exception as e:
+        return jsonify({'success': False, 'output': str(e)})
+
 @app.route('/update_settings', methods=['POST'])
 @login_required
 @admin_required
@@ -489,7 +511,10 @@ def proxy_absolute_paths(e):
     return "404 - Not Found", 404
 
 if __name__ == '__main__':
+    # Initialize the DB and Background tasks
     init_db()
     monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
     monitor_thread.start()
+    
+    # We leave this here so you can still run `python app.py` locally if not using Docker
     app.run(host='0.0.0.0', port=5000, debug=False)

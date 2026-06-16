@@ -4,6 +4,9 @@ import sqlite3
 import subprocess
 import threading
 import paho.mqtt.client as mqtt
+import requests
+from urllib.parse import urlparse
+from flask import Response
 from functools import wraps
 from flask import Flask, render_template, request, redirect, url_for, abort, flash
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user

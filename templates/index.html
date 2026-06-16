@@ -198,26 +198,46 @@
                     {% if current_user.role == 'admin' %}
                     <hr>
                     <h6>Add Camera</h6>
-                    <form action="/add_camera" method="POST" class="row gx-2">
-                        <div class="col-md-3 mb-2">
-                            <select name="switch_id" class="form-select" required>
-                                <option value="" disabled selected>Select Switch...</option>
-                                {% for s in switches %}
-                                <option value="{{ s.id }}">{{ s.name }}</option>
-                                {% endfor %}
-                            </select>
+                    <form action="/add_camera" method="POST">
+                        <div class="row gx-2 mb-2">
+                            <div class="col-md-3">
+                                <select name="switch_id" class="form-select form-select-sm" required>
+                                    <option value="" disabled selected>Select Switch...</option>
+                                    {% for s in switches %}
+                                    <option value="{{ s.id }}">{{ s.name }}</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                            <div class="col-md-3">
+                                <input type="text" name="name" class="form-control form-control-sm" placeholder="Cam Name" required>
+                            </div>
+                            <div class="col-md-3">
+                                <input type="text" name="ip" class="form-control form-control-sm" placeholder="IP Address" required>
+                            </div>
+                            <div class="col-md-3">
+                                <select name="manufacturer" class="form-select form-select-sm" required>
+                                    <option value="Other">Other (FFmpeg RTSP)</option>
+                                    <option value="Hikvision">Hikvision</option>
+                                    <option value="Dahua">Dahua</option>
+                                    <option value="Amcrest">Amcrest</option>
+                                    <option value="Axis">Axis</option>
+                                    <option value="Foscam">Foscam</option>
+                                </select>
+                            </div>
                         </div>
-                        <div class="col-md-2 mb-2">
-                            <input type="text" name="name" class="form-control" placeholder="Cam Name" required>
-                        </div>
-                        <div class="col-md-2 mb-2">
-                            <input type="text" name="ip" class="form-control" placeholder="IP Address" required>
-                        </div>
-                        <div class="col-md-4 mb-2">
-                            <input type="text" name="stream_url" class="form-control" placeholder="RTSP URL" required>
-                        </div>
-                        <div class="col-md-1 mb-2">
-                            <button type="submit" class="btn btn-primary w-100">+</button>
+                        <div class="row gx-2">
+                            <div class="col-md-3">
+                                <input type="text" name="username" class="form-control form-control-sm" placeholder="Camera User">
+                            </div>
+                            <div class="col-md-3">
+                                <input type="password" name="password" class="form-control form-control-sm" placeholder="Camera Pass">
+                            </div>
+                            <div class="col-md-5">
+                                <input type="text" name="stream_url" class="form-control form-control-sm" placeholder="RTSP URL (Fallback/Monitor)" required>
+                            </div>
+                            <div class="col-md-1">
+                                <button type="submit" class="btn btn-primary btn-sm w-100">+</button>
+                            </div>
                         </div>
                     </form>
                     {% endif %}
@@ -234,13 +254,10 @@
             <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
           </div>
           <div class="modal-body text-center bg-dark" style="min-height: 300px;">
-            
             <div class="spinner-border text-primary mt-5" id="previewSpinner" role="status">
                 <span class="visually-hidden">Loading...</span>
             </div>
-            
             <img id="previewImage" src="" class="img-fluid d-none rounded" alt="Stream Preview">
-            
           </div>
         </div>
       </div>
@@ -250,12 +267,10 @@
     
     <script>
         let modalInstance;
-
         function showPreview(id, name) {
             if (!modalInstance) {
                 modalInstance = new bootstrap.Modal(document.getElementById('previewModal'));
             }
-            
             document.getElementById('previewModalLabel').innerText = 'Preview: ' + name;
             
             const img = document.getElementById('previewImage');
@@ -273,10 +288,9 @@
             
             img.onerror = function() {
                 spinner.classList.add('d-none');
-                alert('Failed to load snapshot. The camera might be offline, or the RTSP URL is invalid.');
+                alert('Failed to load snapshot. The camera might be offline, or credentials are invalid.');
                 modalInstance.hide();
             };
-            
             modalInstance.show();
         }
     </script>
@@ -292,7 +306,6 @@
                             if (badge.innerText.trim() !== status) {
                                 badge.innerText = status;
                                 badge.className = 'badge'; 
-                                
                                 if (status === 'UP') {
                                     badge.classList.add('bg-success');
                                 } else if (status.includes('DOWN') || status.includes('UNREACHABLE')) {
@@ -306,7 +319,6 @@
                 })
                 .catch(error => console.error('Error fetching live status:', error));
         }
-
         setInterval(updateStatuses, 15000);
     </script>
 
@@ -332,10 +344,7 @@
             const formData = new FormData();
             formData.append('ip', ip);
 
-            fetch('/api/ping', {
-                method: 'POST',
-                body: formData
-            })
+            fetch('/api/ping', { method: 'POST', body: formData })
             .then(response => response.json())
             .then(data => {
                 output.textContent = data.output;

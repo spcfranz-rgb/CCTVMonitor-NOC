@@ -43,7 +43,7 @@
                                     <a href="/tunnel/switch/{{ s.id }}/" target="_blank" class="badge bg-info text-decoration-none ms-2">WebUI</a>
                                 </td>
                                 <td>
-                                    <span class="badge {% if s.status == 'UP' %}bg-success{% elif s.status == 'DOWN' %}bg-danger{% else %}bg-secondary{% endif %}">
+                                    <span id="status-switch-{{ s.id }}" class="badge {% if s.status == 'UP' %}bg-success{% elif s.status == 'DOWN' %}bg-danger{% else %}bg-secondary{% endif %}">
                                         {{ s.status }}
                                     </span>
                                 </td>
@@ -163,7 +163,7 @@
                                 </td>
                                 <td>{{ c.switch_name }}</td>
                                 <td>
-                                    <span class="badge {% if c.status == 'UP' %}bg-success{% elif 'DOWN' in c.status or 'UNREACHABLE' in c.status %}bg-danger{% else %}bg-secondary{% endif %}">
+                                    <span id="status-camera-{{ c.id }}" class="badge {% if c.status == 'UP' %}bg-success{% elif 'DOWN' in c.status or 'UNREACHABLE' in c.status %}bg-danger{% else %}bg-secondary{% endif %}">
                                         {{ c.status }}
                                     </span>
                                 </td>
@@ -230,6 +230,7 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    
     <script>
         let modalInstance;
 
@@ -261,6 +262,35 @@
             
             modalInstance.show();
         }
+    </script>
+
+    <script>
+        function updateStatuses() {
+            fetch('/api/status')
+                .then(response => response.json())
+                .then(data => {
+                    for (const [key, status] of Object.entries(data)) {
+                        const badge = document.getElementById('status-' + key);
+                        if (badge) {
+                            if (badge.innerText.trim() !== status) {
+                                badge.innerText = status;
+                                badge.className = 'badge'; 
+                                
+                                if (status === 'UP') {
+                                    badge.classList.add('bg-success');
+                                } else if (status.includes('DOWN') || status.includes('UNREACHABLE')) {
+                                    badge.classList.add('bg-danger');
+                                } else {
+                                    badge.classList.add('bg-secondary');
+                                }
+                            }
+                        }
+                    }
+                })
+                .catch(error => console.error('Error fetching live status:', error));
+        }
+
+        setInterval(updateStatuses, 15000);
     </script>
 </body>
 </html>

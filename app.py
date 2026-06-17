@@ -38,6 +38,14 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 # Initialize WebSockets with the eventlet async worker
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
+# --- GLOBAL TEMPLATE VARIABLES (CO-BRANDING) ---
+@app.context_processor
+def inject_globals():
+    return {
+        'company_logo': os.environ.get('COMPANY_LOGO_URL', ''),
+        'customer_logo': os.environ.get('CUSTOMER_LOGO_URL', '')
+    }
+
 # --- SECURITY HARDENING: SESSIONS ---
 app.secret_key = os.environ.get('SECRET_KEY')
 if not app.secret_key:
@@ -88,16 +96,14 @@ def load_user(user_id):
 def admin_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if current_user.role != 'admin':
-            abort(403)
+        if current_user.role != 'admin': abort(403)
         return f(*args, **kwargs)
     return decorated_function
 
 def operator_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if current_user.role not in ['admin', 'operator']:
-            abort(403)
+        if current_user.role not in ['admin', 'operator']: abort(403)
         return f(*args, **kwargs)
     return decorated_function
 
@@ -172,8 +178,7 @@ def is_pingable(target):
 
 def is_port_open(target, port, timeout=2):
     try:
-        with socket.create_connection((target, port), timeout=timeout):
-            return True
+        with socket.create_connection((target, port), timeout=timeout): return True
     except OSError: return False
 
 def is_stream_active(url):
@@ -496,14 +501,6 @@ def history():
     conn.close()
     return render_template('history.html', logs=logs)
 
-@app.route('/api/logs')
-@login_required
-def api_logs():
-    conn = get_db()
-    logs = conn.execute("SELECT * FROM event_logs ORDER BY timestamp DESC LIMIT 500").fetchall()
-    conn.close()
-    return jsonify([dict(row) for row in logs])
-
 @app.route('/export_logs')
 @login_required
 def export_logs():
@@ -725,16 +722,40 @@ def manual_ping():
     except subprocess.TimeoutExpired: return jsonify({'success': False, 'output': 'Ping command timed out.'})
     except Exception as e: return jsonify({'success': False, 'output': str(e)})
 
+@app.route('/api/traceroute', methods=['POST'])
+@login_required
+@operator_required
+def run_traceroute():
+    target = request.form.get('target')
+    if not target: return jsonify({'success': False, 'error': 'No target provided.'})
+
+    def execute_trace():
+        try:
+            cmd = ['traceroute', '-w', '2', '-m', '30', '-q', '1', target]
+            process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+            
+            if process.returncode == 0:
+                socketio.emit('traceroute_result', {'success': True, 'output': process.stdout})
+            else:
+                error_msg = process.stderr.strip() or process.stdout.strip() or "Unknown execution error."
+                socketio.emit('traceroute_result', {'success': False, 'error': error_msg})
+                
+        except subprocess.TimeoutExpired:
+            socketio.emit('traceroute_result', {'success': False, 'error': 'Traceroute timed out after 60 seconds.'})
+        except Exception as e:
+            socketio.emit('traceroute_result', {'success': False, 'error': f'System Error: {str(e)}'})
+
+    threading.Thread(target=execute_trace).start()
+    return jsonify({'status': 'running'})
+
 @app.route('/api/speedtest', methods=['POST'])
 @login_required
 @operator_required
 def run_speedtest():
     def execute_test():
         try:
-            # FIX 1: Added --secure to force HTTPS and bypass Ookla's recent HTTP blocks
             cmd = ['speedtest-cli', '--secure', '--json']
             process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
-            
             if process.returncode == 0:
                 data = json.loads(process.stdout)
                 download = round(data.get('download', 0) / 1000000, 2)
@@ -743,14 +764,10 @@ def run_speedtest():
                 isp = data.get('client', {}).get('isp', 'Unknown')
                 socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': isp})
             else: 
-                # FIX 2: Pass the actual STDERR log to the UI so we can read the exact crash reason
                 error_msg = process.stderr.strip() or process.stdout.strip() or "Unknown execution error."
                 socketio.emit('speedtest_result', {'success': False, 'error': f'Speedtest API Error: {error_msg}'})
-                
-        except subprocess.TimeoutExpired: 
-            socketio.emit('speedtest_result', {'success': False, 'error': 'Speed test timed out after 60 seconds.'})
-        except Exception as e: 
-            socketio.emit('speedtest_result', {'success': False, 'error': f'System Error: {str(e)}'})
+        except subprocess.TimeoutExpired: socketio.emit('speedtest_result', {'success': False, 'error': 'Speed test timed out.'})
+        except Exception as e: socketio.emit('speedtest_result', {'success': False, 'error': str(e)})
 
     threading.Thread(target=execute_test).start()
     return jsonify({'status': 'running'})

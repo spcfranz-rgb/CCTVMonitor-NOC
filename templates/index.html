@@ -130,7 +130,40 @@
                     <pre id="pingOutput" class="bg-black text-light p-2 rounded small d-none" style="max-height: 200px; overflow-y: auto; font-size: 0.75rem; white-space: pre-wrap;"></pre>
                 </div>
             </div>
+            
+            <div class="card mb-4">
+                <div class="card-header"><h5 class="mb-0">WAN Speed Test</h5></div>
+                <div class="card-body">
+                    <p class="small text-muted mb-3">Test the external internet connection speed of the gateway system.</p>
+                    
+                    <div id="speedtestDisplay" class="row text-center mb-3 d-none">
+                        <div class="col-4 border-end">
+                            <small class="text-muted d-block">Ping</small>
+                            <strong id="st-ping" class="text-info">-</strong>
+                        </div>
+                        <div class="col-4 border-end">
+                            <small class="text-muted d-block">Download</small>
+                            <strong id="st-download" class="text-success">-</strong>
+                        </div>
+                        <div class="col-4">
+                            <small class="text-muted d-block">Upload</small>
+                            <strong id="st-upload" class="text-warning">-</strong>
+                        </div>
+                        <div class="col-12 mt-2">
+                            <small class="text-muted small">ISP: <span id="st-isp" class="fw-bold text-light">-</span></small>
+                        </div>
+                    </div>
 
+                    <div id="speedtestSpinner" class="text-center d-none mb-3">
+                        <div class="spinner-border spinner-border-sm text-warning" role="status"></div>
+                        <span class="ms-2 small text-muted">Running network benchmarks (takes ~30s)...</span>
+                    </div>
+
+                    <button class="btn btn-outline-warning btn-sm w-100" type="button" id="speedtestBtn" onclick="runSpeedTest()">Run Speed Test</button>
+                    <div id="speedtestError" class="alert alert-danger py-1 small mt-2 d-none"></div>
+                </div>
+            </div>
+            
             <div class="card mb-4">
                 <div class="card-header"><h5 class="mb-0">User Management</h5></div>
                 <div class="card-body">

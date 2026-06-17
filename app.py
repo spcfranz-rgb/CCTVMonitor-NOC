@@ -16,8 +16,12 @@ from functools import wraps
 from flask import Flask, render_template, request, redirect, url_for, abort, flash, Response, jsonify
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
+
+# Tell Flask it is behind a reverse proxy (NGINX) so redirects use the public HTTPS domain
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 # --- SECURITY HARDENING: SESSIONS ---
 app.secret_key = os.environ.get('SECRET_KEY', 'cctv-super-secret-key') 
@@ -135,13 +139,13 @@ def init_db():
 # ==========================================
 # BACKGROUND MONITORING TASK
 # ==========================================
-def is_pingable(ip):
-    response = subprocess.call(['ping', '-c', '1', '-W', '2', ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def is_pingable(target):
+    response = subprocess.call(['ping', '-c', '1', '-W', '2', target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return response == 0
 
-def is_port_open(ip, port, timeout=2):
+def is_port_open(target, port, timeout=2):
     try:
-        with socket.create_connection((ip, port), timeout=timeout):
+        with socket.create_connection((target, port), timeout=timeout):
             return True
     except OSError:
         return False
@@ -157,7 +161,6 @@ def is_stream_active(url):
         return False
 
 def get_snapshot_bytes(ip, mfg, user, pwd, stream_url):
-    """Unified function to fetch image bytes via API or FFmpeg for hashing/display."""
     if mfg and mfg != 'Other':
         url = None
         auth_in_url = False
@@ -186,9 +189,8 @@ def get_snapshot_bytes(ip, mfg, user, pwd, stream_url):
                 if resp.status_code == 200 and 'image' in resp.headers.get('Content-Type', ''):
                     return resp.content
             except Exception:
-                pass # Silently fallback to FFmpeg
+                pass 
                 
-    # Fallback to FFmpeg RTSP Capture
     try:
         cmd = ['ffmpeg', '-y', '-rtsp_transport', 'tcp', '-i', stream_url, '-vframes', '1', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-']
         process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
@@ -201,7 +203,7 @@ def get_snapshot_bytes(ip, mfg, user, pwd, stream_url):
 
 def monitor_loop():
     print("Starting background monitoring thread...")
-    previous_hashes = {} # Stores perceptual hashes to detect frozen streams
+    previous_hashes = {} 
     
     while True:
         try:
@@ -250,18 +252,14 @@ def monitor_loop():
                             stream_ok = is_stream_active(stream_url)
                             is_frozen = False
                             
-                            # If stream is alive, pull an image and hash it perceptually
                             if stream_ok:
                                 snap_bytes = get_snapshot_bytes(cam_ip, mfg, user, pwd, stream_url)
                                 if snap_bytes:
                                     try:
-                                        # Open the bytes as an image and calculate the structural average hash
                                         img = Image.open(io.BytesIO(snap_bytes))
                                         current_hash = imagehash.average_hash(img)
                                         last_hash = previous_hashes.get(cam_id)
                                         
-                                        # A Hamming distance of <= 2 means the core layout of the image 
-                                        # hasn't changed at all, ignoring the pixels of a ticking clock.
                                         if last_hash is not None and (current_hash - last_hash) <= 2:
                                             is_frozen = True
                                             
@@ -685,12 +683,20 @@ def proxy_request(device_type, device_id, req_path, method, headers, data, cooki
     if not device:
         return "Device not found", 404
 
+    # --- SECURITY HARDENING: SSRF PROTECTION (Updated for Domains) ---
     try:
-        ip_obj = ipaddress.ip_address(device['ip'])
+        # Resolve the domain to an IP address first
+        resolved_ip = socket.gethostbyname(device['ip'])
+        ip_obj = ipaddress.ip_address(resolved_ip)
+        
+        # Block public internet IPs and localhost routing
         if not ip_obj.is_private or ip_obj.is_loopback:
-             return "Security Policy Violation: Target IP is not a valid local device.", 403
+             return "Security Policy Violation: Target domain resolves to a non-local or restricted IP.", 403
+             
+    except socket.gaierror:
+        return f"DNS Error: Could not resolve hostname '{device['ip']}'", 400
     except ValueError:
-        return "Invalid IP Address format.", 400
+        return "Invalid IP or Hostname format.", 400
 
     query_string = request.query_string.decode('utf-8')
     full_req_path = f"{req_path}?{query_string}" if query_string else req_path

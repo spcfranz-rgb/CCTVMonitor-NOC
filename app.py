@@ -457,6 +457,17 @@ def history():
     conn.close()
     return render_template('history.html', logs=logs)
 
+@app.route('/api/logs')
+@login_required
+def api_logs():
+    conn = get_db()
+    # Fetch the 500 most recent logs
+    logs = conn.execute("SELECT * FROM event_logs ORDER BY timestamp DESC LIMIT 500").fetchall()
+    conn.close()
+    
+    # Convert the SQLite Row objects into a standard JSON dictionary list
+    return jsonify([dict(row) for row in logs])
+    
 @app.route('/export_logs')
 @login_required
 def export_logs():

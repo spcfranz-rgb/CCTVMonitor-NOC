@@ -394,10 +394,11 @@ def monitor_loop():
 # ==========================================
 @app.route('/internal_emit', methods=['POST'])
 def internal_emit():
-    # Reject anything that doesn't come directly from the local background loop
-    if request.remote_addr != '127.0.0.1':
-        abort(403)
+    # FIXED: Rely on the secure token instead of NGINX-mangled IP addresses
     payload = request.json
+    if not payload or payload.get('secret') != INTERNAL_WEBHOOK_SECRET:
+        abort(403)
+        
     socketio.emit(payload['event'], payload['data'])
     return "OK", 200
 

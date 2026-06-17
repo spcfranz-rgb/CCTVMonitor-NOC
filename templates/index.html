@@ -33,7 +33,7 @@
                 <div class="card-header"><h5 class="mb-0">Network Switches</h5></div>
                 <div class="card-body">
                     <table class="table table-sm align-middle">
-                        <thead><tr><th>Name</th><th>IP</th><th>Status</th>{% if current_user.role == 'admin' %}<th></th>{% endif %}</tr></thead>
+                        <thead><tr><th>Name</th><th>IP/Host</th><th>Status</th>{% if current_user.role == 'admin' %}<th></th>{% endif %}</tr></thead>
                         <tbody>
                             {% for s in switches %}
                             <tr>
@@ -68,7 +68,7 @@
                     <h6>Add Switch</h6>
                     <form action="/add_switch" method="POST">
                         <input type="text" name="name" class="form-control mb-2" placeholder="Switch Name" required>
-                        <input type="text" name="ip" class="form-control mb-2" placeholder="IP Address" required>
+                        <input type="text" name="ip" class="form-control mb-2" placeholder="IP / Hostname" required>
                         <button type="submit" class="btn btn-primary btn-sm w-100">Add Switch</button>
                     </form>
                     {% endif %}
@@ -171,7 +171,7 @@
                 <div class="card-header"><h5 class="mb-0">Cameras</h5></div>
                 <div class="card-body">
                     <table class="table table-sm align-middle">
-                        <thead><tr><th>Name</th><th>IP</th><th>Switch</th><th>Status</th>{% if current_user.role == 'admin' %}<th></th>{% endif %}</tr></thead>
+                        <thead><tr><th>Name</th><th>IP/Host</th><th>Switch</th><th>Status</th>{% if current_user.role == 'admin' %}<th></th>{% endif %}</tr></thead>
                         <tbody>
                             {% for c in cameras %}
                             <tr>
@@ -185,7 +185,7 @@
                                 </td>
                                 <td><small class="text-muted">{{ c.switch_name or 'Standalone' }}</small></td>
                                 <td>
-                                    <span id="status-camera-{{ c.id }}" class="badge {% if c.status == 'UP' %}bg-success{% elif 'Silenced' in c.status %}bg-warning text-dark{% elif 'DOWN' in c.status or 'UNREACHABLE' in c.status %}bg-danger{% else %}bg-secondary{% endif %}">
+                                    <span id="status-camera-{{ c.id }}" class="badge {% if c.status == 'UP' %}bg-success{% elif 'Silenced' in c.status %}bg-warning text-dark{% elif 'DOWN' in c.status or 'UNREACHABLE' in c.status or 'Frozen' in c.status %}bg-danger{% else %}bg-secondary{% endif %}">
                                         {{ c.status }}
                                     </span>
                                 </td>
@@ -222,7 +222,7 @@
                                 <input type="text" name="name" class="form-control form-control-sm" placeholder="Cam Name" required>
                             </div>
                             <div class="col-md-3">
-                                <input type="text" name="ip" class="form-control form-control-sm" placeholder="IP Address" required>
+                                <input type="text" name="ip" class="form-control form-control-sm" placeholder="IP / Hostname" required>
                             </div>
                             <div class="col-md-3">
                                 <select name="manufacturer" class="form-select form-select-sm" required>
@@ -384,8 +384,6 @@
                         }
                     }
                 })
-                .catch(error => console.error('Error fetching live status:', error));
-        }
                 .catch(error => console.error('Error fetching live status:', error));
         }
         setInterval(updateStatuses, 2500);

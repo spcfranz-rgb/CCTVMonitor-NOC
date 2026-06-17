@@ -77,7 +77,6 @@
         // Listen for new events and append them to the top of the table natively
         const socket = io();
         socket.on('state_change', function(data) {
-            // Remove the "No state changes" message if it is currently visible
             const emptyMsg = document.querySelector('td.text-center');
             if (emptyMsg) emptyMsg.parentElement.remove();
 
@@ -87,7 +86,6 @@
                 hour: '2-digit', minute: '2-digit', second: '2-digit'
             });
 
-            // Format Badges based on the payload
             let devBadge = data.device_type === 'Switch' 
                 ? '<span class="badge bg-secondary">Switch</span>' 
                 : '<span class="badge bg-dark border">Camera</span>';
@@ -97,7 +95,6 @@
             else if (data.status.includes('Silenced')) statBadge = 'bg-warning text-dark';
             else if (data.status.includes('DOWN') || data.status.includes('UNREACHABLE') || data.status.includes('Frozen') || data.status.includes('ERR')) statBadge = 'bg-danger';
 
-            // Create the new DOM node
             const row = document.createElement('tr');
             row.innerHTML = `
                 <td class="ps-4 text-muted">${date}</td>
@@ -106,10 +103,8 @@
                 <td><span class="badge ${statBadge}">${data.status}</span></td>
             `;
             
-            // Insert the new row at the very top of the table
             tbody.insertBefore(row, tbody.firstChild);
 
-            // Prevent the table from growing infinitely in the browser memory
             if (tbody.children.length > 500) {
                 tbody.removeChild(tbody.lastChild);
             }

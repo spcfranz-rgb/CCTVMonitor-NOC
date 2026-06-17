@@ -5,6 +5,8 @@ import sqlite3
 import subprocess
 import threading
 import io
+import csv
+from datetime import datetime
 import requests
 import ipaddress
 import paho.mqtt.client as mqtt
@@ -93,7 +95,6 @@ def init_db():
         FOREIGN KEY(switch_id) REFERENCES switches(id)
     )""")
     
-    # NEW: Event Logs Table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS event_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -221,10 +222,8 @@ def monitor_loop():
             cursor = conn.cursor()
             now = time.time()
             
-            # Helper function to detect state changes and log them
             def set_status(table, item_id, item_name, dev_type, old_status, new_status):
                 if old_status != new_status:
-                    # Ignore the initial "UNKNOWN -> State" jump on container boot
                     if old_status != 'UNKNOWN':
                         cursor.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)",
                                        (now, dev_type, item_name, new_status))
@@ -317,7 +316,6 @@ def monitor_loop():
                     new_s_stat = 'DOWN' if not silenced else 'DOWN (Silenced)'
                     set_status('switches', switch_id, switch_name, 'Switch', switch['status'], new_s_stat)
                     
-                    # Unreachable Cameras
                     cursor.execute("SELECT * FROM cameras WHERE switch_id = ?", (switch_id,))
                     cameras = cursor.fetchall()
                     for cam in cameras:
@@ -455,10 +453,36 @@ def index():
 @login_required
 def history():
     conn = get_db()
-    # Fetch the 500 most recent event logs
     logs = conn.execute("SELECT * FROM event_logs ORDER BY timestamp DESC LIMIT 500").fetchall()
     conn.close()
     return render_template('history.html', logs=logs)
+
+@app.route('/export_logs')
+@login_required
+def export_logs():
+    conn = get_db()
+    logs = conn.execute("SELECT * FROM event_logs ORDER BY timestamp DESC").fetchall()
+    conn.close()
+    
+    # Create an in-memory string stream to hold the CSV data
+    si = io.StringIO()
+    cw = csv.writer(si)
+    
+    # Write the header row
+    cw.writerow(['Timestamp (UTC)', 'Device Type', 'Device Name', 'Status'])
+    
+    # Write the data rows, converting Unix epoch to human-readable UTC string
+    for log in logs:
+        dt_string = datetime.utcfromtimestamp(log['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+        cw.writerow([dt_string, log['device_type'], log['device_name'], log['status']])
+        
+    # Return as a downloadable file
+    output = si.getvalue()
+    return Response(
+        output,
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment;filename=cctv_event_logs.csv"}
+    )
 
 @app.route('/api/status')
 @login_required

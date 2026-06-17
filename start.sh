@@ -8,5 +8,5 @@ echo "Starting background monitor loop..."
 python -c "from app import monitor_loop; monitor_loop()" &
 
 echo "Starting Gunicorn web server..."
-# 'exec' replaces the bash shell with Gunicorn as the primary container process
-exec gunicorn -w 4 --threads 2 -b 0.0.0.0:5000 app:app
+# Force Gunicorn to use the eventlet asynchronous worker for WebSocket support
+exec gunicorn -k eventlet -w 1 -b 0.0.0.0:5000 app:app

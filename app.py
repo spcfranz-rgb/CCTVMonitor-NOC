@@ -36,6 +36,34 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 # Initialize WebSockets with the eventlet async worker
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
+from authlib.integrations.flask_client import OAuth
+
+app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+
+# --- SECURITY HARDENING: SESSIONS ---
+app.secret_key = os.environ.get('SECRET_KEY')
+if not app.secret_key:
+    raise RuntimeError("CRITICAL: SECRET_KEY environment variable is missing.")
+    
+app.config['SESSION_COOKIE_HTTPONLY'] = True 
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get('REQUIRE_HTTPS', 'False').lower() == 'true'
+
+# --- NEW: AUTHENTIK OIDC SETUP ---
+oauth = OAuth(app)
+AUTHENTIK_URL = os.environ.get('AUTHENTIK_URL')
+
+if AUTHENTIK_URL:
+    oauth.register(
+        name='authentik',
+        client_id=os.environ.get('AUTHENTIK_CLIENT_ID'),
+        client_secret=os.environ.get('AUTHENTIK_CLIENT_SECRET'),
+        server_metadata_url=f"{AUTHENTIK_URL.rstrip('/')}/application/o/cctv-dashboard/.well-known/openid-configuration",
+        client_kwargs={'scope': 'openid profile email'}
+    )
+
 # --- SECURITY HARDENING: SESSIONS ---
 app.secret_key = os.environ.get('SECRET_KEY')
 if not app.secret_key:
@@ -399,6 +427,9 @@ def monitor_loop():
 # ==========================================
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    fallback = request.args.get('fallback') == 'true'
+    
+    # 1. Handle Local SQLite Form Submissions (Break-Glass Mode)
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
@@ -412,10 +443,67 @@ def login():
             login_user(user_obj)
             return redirect(url_for('index'))
         else:
-            flash('Invalid username or password', 'danger')
-            
-    return render_template('login.html')
+            flash('Invalid local username or password', 'danger')
+            return render_template('login.html', fallback=True)
 
+    # 2. Handle OIDC Single Sign-On (If WAN is up)
+    if AUTHENTIK_URL and not fallback:
+        try:
+            # Active Health Check: Verify WAN connectivity to Authentik
+            requests.get(f"{AUTHENTIK_URL.rstrip('/')}/-/health/ready/", timeout=1.5)
+            
+            # WAN is UP: Redirect to Central SSO
+            redirect_uri = url_for('auth_callback', _external=True)
+            return oauth.authentik.authorize_redirect(redirect_uri)
+            
+        except requests.RequestException:
+            # WAN is DOWN: Trip the breaker and show local login form
+            flash('Authentik SSO server is unreachable. Emergency Local Access enabled.', 'warning')
+            fallback = True
+
+    # 3. Render Local Form if SSO is disabled or WAN is down
+    return render_template('login.html', fallback=fallback, sso_configured=bool(AUTHENTIK_URL))
+
+
+@app.route('/auth/callback')
+def auth_callback():
+    """Handles the return trip from Authentik, creates/syncs the user, and logs them in."""
+    try:
+        token = oauth.authentik.authorize_access_token()
+        user_info = oauth.authentik.parse_id_token(token)
+    except Exception as e:
+        flash(f'SSO Login Failed: {str(e)}', 'danger')
+        return redirect(url_for('login', fallback='true'))
+    
+    # Extract username (Authentik uses preferred_username)
+    username = user_info.get('preferred_username') or user_info.get('name') or user_info.get('email')
+    
+    # Map Roles based on Authentik Groups (Create these groups in your Authentik dashboard)
+    groups = user_info.get('groups', [])
+    role = 'user'
+    if 'cctv-admins' in groups:
+        role = 'admin'
+    elif 'cctv-operators' in groups:
+        role = 'operator'
+        
+    conn = get_db()
+    db_user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    
+    if not db_user:
+        # User doesn't exist locally yet. Auto-provision them into SQLite with an unusable password hash.
+        cursor = conn.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", (username, 'SSO_MANAGED', role))
+        user_id = cursor.lastrowid
+    else:
+        user_id = db_user['id']
+        # Always sync their role from Authentik in case they were promoted/demoted centrally
+        conn.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
+        
+    conn.commit()
+    conn.close()
+    
+    # Log them into the local Flask session
+    login_user(User(user_id, username, role))
+    return redirect(url_for('index'))
 @app.route('/logout')
 @login_required
 def logout():

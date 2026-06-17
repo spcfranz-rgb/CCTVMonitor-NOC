@@ -731,8 +731,10 @@ def manual_ping():
 def run_speedtest():
     def execute_test():
         try:
-            cmd = ['speedtest-cli', '--json']
+            # FIX 1: Added --secure to force HTTPS and bypass Ookla's recent HTTP blocks
+            cmd = ['speedtest-cli', '--secure', '--json']
             process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+            
             if process.returncode == 0:
                 data = json.loads(process.stdout)
                 download = round(data.get('download', 0) / 1000000, 2)
@@ -740,9 +742,15 @@ def run_speedtest():
                 ping = round(data.get('ping', 0), 1)
                 isp = data.get('client', {}).get('isp', 'Unknown')
                 socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': isp})
-            else: socketio.emit('speedtest_result', {'success': False, 'error': 'Speed test binary failed.'})
-        except subprocess.TimeoutExpired: socketio.emit('speedtest_result', {'success': False, 'error': 'Speed test timed out.'})
-        except Exception as e: socketio.emit('speedtest_result', {'success': False, 'error': str(e)})
+            else: 
+                # FIX 2: Pass the actual STDERR log to the UI so we can read the exact crash reason
+                error_msg = process.stderr.strip() or process.stdout.strip() or "Unknown execution error."
+                socketio.emit('speedtest_result', {'success': False, 'error': f'Speedtest API Error: {error_msg}'})
+                
+        except subprocess.TimeoutExpired: 
+            socketio.emit('speedtest_result', {'success': False, 'error': 'Speed test timed out after 60 seconds.'})
+        except Exception as e: 
+            socketio.emit('speedtest_result', {'success': False, 'error': f'System Error: {str(e)}'})
 
     threading.Thread(target=execute_test).start()
     return jsonify({'status': 'running'})

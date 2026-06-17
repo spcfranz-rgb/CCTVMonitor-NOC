@@ -102,7 +102,6 @@ def operator_required(f):
     return decorated_function
 
 def trigger_monitor_check():
-    """Drops an IPC flag to immediately wake up the background monitor process."""
     try: open(FORCE_CHECK_FLAG, 'w').close()
     except Exception: pass
 
@@ -238,7 +237,7 @@ def monitor_loop():
     client = mqtt.Client("camera_monitor_service")
     try:
         client.connect(broker, port, 60)
-        client.loop_start() # Starts a silent thread to maintain MQTT pings
+        client.loop_start()
     except Exception as e:
         print(f"Initial MQTT connection failed: {e}")
         
@@ -247,7 +246,21 @@ def monitor_loop():
             conn = get_db()
             cursor = conn.cursor()
             now = time.time()
-            # ... (rest of the logic remains the same, do not disconnect at the end) ...
+            
+            def set_status(table, item_id, item_name, dev_type, old_status, new_status):
+                if old_status != new_status:
+                    if old_status != 'UNKNOWN':
+                        cursor.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, dev_type, item_name, new_status))
+                    cursor.execute(f"UPDATE {table} SET status = ? WHERE id = ?", (new_status, item_id))
+                    socketio.emit('state_change', {
+                        'type': table, 'id': item_id, 'name': item_name,
+                        'status': new_status, 'device_type': dev_type, 'timestamp': now
+                    })
+            
+            # Re-fetch settings in case they were updated via UI
+            cursor.execute("SELECT key, value FROM settings")
+            dynamic_settings = {row['key']: row['value'] for row in cursor.fetchall()}
+            interval = int(dynamic_settings.get('check_interval', 60))
             
             # PROCESS SWITCHES & CAMERAS
             cursor.execute("SELECT * FROM switches")
@@ -269,10 +282,8 @@ def monitor_loop():
                     cameras = cursor.fetchall()
                     camera_results = {}
                     
+                    # Concurrency optimization using Eventlet GreenPool
                     pool = eventlet.greenpool.GreenPool(size=20)
-                    camera_results = {}
-                    
-                    # Native Eventlet concurrency mapped directly to your worker function
                     for c_id, cam_up, stream_ok, snap_bytes in pool.imap(threaded_camera_check, [dict(c) for c in cameras]):
                         camera_results[c_id] = (cam_up, stream_ok, snap_bytes)
                     
@@ -328,12 +339,10 @@ def monitor_loop():
             standalone_cameras = cursor.fetchall()
             standalone_results = {}
             
-                    pool = eventlet.greenpool.GreenPool(size=20)
-                    camera_results = {}
-                    
-                    # Native Eventlet concurrency mapped directly to your worker function
-                    for c_id, cam_up, stream_ok, snap_bytes in pool.imap(threaded_camera_check, [dict(c) for c in cameras]):
-                        camera_results[c_id] = (cam_up, stream_ok, snap_bytes)
+            # Concurrency optimization using Eventlet GreenPool
+            standalone_pool = eventlet.greenpool.GreenPool(size=20)
+            for c_id, cam_up, stream_ok, snap_bytes in standalone_pool.imap(threaded_camera_check, [dict(c) for c in standalone_cameras]):
+                standalone_results[c_id] = (cam_up, stream_ok, snap_bytes)
                     
             for cam in standalone_cameras:
                 cam_id, cam_name, cam_silenced = cam['id'], cam['name'], (cam['silenced_until'] > now)
@@ -379,7 +388,6 @@ def monitor_loop():
 
             conn.commit()
             conn.close()
-            client.disconnect()
             
         except Exception as e:
             print(f"Error in monitor loop: {e}")
@@ -903,13 +911,12 @@ def proxy_absolute_paths(e):
         if len(parts) >= 4 and parts[1] == 'tunnel':
             return proxy_request(parts[2], parts[3], request.path, request.method, request.headers, request.get_data(), request.cookies)
     return "404 - Not Found", 404
+
 # ==========================================
 # APPLICATION STARTUP
 # ==========================================
-# Ensure the background monitoring loop is spawned exactly once when the server starts
 @app.before_first_request
 def start_background_threads():
-    # We use a dummy file flag to ensure Gunicorn doesn't spawn duplicate loops if workers restart
     lock_file = '/app/data/monitor.lock'
     if not os.path.exists(lock_file):
         open(lock_file, 'w').close()

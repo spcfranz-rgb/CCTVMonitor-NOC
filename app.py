@@ -19,11 +19,15 @@ from flask import Flask, render_template, request, redirect, url_for, abort, fla
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
+from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
 
-# Tell Flask it is behind a reverse proxy (NGINX) so redirects use the public HTTPS domain
+# Tell Flask it is behind a reverse proxy (NGINX)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
+# Initialize WebSockets
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # --- SECURITY HARDENING: SESSIONS ---
 app.secret_key = os.environ.get('SECRET_KEY', 'cctv-super-secret-key') 
@@ -64,7 +68,6 @@ def admin_required(f):
     return decorated_function
 
 def trigger_monitor_check():
-    """Drops an IPC flag to immediately wake up the background monitor process."""
     try:
         open(FORCE_CHECK_FLAG, 'w').close()
     except Exception:
@@ -84,25 +87,9 @@ def init_db():
     cursor = conn.cursor()
     
     cursor.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS switches (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, ip TEXT, status TEXT DEFAULT 'UNKNOWN'
-    )""")
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS cameras (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, switch_id INTEGER, name TEXT UNIQUE, 
-        ip TEXT, stream_url TEXT, status TEXT DEFAULT 'UNKNOWN',
-        FOREIGN KEY(switch_id) REFERENCES switches(id)
-    )""")
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS event_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp REAL,
-        device_type TEXT,
-        device_name TEXT,
-        status TEXT
-    )""")
+    cursor.execute("CREATE TABLE IF NOT EXISTS switches (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, ip TEXT, status TEXT DEFAULT 'UNKNOWN')")
+    cursor.execute("CREATE TABLE IF NOT EXISTS cameras (id INTEGER PRIMARY KEY AUTOINCREMENT, switch_id INTEGER, name TEXT UNIQUE, ip TEXT, stream_url TEXT, status TEXT DEFAULT 'UNKNOWN', FOREIGN KEY(switch_id) REFERENCES switches(id))")
+    cursor.execute("CREATE TABLE IF NOT EXISTS event_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, device_type TEXT, device_name TEXT, status TEXT)")
     
     try:
         cursor.execute("ALTER TABLE cameras ADD COLUMN manufacturer TEXT DEFAULT 'Other'")
@@ -117,10 +104,7 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT, role TEXT
-    )""")
+    cursor.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT, role TEXT)")
     
     cursor.execute("SELECT count(*) FROM settings")
     if cursor.fetchone()[0] == 0:
@@ -145,7 +129,6 @@ def init_db():
 
     conn.commit()
     conn.close()
-    print("Database initialized.")
 
 # ==========================================
 # BACKGROUND MONITORING TASK
@@ -163,10 +146,7 @@ def is_port_open(target, port, timeout=2):
 
 def is_stream_active(url):
     try:
-        response = subprocess.call(
-            ['ffprobe', '-rtsp_transport', 'tcp', '-v', 'error', '-i', url],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10
-        )
+        response = subprocess.call(['ffprobe', '-rtsp_transport', 'tcp', '-v', 'error', '-i', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
         return response == 0
     except subprocess.TimeoutExpired:
         return False
@@ -176,17 +156,13 @@ def get_snapshot_bytes(ip, mfg, user, pwd, stream_url):
         url = None
         auth_in_url = False
         
-        if mfg == 'Hikvision':
-            url = f"http://{ip}/ISAPI/Streaming/channels/101/picture"
-        elif mfg in ['Dahua', 'Amcrest']:
-            url = f"http://{ip}/cgi-bin/snapshot.cgi?chn=1"
-        elif mfg == 'Axis':
-            url = f"http://{ip}/axis-cgi/jpg/image.cgi"
-        elif mfg == 'Foscam':
+        if mfg == 'Hikvision': url = f"http://{ip}/ISAPI/Streaming/channels/101/picture"
+        elif mfg in ['Dahua', 'Amcrest']: url = f"http://{ip}/cgi-bin/snapshot.cgi?chn=1"
+        elif mfg == 'Axis': url = f"http://{ip}/axis-cgi/jpg/image.cgi"
+        elif mfg == 'Foscam': 
             url = f"http://{ip}/cgi-bin/CGIProxy.fcgi?cmd=snapPicture2&usr={user}&pwd={pwd}"
             auth_in_url = True
-        elif mfg == 'Hanwha':
-            url = f"http://{ip}/stw-cgi/video.cgi?msubmenu=snapshot&action=view&Profile=1"
+        elif mfg == 'Hanwha': url = f"http://{ip}/stw-cgi/video.cgi?msubmenu=snapshot&action=view&Profile=1"
             
         if url:
             try:
@@ -196,7 +172,6 @@ def get_snapshot_bytes(ip, mfg, user, pwd, stream_url):
                     resp = requests.get(url, auth=HTTPDigestAuth(user, pwd), timeout=3)
                     if resp.status_code != 200:
                         resp = requests.get(url, auth=HTTPBasicAuth(user, pwd), timeout=3)
-                        
                 if resp.status_code == 200 and 'image' in resp.headers.get('Content-Type', ''):
                     return resp.content
             except Exception:
@@ -225,9 +200,24 @@ def monitor_loop():
             def set_status(table, item_id, item_name, dev_type, old_status, new_status):
                 if old_status != new_status:
                     if old_status != 'UNKNOWN':
-                        cursor.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)",
-                                       (now, dev_type, item_name, new_status))
+                        cursor.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, dev_type, item_name, new_status))
                     cursor.execute(f"UPDATE {table} SET status = ? WHERE id = ?", (new_status, item_id))
+                    
+                    # ZERO-LATENCY PUSH: Hit the internal webhook to emit WebSocket event
+                    try:
+                        requests.post('http://127.0.0.1:5000/internal_emit', json={
+                            'event': 'state_change',
+                            'data': {
+                                'type': table,
+                                'id': item_id,
+                                'name': item_name,
+                                'status': new_status,
+                                'device_type': dev_type,
+                                'timestamp': now
+                            }
+                        }, timeout=2)
+                    except Exception as e:
+                        print(f"Failed to push socket update: {e}")
             
             cursor.execute("SELECT key, value FROM settings")
             settings_dict = {row['key']: row['value'] for row in cursor.fetchall()}
@@ -237,10 +227,8 @@ def monitor_loop():
             interval = int(settings_dict.get('check_interval', 60))
             
             client = mqtt.Client("camera_monitor_service")
-            try:
-                client.connect(broker, port, 60)
-            except Exception:
-                pass
+            try: client.connect(broker, port, 60)
+            except Exception: pass
             
             # 1. PROCESS SWITCHES & THEIR ATTACHED CAMERAS
             cursor.execute("SELECT * FROM switches")
@@ -284,8 +272,7 @@ def monitor_loop():
                                             is_frozen = True
                                             
                                         previous_hashes[cam_id] = current_hash
-                                    except Exception as e:
-                                        print(f"Error hashing image for {cam_name}: {e}")
+                                    except Exception:
                                         pass
                             
                             if cam_silenced:
@@ -348,8 +335,7 @@ def monitor_loop():
                                     is_frozen = True
                                     
                                 previous_hashes[cam_id] = current_hash
-                            except Exception as e:
-                                print(f"Error hashing image for {cam_name}: {e}")
+                            except Exception:
                                 pass
                             
                     if cam_silenced:
@@ -393,12 +379,22 @@ def monitor_loop():
         # 4. INTERRUPTIBLE SLEEP CYCLE
         for _ in range(interval):
             if os.path.exists(FORCE_CHECK_FLAG):
-                try:
-                    os.remove(FORCE_CHECK_FLAG)
-                except OSError:
-                    pass
+                try: os.remove(FORCE_CHECK_FLAG)
+                except OSError: pass
                 break
             time.sleep(1)
+
+# ==========================================
+# INTERNAL WEBHOOK (For Zero-Latency Pushes)
+# ==========================================
+@app.route('/internal_emit', methods=['POST'])
+def internal_emit():
+    # Reject anything that doesn't come directly from the local background loop
+    if request.remote_addr != '127.0.0.1':
+        abort(403)
+    payload = request.json
+    socketio.emit(payload['event'], payload['data'])
+    return "OK", 200
 
 # ==========================================
 # FLASK WEB ROUTES
@@ -457,17 +453,6 @@ def history():
     conn.close()
     return render_template('history.html', logs=logs)
 
-@app.route('/api/logs')
-@login_required
-def api_logs():
-    conn = get_db()
-    # Fetch the 500 most recent logs
-    logs = conn.execute("SELECT * FROM event_logs ORDER BY timestamp DESC LIMIT 500").fetchall()
-    conn.close()
-    
-    # Convert the SQLite Row objects into a standard JSON dictionary list
-    return jsonify([dict(row) for row in logs])
-    
 @app.route('/export_logs')
 @login_required
 def export_logs():
@@ -475,41 +460,15 @@ def export_logs():
     logs = conn.execute("SELECT * FROM event_logs ORDER BY timestamp DESC").fetchall()
     conn.close()
     
-    # Create an in-memory string stream to hold the CSV data
     si = io.StringIO()
     cw = csv.writer(si)
-    
-    # Write the header row
     cw.writerow(['Timestamp (UTC)', 'Device Type', 'Device Name', 'Status'])
-    
-    # Write the data rows, converting Unix epoch to human-readable UTC string
     for log in logs:
         dt_string = datetime.utcfromtimestamp(log['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
         cw.writerow([dt_string, log['device_type'], log['device_name'], log['status']])
         
-    # Return as a downloadable file
     output = si.getvalue()
-    return Response(
-        output,
-        mimetype="text/csv",
-        headers={"Content-Disposition": "attachment;filename=cctv_event_logs.csv"}
-    )
-
-@app.route('/api/status')
-@login_required
-def api_status():
-    conn = get_db()
-    switches = conn.execute("SELECT id, status FROM switches").fetchall()
-    cameras = conn.execute("SELECT id, status FROM cameras").fetchall()
-    conn.close()
-    
-    status_data = {}
-    for s in switches:
-        status_data[f"switch_{s['id']}"] = s['status']
-    for c in cameras:
-        status_data[f"camera_{c['id']}"] = c['status']
-        
-    return jsonify(status_data)
+    return Response(output, mimetype="text/csv", headers={"Content-Disposition": "attachment;filename=cctv_event_logs.csv"})
 
 @app.route('/toggle_silence/<device_type>/<int:id>', methods=['POST'])
 @login_required
@@ -517,15 +476,11 @@ def api_status():
 def toggle_silence(device_type, id):
     hours = float(request.form.get('hours', 0))
     silence_until = time.time() + (hours * 3600) if hours > 0 else 0
-    
     conn = get_db()
-    if device_type == 'switch':
-        conn.execute("UPDATE switches SET silenced_until = ? WHERE id = ?", (silence_until, id))
-    elif device_type == 'camera':
-        conn.execute("UPDATE cameras SET silenced_until = ? WHERE id = ?", (silence_until, id))
+    if device_type == 'switch': conn.execute("UPDATE switches SET silenced_until = ? WHERE id = ?", (silence_until, id))
+    elif device_type == 'camera': conn.execute("UPDATE cameras SET silenced_until = ? WHERE id = ?", (silence_until, id))
     conn.commit()
     conn.close()
-    
     trigger_monitor_check()
     return jsonify({'success': True})
 
@@ -534,15 +489,12 @@ def toggle_silence(device_type, id):
 @admin_required
 def manual_ping():
     ip = request.form.get('ip')
-    if not ip:
-        return jsonify({'success': False, 'output': 'No IP address provided.'})
+    if not ip: return jsonify({'success': False, 'output': 'No IP address provided.'})
     try:
         cmd = ['ping', '-c', '4', '-W', '2', ip]
         process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
-        if process.returncode == 0:
-            return jsonify({'success': True, 'output': process.stdout})
-        else:
-            return jsonify({'success': False, 'output': process.stdout or process.stderr or 'Ping failed.'})
+        if process.returncode == 0: return jsonify({'success': True, 'output': process.stdout})
+        else: return jsonify({'success': False, 'output': process.stdout or process.stderr or 'Ping failed.'})
     except subprocess.TimeoutExpired:
         return jsonify({'success': False, 'output': 'Ping command timed out.'})
     except Exception as e:
@@ -559,7 +511,6 @@ def update_settings():
     conn.execute("UPDATE settings SET value = ? WHERE key = 'check_interval'", (request.form['check_interval'],))
     conn.commit()
     conn.close()
-    
     trigger_monitor_check()
     flash('Settings updated. Immediate network scan triggered.', 'success')
     return redirect(url_for('index'))
@@ -587,7 +538,6 @@ def test_alert():
         flash(f'Success! Test alert sent to {test_topic}', 'success')
     except Exception as e:
         flash(f'MQTT Error: Could not reach broker at {broker}:{port}. ({str(e)})', 'danger')
-        
     return redirect(url_for('index'))
 
 @app.route('/add_switch', methods=['POST'])
@@ -600,10 +550,8 @@ def add_switch():
         conn.commit()
         trigger_monitor_check()
         flash('Switch added.', 'success')
-    except sqlite3.IntegrityError:
-        flash('Error: A switch with that name already exists.', 'danger')
-    finally:
-        conn.close()
+    except sqlite3.IntegrityError: flash('Error: A switch with that name already exists.', 'danger')
+    finally: conn.close()
     return redirect(url_for('index'))
 
 @app.route('/edit_switch/<int:id>', methods=['GET', 'POST'])
@@ -635,7 +583,6 @@ def delete_switch(id):
     conn.execute("DELETE FROM switches WHERE id = ?", (id,))
     conn.commit()
     conn.close()
-    
     trigger_monitor_check()
     flash('Switch deleted.', 'success')
     return redirect(url_for('index'))
@@ -649,19 +596,13 @@ def add_camera():
 
     conn = get_db()
     try:
-        conn.execute("""
-            INSERT INTO cameras (switch_id, name, ip, stream_url, manufacturer, username, password) 
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (switch_id, request.form['name'], request.form['ip'], 
-              request.form['stream_url'], request.form.get('manufacturer', 'Other'),
-              request.form.get('username', ''), request.form.get('password', '')))
+        conn.execute("""INSERT INTO cameras (switch_id, name, ip, stream_url, manufacturer, username, password) VALUES (?, ?, ?, ?, ?, ?, ?)""", 
+                     (switch_id, request.form['name'], request.form['ip'], request.form['stream_url'], request.form.get('manufacturer', 'Other'), request.form.get('username', ''), request.form.get('password', '')))
         conn.commit()
         trigger_monitor_check()
         flash('Camera added.', 'success')
-    except sqlite3.IntegrityError:
-        flash('Error: A camera with that name already exists.', 'danger')
-    finally:
-        conn.close()
+    except sqlite3.IntegrityError: flash('Error: A camera with that name already exists.', 'danger')
+    finally: conn.close()
     return redirect(url_for('index'))
 
 @app.route('/edit_camera/<int:id>', methods=['GET', 'POST'])
@@ -674,12 +615,8 @@ def edit_camera(id):
         switch_id = switch_id if switch_id else None 
 
         try:
-            conn.execute("""
-                UPDATE cameras SET switch_id = ?, name = ?, ip = ?, stream_url = ?, 
-                manufacturer = ?, username = ?, password = ? WHERE id = ?
-            """, (switch_id, request.form['name'], request.form['ip'], 
-                  request.form['stream_url'], request.form.get('manufacturer', 'Other'),
-                  request.form.get('username', ''), request.form.get('password', ''), id))
+            conn.execute("""UPDATE cameras SET switch_id = ?, name = ?, ip = ?, stream_url = ?, manufacturer = ?, username = ?, password = ? WHERE id = ?""", 
+                         (switch_id, request.form['name'], request.form['ip'], request.form['stream_url'], request.form.get('manufacturer', 'Other'), request.form.get('username', ''), request.form.get('password', ''), id))
             conn.commit()
             trigger_monitor_check()
             flash('Camera updated.', 'success')
@@ -701,7 +638,6 @@ def delete_camera(id):
     conn.execute("DELETE FROM cameras WHERE id = ?", (id,))
     conn.commit()
     conn.close()
-    
     trigger_monitor_check()
     flash('Camera deleted.', 'success')
     return redirect(url_for('index'))
@@ -718,8 +654,7 @@ def add_user():
         conn.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", (username, password, role))
         conn.commit()
         flash('User added.', 'success')
-    except sqlite3.IntegrityError:
-        flash('Username already exists.', 'danger')
+    except sqlite3.IntegrityError: flash('Username already exists.', 'danger')
     conn.close()
     return redirect(url_for('index'))
 
@@ -743,44 +678,30 @@ def snapshot(id):
     conn = get_db()
     camera = conn.execute("SELECT stream_url, ip, manufacturer, username, password FROM cameras WHERE id = ?", (id,)).fetchone()
     conn.close()
-    
-    if not camera:
-        return "Camera not found", 404
-        
+    if not camera: return "Camera not found", 404
     snap_bytes = get_snapshot_bytes(camera['ip'], camera['manufacturer'], camera['username'], camera['password'], camera['stream_url'])
-    
-    if snap_bytes:
-        return Response(snap_bytes, mimetype='image/jpeg')
-    else:
-        return "Failed to grab snapshot", 500
+    if snap_bytes: return Response(snap_bytes, mimetype='image/jpeg')
+    else: return "Failed to grab snapshot", 500
 
 # ==========================================
 # WEB UI TUNNELING (REVERSE PROXY)
 # ==========================================
 def proxy_request(device_type, device_id, req_path, method, headers, data, cookies):
     conn = get_db()
-    if device_type == 'switch':
-        device = conn.execute("SELECT ip FROM switches WHERE id = ?", (device_id,)).fetchone()
-    elif device_type == 'camera':
-        device = conn.execute("SELECT ip FROM cameras WHERE id = ?", (device_id,)).fetchone()
-    else:
-        return "Invalid device type", 404
+    if device_type == 'switch': device = conn.execute("SELECT ip FROM switches WHERE id = ?", (device_id,)).fetchone()
+    elif device_type == 'camera': device = conn.execute("SELECT ip FROM cameras WHERE id = ?", (device_id,)).fetchone()
+    else: return "Invalid device type", 404
     conn.close()
 
-    if not device:
-        return "Device not found", 404
+    if not device: return "Device not found", 404
 
     try:
         resolved_ip = socket.gethostbyname(device['ip'])
         ip_obj = ipaddress.ip_address(resolved_ip)
-        
         if not ip_obj.is_private or ip_obj.is_loopback:
              return "Security Policy Violation: Target domain resolves to a non-local or restricted IP.", 403
-             
-    except socket.gaierror:
-        return f"DNS Error: Could not resolve hostname '{device['ip']}'", 400
-    except ValueError:
-        return "Invalid IP or Hostname format.", 400
+    except socket.gaierror: return f"DNS Error: Could not resolve hostname '{device['ip']}'", 400
+    except ValueError: return "Invalid IP or Hostname format.", 400
 
     query_string = request.query_string.decode('utf-8')
     full_req_path = f"{req_path}?{query_string}" if query_string else req_path
@@ -788,22 +709,14 @@ def proxy_request(device_type, device_id, req_path, method, headers, data, cooki
     clean_headers = {k: v for k, v in headers if k.lower() not in ['host', 'origin', 'referer', 'accept-encoding']}
     
     try:
-        resp = requests.request(
-            method=method, url=target_url, headers=clean_headers, data=data,
-            cookies=cookies, allow_redirects=False, stream=True, timeout=15
-        )
-        
+        resp = requests.request(method=method, url=target_url, headers=clean_headers, data=data, cookies=cookies, allow_redirects=False, stream=True, timeout=15)
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
         resp_headers = [(name, value) for (name, value) in resp.raw.headers.items() if name.lower() not in excluded_headers]
-        
         for i, (name, value) in enumerate(resp_headers):
             if name.lower() == 'location':
-                if value.startswith(f"http://{device['ip']}"):
-                    value = value.replace(f"http://{device['ip']}", f"/tunnel/{device_type}/{device_id}")
-                elif value.startswith('/'):
-                    value = f"/tunnel/{device_type}/{device_id}{value}"
+                if value.startswith(f"http://{device['ip']}"): value = value.replace(f"http://{device['ip']}", f"/tunnel/{device_type}/{device_id}")
+                elif value.startswith('/'): value = f"/tunnel/{device_type}/{device_id}{value}"
                 resp_headers[i] = (name, value)
-
         return Response(resp.iter_content(chunk_size=10*1024), resp.status_code, resp_headers)
     except requests.exceptions.RequestException as e:
         return f"Tunnel Error connecting to {device['ip']}: {str(e)}", 502
@@ -816,16 +729,11 @@ def tunnel(device_type, device_id, req_path):
 
 @app.errorhandler(404)
 def proxy_absolute_paths(e):
-    if not current_user.is_authenticated:
-        return "404 - Not Found", 404
-
+    if not current_user.is_authenticated: return "404 - Not Found", 404
     referer = request.headers.get('Referer')
     if referer:
         parsed_referer = urlparse(referer)
         parts = parsed_referer.path.split('/')
         if len(parts) >= 4 and parts[1] == 'tunnel':
-            device_type = parts[2]
-            device_id = parts[3]
-            return proxy_request(device_type, device_id, request.path, request.method, request.headers, request.get_data(), request.cookies)
-    
+            return proxy_request(parts[2], parts[3], request.path, request.method, request.headers, request.get_data(), request.cookies)
     return "404 - Not Found", 404

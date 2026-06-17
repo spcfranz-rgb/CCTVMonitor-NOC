@@ -24,17 +24,24 @@
               {% endif %}
             {% endwith %}
 
-            <form action="/login" method="POST">
+            <form action="/login?fallback=true" method="POST">
                 <div class="mb-3">
-                    <label class="form-label">Username</label>
+                    <label class="form-label">Local Username</label>
                     <input type="text" name="username" class="form-control" required autofocus>
                 </div>
                 <div class="mb-4">
-                    <label class="form-label">Password</label>
+                    <label class="form-label">Local Password</label>
                     <input type="password" name="password" class="form-control" required>
                 </div>
-                <button type="submit" class="btn btn-primary w-100">Secure Login</button>
+                <button type="submit" class="btn btn-primary w-100 mb-3">Secure Local Login</button>
             </form>
+
+            {% if sso_configured %}
+            <div class="text-center border-top pt-3">
+                <a href="/login" class="btn btn-outline-info btn-sm w-100">Attempt Authentik SSO Login</a>
+            </div>
+            {% endif %}
+
         </div>
     </div>
 

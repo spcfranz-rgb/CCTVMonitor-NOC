@@ -265,23 +265,39 @@
                         <h6 class="mb-0">Add Camera</h6>
                         
                         <div class="dropdown">
-                            <button class="btn btn-outline-info btn-sm dropdown-toggle py-0" type="button" data-bs-toggle="dropdown" aria-expanded="false">
+                            <button class="btn btn-outline-info btn-sm dropdown-toggle py-0" type="button" data-bs-toggle="dropdown" data-bs-auto-close="outside" aria-expanded="false">
                                 Auto-Discover
                             </button>
-                            <div class="dropdown-menu dropdown-menu-end p-3 shadow" style="width: 300px;">
+                            <div class="dropdown-menu dropdown-menu-end p-3 shadow" style="width: 320px;">
                                 <p class="small text-muted mb-2">Scan a local subnet for port 554 (RTSP).</p>
                                 <div class="input-group input-group-sm mb-2">
                                     <input type="text" id="scanSubnetInput" class="form-control" placeholder="192.168.1.0/24" value="192.168.1.0/24">
                                     <button class="btn btn-primary" type="button" id="scanSubnetBtn" onclick="runNetworkScan()">Scan</button>
                                 </div>
+                                
                                 <div id="scanSpinner" class="text-center d-none mb-2">
                                     <div class="spinner-border spinner-border-sm text-info" role="status"></div>
                                     <span class="ms-2 small text-muted">Sweeping subnet...</span>
                                 </div>
+                                
                                 <div id="scanResults" class="small mt-2"></div>
+                                
+                                <div id="bulkAddOptions" class="d-none mt-3 pt-2 border-top">
+                                    <label class="form-label small fw-bold mb-1">Mass-Add Selected</label>
+                                    <select id="bulkMfg" class="form-select form-select-sm mb-1">
+                                        <option value="Other">Other (FFmpeg RTSP)</option>
+                                        <option value="Hanwha">Hanwha / Wisenet</option>
+                                        <option value="Hikvision">Hikvision</option>
+                                        <option value="Dahua">Dahua</option>
+                                    </select>
+                                    <div class="input-group input-group-sm mb-2">
+                                        <input type="text" id="bulkUser" class="form-control" placeholder="Shared User">
+                                        <input type="password" id="bulkPass" class="form-control" placeholder="Shared Pass">
+                                    </div>
+                                    <button class="btn btn-success btn-sm w-100" id="submitBulkBtn" onclick="submitBulkAdd()">Add Checked Cameras</button>
+                                </div>
                             </div>
                         </div>
-                    </div>
     <div class="modal fade" id="previewModal" tabindex="-1" aria-hidden="true">
       <div class="modal-dialog modal-lg modal-dialog-centered">
         <div class="modal-content">
@@ -511,11 +527,16 @@
     </script>
 
     <script>
+        function toggleAllCheckboxes(state) {
+            document.querySelectorAll('.bulk-ip-check').forEach(chk => chk.checked = state);
+        }
+
         function runNetworkScan() {
             const btn = document.getElementById('scanSubnetBtn');
             const input = document.getElementById('scanSubnetInput');
             const spinner = document.getElementById('scanSpinner');
             const resultsDiv = document.getElementById('scanResults');
+            const bulkOptions = document.getElementById('bulkAddOptions');
             
             const subnet = input.value.trim();
             if (!subnet) return;
@@ -523,6 +544,7 @@
             btn.disabled = true;
             spinner.classList.remove('d-none');
             resultsDiv.innerHTML = '';
+            bulkOptions.classList.add('d-none');
 
             const formData = new FormData();
             formData.append('subnet', subnet);
@@ -540,16 +562,22 @@
                     return;
                 }
 
-                // Render out clickable IP addresses that auto-fill the Add Camera form
-                let html = `<div class="alert alert-success py-1 mb-2">Found ${data.discovered.length} new devices!</div><ul class="list-group list-group-flush border rounded">`;
+                // Render checkboxes + clickable IP text
+                let html = `<div class="alert alert-success py-1 mb-2 px-2 text-center">Found ${data.discovered.length} new devices!</div>
+                <div class="mb-1 text-end"><a href="#" class="text-decoration-none me-2" onclick="toggleAllCheckboxes(true)">Select All</a> <a href="#" class="text-decoration-none text-secondary" onclick="toggleAllCheckboxes(false)">None</a></div>
+                <ul class="list-group list-group-flush border rounded mb-2" style="max-height: 150px; overflow-y: auto;">`;
+                
                 data.discovered.forEach(ip => {
-                    html += `<li class="list-group-item list-group-item-action d-flex justify-content-between align-items-center py-1 px-2 cursor-pointer" onclick="document.querySelector('input[name=\\'ip\\']').value = '${ip}';">
-                        ${ip}
-                        <span class="badge bg-primary rounded-pill pb-1">+</span>
+                    html += `<li class="list-group-item py-1 px-2 d-flex align-items-center">
+                        <input class="form-check-input me-2 bulk-ip-check" type="checkbox" value="${ip}" checked>
+                        <span class="text-primary cursor-pointer flex-grow-1" style="cursor: pointer;" onclick="document.querySelector('input[name=\\'ip\\']').value = '${ip}'; alert('IP copied to manual form below.');" title="Click to auto-fill manual form below">${ip}</span>
                     </li>`;
                 });
-                html += `</ul><small class="text-muted mt-1 d-block text-center">Click an IP to auto-fill the form.</small>`;
+                
+                html += `</ul><small class="text-muted mt-1 d-block lh-sm" style="font-size: 0.7rem;">Check boxes to mass-add, or click a blue IP to drop it into the manual form below.</small>`;
+                
                 resultsDiv.innerHTML = html;
+                bulkOptions.classList.remove('d-none'); // Reveal the Mass Add button
             })
             .catch(err => {
                 resultsDiv.innerHTML = `<span class="text-danger">Network Error: ${err.message}</span>`;
@@ -557,6 +585,55 @@
             .finally(() => {
                 btn.disabled = false;
                 spinner.classList.add('d-none');
+            });
+        }
+
+        function submitBulkAdd() {
+            const btn = document.getElementById('submitBulkBtn');
+            const checkboxes = document.querySelectorAll('.bulk-ip-check:checked');
+            
+            if (checkboxes.length === 0) {
+                alert("Please check at least one IP address to mass-add.");
+                return;
+            }
+
+            const ips = Array.from(checkboxes).map(chk => chk.value);
+            const mfg = document.getElementById('bulkMfg').value;
+            const user = document.getElementById('bulkUser').value.trim();
+            const pass = document.getElementById('bulkPass').value;
+            
+            // Grab the currently selected switch ID from the manual form so they attach to the correct parent!
+            const switchId = document.querySelector('select[name="switch_id"]').value;
+
+            btn.disabled = true;
+            btn.innerText = "Processing...";
+
+            fetch('/api/add_cameras_bulk', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    ips: ips,
+                    manufacturer: mfg,
+                    username: user,
+                    password: pass,
+                    switch_id: switchId
+                })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    alert(`Successfully added ${data.added} cameras!`);
+                    location.reload(); // Refresh the page to see the new cameras instantly
+                } else {
+                    alert(`Error: ${data.error}`);
+                    btn.disabled = false;
+                    btn.innerText = "Add Checked Cameras";
+                }
+            })
+            .catch(err => {
+                alert(`Network Error: ${err.message}`);
+                btn.disabled = false;
+                btn.innerText = "Add Checked Cameras";
             });
         }
     </script>

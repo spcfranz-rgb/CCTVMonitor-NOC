@@ -7,9 +7,10 @@
 </head>
 <body class="container py-4">
 
-    <div class="d-flex justify-content-between align-items-center mb-4 border-bottom pb-3">
+<div class="d-flex justify-content-between align-items-center mb-4 border-bottom pb-3">
         <h1 class="mb-0 h3">CCTV & Network Dashboard</h1>
         <div class="d-flex align-items-center">
+            <a href="/history" class="btn btn-outline-info btn-sm me-3">View Event Logs</a>
             <span class="me-3">Logged in as: <strong>{{ current_user.username }}</strong> ({{ current_user.role }})</span>
             <a href="/logout" class="btn btn-outline-light btn-sm">Logout</a>
         </div>

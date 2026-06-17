@@ -8,7 +8,15 @@
 <body class="container py-4">
 
     <div class="d-flex justify-content-between align-items-center mb-4 border-bottom pb-3">
-        <h1 class="mb-0 h3">CCTV & Network Dashboard</h1>
+        <div class="d-flex align-items-center">
+            {% if company_logo %}
+                <img src="{{ company_logo }}" alt="Company Logo" style="height: 30px; width: auto; object-fit: contain;" class="me-3 border-end border-secondary pe-3">
+            {% endif %}
+            {% if customer_logo %}
+                <img src="{{ customer_logo }}" alt="Customer Logo" style="height: 40px; width: auto; object-fit: contain;" class="me-3">
+            {% endif %}
+            <h1 class="mb-0 h3">CCTV Dashboard</h1>
+        </div>
         <div class="d-flex align-items-center">
             <a href="/history" class="btn btn-outline-info btn-sm me-3">View Event Logs</a>
             <span class="me-3">Logged in as: <strong>{{ current_user.username }}</strong> ({{ current_user.role }})</span>
@@ -123,14 +131,17 @@
                 <div class="card-header"><h5 class="mb-0">Manual Diagnostic Tool</h5></div>
                 <div class="card-body">
                     <div class="input-group mb-3">
-                        <input type="text" id="manualPingIp" class="form-control form-control-sm" placeholder="IP Address (e.g. 192.168.1.5)">
-                        <button class="btn btn-outline-info btn-sm" type="button" id="manualPingBtn" onclick="runManualPing()">Ping</button>
+                        <input type="text" id="diagIp" class="form-control form-control-sm" placeholder="IP or Hostname (e.g. 192.168.1.5)">
+                        <button class="btn btn-outline-info btn-sm" type="button" id="pingBtn" onclick="runPing()">Ping</button>
+                        <button class="btn btn-outline-warning btn-sm" type="button" id="traceBtn" onclick="runTrace()">Trace</button>
                     </div>
-                    <div id="pingSpinner" class="text-center d-none mb-2">
+                    
+                    <div id="diagSpinner" class="text-center d-none mb-2">
                         <div class="spinner-border spinner-border-sm text-info" role="status"></div>
-                        <span class="ms-2 small text-muted">Sending 4 packets...</span>
+                        <span id="diagSpinnerText" class="ms-2 small text-muted">Running diagnostic...</span>
                     </div>
-                    <pre id="pingOutput" class="bg-black text-light p-2 rounded small d-none" style="max-height: 200px; overflow-y: auto; font-size: 0.75rem; white-space: pre-wrap;"></pre>
+                    
+                    <pre id="diagOutput" class="bg-black text-light p-2 rounded small d-none" style="max-height: 250px; overflow-y: auto; font-size: 0.75rem; white-space: pre-wrap;"></pre>
                 </div>
             </div>
             {% endif %}
@@ -409,19 +420,25 @@
             modalInstance.show();
         }
 
-        // Manual Ping Script
-        function runManualPing() {
-            const ipInput = document.getElementById('manualPingIp');
-            const btn = document.getElementById('manualPingBtn');
-            const spinner = document.getElementById('pingSpinner');
-            const output = document.getElementById('pingOutput');
+        // Diagnostic Ping Script
+        function runPing() {
+            const ipInput = document.getElementById('diagIp');
+            const pBtn = document.getElementById('pingBtn');
+            const tBtn = document.getElementById('traceBtn');
+            const spinner = document.getElementById('diagSpinner');
+            const spinnerText = document.getElementById('diagSpinnerText');
+            const output = document.getElementById('diagOutput');
             const ip = ipInput.value.trim();
 
-            if (!ip) { alert('Please enter an IP address.'); return; }
-            btn.disabled = true; ipInput.disabled = true;
-            spinner.classList.remove('d-none'); output.classList.add('d-none'); output.textContent = '';
+            if (!ip) { alert('Please enter an IP address or Hostname.'); return; }
+
+            pBtn.disabled = true; tBtn.disabled = true; ipInput.disabled = true;
+            spinnerText.innerText = 'Sending 4 packets...';
+            spinner.classList.remove('d-none');
+            output.classList.add('d-none'); output.textContent = '';
 
             const formData = new FormData(); formData.append('ip', ip);
+
             fetch('/api/ping', { method: 'POST', body: formData })
             .then(response => response.json())
             .then(data => {
@@ -435,13 +452,48 @@
                 output.classList.remove('text-success'); output.classList.add('text-danger');
                 output.classList.remove('d-none');
             })
-            .finally(() => { btn.disabled = false; ipInput.disabled = false; spinner.classList.add('d-none'); });
+            .finally(() => {
+                pBtn.disabled = false; tBtn.disabled = false; ipInput.disabled = false; spinner.classList.add('d-none');
+            });
+        }
+
+        // Diagnostic Traceroute Script
+        function runTrace() {
+            const ipInput = document.getElementById('diagIp');
+            const pBtn = document.getElementById('pingBtn');
+            const tBtn = document.getElementById('traceBtn');
+            const spinner = document.getElementById('diagSpinner');
+            const spinnerText = document.getElementById('diagSpinnerText');
+            const output = document.getElementById('diagOutput');
+            const ip = ipInput.value.trim();
+
+            if (!ip) { alert('Please enter an IP address or Hostname.'); return; }
+
+            pBtn.disabled = true; tBtn.disabled = true; ipInput.disabled = true;
+            spinnerText.innerText = 'Tracing route (may take up to 60s)...';
+            spinner.classList.remove('d-none');
+            output.classList.add('d-none'); output.textContent = '';
+
+            const formData = new FormData(); formData.append('target', ip);
+
+            fetch('/api/traceroute', { method: 'POST', body: formData })
+            .then(res => res.json())
+            .then(data => {
+                if (data.status !== 'running') { throw new Error('Could not initialize trace worker.'); }
+            })
+            .catch(err => {
+                output.textContent = 'Execution Error: ' + err.message;
+                output.classList.remove('text-success'); output.classList.add('text-danger');
+                output.classList.remove('d-none');
+                pBtn.disabled = false; tBtn.disabled = false; ipInput.disabled = false; spinner.classList.add('d-none');
+            });
         }
         
-        const pingIpElement = document.getElementById("manualPingIp");
-        if (pingIpElement) {
-            pingIpElement.addEventListener("keypress", function(event) {
-                if (event.key === "Enter") { event.preventDefault(); document.getElementById("manualPingBtn").click(); }
+        // Let user hit enter on diagnostic input to default to Ping
+        const diagIpElement = document.getElementById("diagIp");
+        if (diagIpElement) {
+            diagIpElement.addEventListener("keypress", function(event) {
+                if (event.key === "Enter") { event.preventDefault(); document.getElementById("pingBtn").click(); }
             });
         }
 
@@ -549,6 +601,28 @@
                 else if (data.status.includes('Silenced')) badge.classList.add('bg-warning', 'text-dark');
                 else if (data.status.includes('DOWN') || data.status.includes('UNREACHABLE') || data.status.includes('ERR') || data.status.includes('Frozen')) badge.classList.add('bg-danger');
                 else badge.classList.add('bg-secondary');
+            }
+        });
+
+        socket.on('traceroute_result', function(data) {
+            const ipInput = document.getElementById('diagIp');
+            const pBtn = document.getElementById('pingBtn');
+            const tBtn = document.getElementById('traceBtn');
+            const spinner = document.getElementById('diagSpinner');
+            const output = document.getElementById('diagOutput');
+
+            if (pBtn && tBtn) {
+                pBtn.disabled = false; tBtn.disabled = false; ipInput.disabled = false;
+                spinner.classList.add('d-none');
+
+                if (data.success) {
+                    output.textContent = data.output;
+                    output.classList.remove('text-danger'); output.classList.add('text-success');
+                } else {
+                    output.textContent = 'Traceroute Failed:\n' + data.error;
+                    output.classList.remove('text-success'); output.classList.add('text-danger');
+                }
+                output.classList.remove('d-none');
             }
         });
 

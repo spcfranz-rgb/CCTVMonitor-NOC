@@ -62,7 +62,7 @@
         </div>
     </div>
 
-<script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <script>
         // Initial format on first page load
         document.querySelectorAll('.log-time').forEach(el => {
@@ -109,7 +109,7 @@
             // Insert the new row at the very top of the table
             tbody.insertBefore(row, tbody.firstChild);
 
-            // Optional: Prevent the table from growing infinitely in the browser memory
+            // Prevent the table from growing infinitely in the browser memory
             if (tbody.children.length > 500) {
                 tbody.removeChild(tbody.lastChild);
             }

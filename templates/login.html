@@ -7,9 +7,27 @@
 </head>
 <body class="container py-5 d-flex justify-content-center align-items-center" style="min-height: 100vh;">
 
-    <div class="card w-100 shadow" style="max-width: 400px;">
-        <div class="card-header text-center">
-            <h4 class="mb-0 py-2">CCTV Dashboard</h4>
+    <div class="card w-100 shadow" style="max-width: 450px;">
+        <div class="card-header text-center bg-dark py-3">
+            
+            <div class="d-flex justify-content-center align-items-center">
+                {% if company_logo %}
+                    <img src="{{ company_logo }}" alt="Company Logo" style="max-height: 45px; max-width: 40%; object-fit: contain;">
+                {% endif %}
+                
+                {% if company_logo and customer_logo %}
+                    <span class="text-muted fw-bold mx-3 fs-5">×</span>
+                {% endif %}
+                
+                {% if customer_logo %}
+                    <img src="{{ customer_logo }}" alt="Customer Logo" style="max-height: 55px; max-width: 40%; object-fit: contain;">
+                {% endif %}
+            </div>
+
+            {% if not company_logo and not customer_logo %}
+                <h4 class="mb-0">CCTV Dashboard</h4>
+            {% endif %}
+            
         </div>
         <div class="card-body p-4">
             

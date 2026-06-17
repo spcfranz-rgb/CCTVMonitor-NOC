@@ -4,6 +4,7 @@ import socket
 import sqlite3
 import subprocess
 import threading
+import hashlib
 import requests
 import ipaddress
 import paho.mqtt.client as mqtt
@@ -153,8 +154,53 @@ def is_stream_active(url):
     except subprocess.TimeoutExpired:
         return False
 
+def get_snapshot_bytes(ip, mfg, user, pwd, stream_url):
+    """Unified function to fetch image bytes via API or FFmpeg for hashing/display."""
+    if mfg and mfg != 'Other':
+        url = None
+        auth_in_url = False
+        
+        if mfg == 'Hikvision':
+            url = f"http://{ip}/ISAPI/Streaming/channels/101/picture"
+        elif mfg in ['Dahua', 'Amcrest']:
+            url = f"http://{ip}/cgi-bin/snapshot.cgi?chn=1"
+        elif mfg == 'Axis':
+            url = f"http://{ip}/axis-cgi/jpg/image.cgi"
+        elif mfg == 'Foscam':
+            url = f"http://{ip}/cgi-bin/CGIProxy.fcgi?cmd=snapPicture2&usr={user}&pwd={pwd}"
+            auth_in_url = True
+        elif mfg == 'Hanwha':
+            url = f"http://{ip}/stw-cgi/video.cgi?msubmenu=snapshot&action=view&Profile=1"
+            
+        if url:
+            try:
+                if auth_in_url:
+                    resp = requests.get(url, timeout=3)
+                else:
+                    resp = requests.get(url, auth=HTTPDigestAuth(user, pwd), timeout=3)
+                    if resp.status_code != 200:
+                        resp = requests.get(url, auth=HTTPBasicAuth(user, pwd), timeout=3)
+                        
+                if resp.status_code == 200 and 'image' in resp.headers.get('Content-Type', ''):
+                    return resp.content
+            except Exception:
+                pass # Silently fallback to FFmpeg
+                
+    # Fallback to FFmpeg RTSP Capture
+    try:
+        cmd = ['ffmpeg', '-y', '-rtsp_transport', 'tcp', '-i', stream_url, '-vframes', '1', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-']
+        process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        if process.returncode == 0:
+            return process.stdout
+    except Exception:
+        pass
+        
+    return None
+
 def monitor_loop():
     print("Starting background monitoring thread...")
+    previous_hashes = {} # Stores image hashes to detect frozen streams
+    
     while True:
         try:
             conn = get_db()
@@ -181,43 +227,58 @@ def monitor_loop():
             for switch in switches:
                 switch_id, switch_name, switch_ip, s_until = switch['id'], switch['name'], switch['ip'], switch['silenced_until']
                 silenced = s_until > now
-                
                 is_up = is_pingable(switch_ip) or is_port_open(switch_ip, 80) or is_port_open(switch_ip, 443)
                 
-                # STRING UPDATES FOR SWITCH
                 switch_payload = "MAINTENANCE" if silenced else ("UP" if is_up else "OFFLINE")
                 client.publish(f"{prefix}/{switch_name}/ping", switch_payload, retain=True)
                 
                 if is_up:
                     cursor.execute("UPDATE switches SET status = ? WHERE id = ?", ('UP' if not silenced else 'UP (Silenced)', switch_id))
-                    
                     cursor.execute("SELECT * FROM cameras WHERE switch_id = ?", (switch_id,))
                     cameras = cursor.fetchall()
                     
                     for cam in cameras:
                         cam_id, cam_name, cam_ip, stream_url, c_until = cam['id'], cam['name'], cam['ip'], cam['stream_url'], cam['silenced_until']
+                        mfg, user, pwd = cam['manufacturer'], cam['username'], cam['password']
                         cam_silenced = c_until > now
                         
                         cam_up = is_pingable(cam_ip) or is_port_open(cam_ip, 554) or is_port_open(cam_ip, 80)
                         
                         if cam_up:
                             stream_ok = is_stream_active(stream_url)
+                            is_frozen = False
+                            
+                            # If stream is alive, pull an image and hash it to check for lock-ups
+                            if stream_ok:
+                                snap_bytes = get_snapshot_bytes(cam_ip, mfg, user, pwd, stream_url)
+                                if snap_bytes:
+                                    current_hash = hashlib.md5(snap_bytes).hexdigest()
+                                    last_hash = previous_hashes.get(cam_id)
+                                    if last_hash and last_hash == current_hash:
+                                        is_frozen = True
+                                    previous_hashes[cam_id] = current_hash
+                            
                             if cam_silenced:
                                 client.publish(f"{prefix}/{cam_name}/ping", "MAINTENANCE", retain=True)
                                 client.publish(f"{prefix}/{cam_name}/stream", "MAINTENANCE", retain=True)
-                                cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('UP (Silenced)' if stream_ok else 'STREAM ERR (Silenced)', cam_id))
+                                if is_frozen:
+                                    cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('FROZEN (Silenced)', cam_id))
+                                else:
+                                    cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('UP (Silenced)' if stream_ok else 'STREAM ERR (Silenced)', cam_id))
                             else:
-                                # STRING UPDATES FOR HEALTHY CAMERA
                                 client.publish(f"{prefix}/{cam_name}/ping", "UP", retain=True)
-                                client.publish(f"{prefix}/{cam_name}/stream", "UP" if stream_ok else "STREAM_ERROR", retain=True)
-                                cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('UP' if stream_ok else 'DOWN (Stream Error)', cam_id))
+                                if is_frozen:
+                                    client.publish(f"{prefix}/{cam_name}/stream", "FROZEN", retain=True)
+                                    cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('DOWN (Frozen)', cam_id))
+                                else:
+                                    client.publish(f"{prefix}/{cam_name}/stream", "UP" if stream_ok else "STREAM_ERROR", retain=True)
+                                    cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('UP' if stream_ok else 'DOWN (Stream Error)', cam_id))
                         else:
                             if cam_silenced:
                                 client.publish(f"{prefix}/{cam_name}/ping", "MAINTENANCE", retain=True)
                                 client.publish(f"{prefix}/{cam_name}/stream", "MAINTENANCE", retain=True)
                                 cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('DOWN (Silenced)', cam_id))
                             else:
-                                # STRING UPDATES FOR DEAD CAMERA
                                 client.publish(f"{prefix}/{cam_name}/ping", "OFFLINE", retain=True)
                                 client.publish(f"{prefix}/{cam_name}/stream", "OFFLINE", retain=True)
                                 cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('DOWN (Offline)', cam_id))
@@ -230,28 +291,45 @@ def monitor_loop():
             standalone_cameras = cursor.fetchall()
             for cam in standalone_cameras:
                 cam_id, cam_name, cam_ip, stream_url, c_until = cam['id'], cam['name'], cam['ip'], cam['stream_url'], cam['silenced_until']
+                mfg, user, pwd = cam['manufacturer'], cam['username'], cam['password']
                 cam_silenced = c_until > now
                 
                 cam_up = is_pingable(cam_ip) or is_port_open(cam_ip, 554) or is_port_open(cam_ip, 80)
                 
                 if cam_up:
                     stream_ok = is_stream_active(stream_url)
+                    is_frozen = False
+                    
+                    if stream_ok:
+                        snap_bytes = get_snapshot_bytes(cam_ip, mfg, user, pwd, stream_url)
+                        if snap_bytes:
+                            current_hash = hashlib.md5(snap_bytes).hexdigest()
+                            last_hash = previous_hashes.get(cam_id)
+                            if last_hash and last_hash == current_hash:
+                                is_frozen = True
+                            previous_hashes[cam_id] = current_hash
+                            
                     if cam_silenced:
                         client.publish(f"{prefix}/{cam_name}/ping", "MAINTENANCE", retain=True)
                         client.publish(f"{prefix}/{cam_name}/stream", "MAINTENANCE", retain=True)
-                        cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('UP (Silenced)' if stream_ok else 'STREAM ERR (Silenced)', cam_id))
+                        if is_frozen:
+                            cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('FROZEN (Silenced)', cam_id))
+                        else:
+                            cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('UP (Silenced)' if stream_ok else 'STREAM ERR (Silenced)', cam_id))
                     else:
-                        # STRING UPDATES FOR HEALTHY STANDALONE
                         client.publish(f"{prefix}/{cam_name}/ping", "UP", retain=True)
-                        client.publish(f"{prefix}/{cam_name}/stream", "UP" if stream_ok else "STREAM_ERROR", retain=True)
-                        cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('UP' if stream_ok else 'DOWN (Stream Error)', cam_id))
+                        if is_frozen:
+                            client.publish(f"{prefix}/{cam_name}/stream", "FROZEN", retain=True)
+                            cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('DOWN (Frozen)', cam_id))
+                        else:
+                            client.publish(f"{prefix}/{cam_name}/stream", "UP" if stream_ok else "STREAM_ERROR", retain=True)
+                            cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('UP' if stream_ok else 'DOWN (Stream Error)', cam_id))
                 else:
                     if cam_silenced:
                         client.publish(f"{prefix}/{cam_name}/ping", "MAINTENANCE", retain=True)
                         client.publish(f"{prefix}/{cam_name}/stream", "MAINTENANCE", retain=True)
                         cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('DOWN (Silenced)', cam_id))
                     else:
-                        # STRING UPDATES FOR DEAD STANDALONE
                         client.publish(f"{prefix}/{cam_name}/ping", "OFFLINE", retain=True)
                         client.publish(f"{prefix}/{cam_name}/stream", "OFFLINE", retain=True)
                         cursor.execute("UPDATE cameras SET status = ? WHERE id = ?", ('DOWN (Offline)', cam_id))
@@ -411,7 +489,6 @@ def test_alert():
         client = mqtt.Client("camera_monitor_test")
         client.connect(broker, port, 5)
         test_topic = f"{prefix}/test_device/ping"
-        # UPDATED PAYLOAD FOR THE TEST BUTTON
         client.publish(test_topic, "TEST_PING", retain=False)
         client.disconnect()
         flash(f'Success! Test alert sent to {test_topic}', 'success')
@@ -566,52 +643,12 @@ def snapshot(id):
     if not camera:
         return "Camera not found", 404
         
-    mfg = camera['manufacturer']
-    ip = camera['ip']
-    user = camera['username']
-    pwd = camera['password']
+    snap_bytes = get_snapshot_bytes(camera['ip'], camera['manufacturer'], camera['username'], camera['password'], camera['stream_url'])
     
-    if mfg and mfg != 'Other':
-        url = None
-        auth_in_url = False
-        
-        if mfg == 'Hikvision':
-            url = f"http://{ip}/ISAPI/Streaming/channels/101/picture"
-        elif mfg in ['Dahua', 'Amcrest']:
-            url = f"http://{ip}/cgi-bin/snapshot.cgi?chn=1"
-        elif mfg == 'Axis':
-            url = f"http://{ip}/axis-cgi/jpg/image.cgi"
-        elif mfg == 'Foscam':
-            url = f"http://{ip}/cgi-bin/CGIProxy.fcgi?cmd=snapPicture2&usr={user}&pwd={pwd}"
-            auth_in_url = True
-        elif mfg == 'Hanwha':
-            url = f"http://{ip}/stw-cgi/video.cgi?msubmenu=snapshot&action=view&Profile=1"
-            
-        if url:
-            try:
-                if auth_in_url:
-                    resp = requests.get(url, timeout=3)
-                else:
-                    resp = requests.get(url, auth=HTTPDigestAuth(user, pwd), timeout=3)
-                    if resp.status_code != 200:
-                        resp = requests.get(url, auth=HTTPBasicAuth(user, pwd), timeout=3)
-                        
-                if resp.status_code == 200 and 'image' in resp.headers.get('Content-Type', ''):
-                    return Response(resp.content, mimetype='image/jpeg')
-            except Exception as e:
-                print(f"HTTP Snapshot failed for {ip}: {e}. Falling back to FFmpeg.")
-
-    try:
-        cmd = ['ffmpeg', '-y', '-rtsp_transport', 'tcp', '-i', camera['stream_url'], '-vframes', '1', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-']
-        process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
-        if process.returncode == 0:
-            return Response(process.stdout, mimetype='image/jpeg')
-        else:
-            return f"Failed to grab snapshot", 500
-    except subprocess.TimeoutExpired:
-        return "Timeout reaching camera", 504
-    except Exception as e:
-        return str(e), 500
+    if snap_bytes:
+        return Response(snap_bytes, mimetype='image/jpeg')
+    else:
+        return "Failed to grab snapshot", 500
 
 # ==========================================
 # WEB UI TUNNELING (REVERSE PROXY)

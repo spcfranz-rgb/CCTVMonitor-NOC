@@ -1053,19 +1053,21 @@ def init_logos():
     LOCAL_CUSTOMER_LOGO = process_logo('CUSTOMER_LOGO_URL', 'customer_logo.png')
 
 
-if __name__ == '__main__':
-    # Initialize DB and run the Smart Cache logo downloader
+# ==========================================
+# GUNICORN / FLASK BOOTLOADER
+# ==========================================
+# This MUST be outside the __main__ block so Gunicorn runs it on boot!
+try:
     init_db()
     init_logos()
     
-    # Safely start background task without deprecated Flask 2.2 hooks
-    try:
-        os.makedirs('/app/data', exist_ok=True)
-        lock_file = '/app/data/monitor.lock'
-        if not os.path.exists(lock_file):
-            open(lock_file, 'w').close()
-            socketio.start_background_task(monitor_loop)
-    except Exception as e:
-        print(f"Could not initialize background task lock: {e}")
+    os.makedirs('/app/data', exist_ok=True)
+    lock_file = '/app/data/monitor.lock'
+    if not os.path.exists(lock_file):
+        open(lock_file, 'w').close()
+        socketio.start_background_task(monitor_loop)
+except Exception as e:
+    print(f"Startup initialization error: {e}")
 
+if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5000)

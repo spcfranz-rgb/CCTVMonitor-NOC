@@ -210,6 +210,7 @@ def monitor_loop():
                     # ZERO-LATENCY PUSH: Hit the internal webhook to emit WebSocket event
                     try:
                         requests.post('http://127.0.0.1:5000/internal_emit', json={
+                            'secret': INTERNAL_WEBHOOK_SECRET, # <--- Added Secret Token
                             'event': 'state_change',
                             'data': {
                                 'type': table,

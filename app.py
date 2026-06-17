@@ -623,7 +623,44 @@ def manual_ping():
         return jsonify({'success': False, 'output': 'Ping command timed out.'})
     except Exception as e:
         return jsonify({'success': False, 'output': str(e)})
+        
+@app.route('/api/speedtest', methods=['POST'])
+@login_required
+@admin_required
+def run_speedtest():
+    def execute_test():
+        try:
+            # Run speedtest-cli matching JSON format for easy ingestion
+            import json
+            cmd = ['speedtest-cli', '--json']
+            process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+            
+            if process.returncode == 0:
+                data = json.loads(process.stdout)
+                # Convert bits to Megabits per second (Mbps)
+                download = round(data.get('download', 0) / 1000000, 2)
+                upload = round(data.get('upload', 0) / 1000000, 2)
+                ping = round(data.get('ping', 0), 1)
+                isp = data.get('client', {}).get('isp', 'Unknown')
+                
+                socketio.emit('speedtest_result', {
+                    'success': True,
+                    'download': f"{download} Mbps",
+                    'upload': f"{upload} Mbps",
+                    'ping': f"{ping} ms",
+                    'isp': isp
+                })
+            else:
+                socketio.emit('speedtest_result', {'success': False, 'error': 'Speed test binary failed.'})
+        except subprocess.TimeoutExpired:
+            socketio.emit('speedtest_result', {'success': False, 'error': 'Speed test timed out.'})
+        except Exception as e:
+            socketio.emit('speedtest_result', {'success': False, 'error': str(e)})
 
+    # Dispatch to background thread to ensure no UI degradation
+    threading.Thread(target=execute_test).start()
+    return jsonify({'status': 'running'})
+    
 @app.route('/update_settings', methods=['POST'])
 @login_required
 @admin_required

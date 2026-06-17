@@ -680,6 +680,56 @@ def run_speedtest():
     threading.Thread(target=execute_test).start()
     return jsonify({'status': 'running'})
 
+@app.route('/api/scan_network', methods=['POST'])
+@login_required
+@admin_required
+def scan_network():
+    subnet = request.form.get('subnet')
+    if not subnet:
+        return jsonify({'success': False, 'error': 'No subnet provided.'})
+        
+    try:
+        network = ipaddress.ip_network(subnet, strict=False)
+    except ValueError:
+        return jsonify({'success': False, 'error': 'Invalid subnet format. Use CIDR notation (e.g., 192.168.1.0/24)'})
+
+    # Generate list of all usable host IPs in the subnet
+    hosts = [str(ip) for ip in network.hosts()]
+    
+    # Do not scan massive networks that will crash the server memory
+    if len(hosts) > 1024:
+        return jsonify({'success': False, 'error': 'Subnet too large. Please scan a /22 or smaller.'})
+
+    def check_rtsp_port(ip):
+        """Attempts to open a TCP socket on port 554 (RTSP)"""
+        try:
+            with socket.create_connection((ip, 554), timeout=1.5):
+                return ip
+        except (socket.timeout, ConnectionRefusedError, OSError):
+            return None
+
+    # Use Eventlet to scan all IPs concurrently
+    discovered_ips = []
+    pool = eventlet.greenpool.GreenPool(size=100)
+    
+    for result in pool.imap(check_rtsp_port, hosts):
+        if result:
+            discovered_ips.append(result)
+
+    # Filter out IPs that are already in the database
+    conn = get_db()
+    existing_cameras = [row['ip'] for row in conn.execute("SELECT ip FROM cameras").fetchall()]
+    conn.close()
+    
+    new_discoveries = [ip for ip in discovered_ips if ip not in existing_cameras]
+
+    return jsonify({
+        'success': True, 
+        'discovered': new_discoveries,
+        'total_found': len(discovered_ips),
+        'already_added': len(discovered_ips) - len(new_discoveries)
+    })
+    
 @app.route('/update_settings', methods=['POST'])
 @login_required
 @admin_required

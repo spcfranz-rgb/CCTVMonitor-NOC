@@ -4,10 +4,12 @@ import socket
 import sqlite3
 import subprocess
 import threading
-import hashlib
+import io
 import requests
 import ipaddress
 import paho.mqtt.client as mqtt
+import imagehash
+from PIL import Image
 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 from urllib.parse import urlparse
 from functools import wraps
@@ -199,7 +201,7 @@ def get_snapshot_bytes(ip, mfg, user, pwd, stream_url):
 
 def monitor_loop():
     print("Starting background monitoring thread...")
-    previous_hashes = {} # Stores image hashes to detect frozen streams
+    previous_hashes = {} # Stores perceptual hashes to detect frozen streams
     
     while True:
         try:
@@ -248,15 +250,25 @@ def monitor_loop():
                             stream_ok = is_stream_active(stream_url)
                             is_frozen = False
                             
-                            # If stream is alive, pull an image and hash it to check for lock-ups
+                            # If stream is alive, pull an image and hash it perceptually
                             if stream_ok:
                                 snap_bytes = get_snapshot_bytes(cam_ip, mfg, user, pwd, stream_url)
                                 if snap_bytes:
-                                    current_hash = hashlib.md5(snap_bytes).hexdigest()
-                                    last_hash = previous_hashes.get(cam_id)
-                                    if last_hash and last_hash == current_hash:
-                                        is_frozen = True
-                                    previous_hashes[cam_id] = current_hash
+                                    try:
+                                        # Open the bytes as an image and calculate the structural average hash
+                                        img = Image.open(io.BytesIO(snap_bytes))
+                                        current_hash = imagehash.average_hash(img)
+                                        last_hash = previous_hashes.get(cam_id)
+                                        
+                                        # A Hamming distance of <= 2 means the core layout of the image 
+                                        # hasn't changed at all, ignoring the pixels of a ticking clock.
+                                        if last_hash is not None and (current_hash - last_hash) <= 2:
+                                            is_frozen = True
+                                            
+                                        previous_hashes[cam_id] = current_hash
+                                    except Exception as e:
+                                        print(f"Error hashing image for {cam_name}: {e}")
+                                        pass
                             
                             if cam_silenced:
                                 client.publish(f"{prefix}/{cam_name}/ping", "MAINTENANCE", retain=True)
@@ -303,11 +315,18 @@ def monitor_loop():
                     if stream_ok:
                         snap_bytes = get_snapshot_bytes(cam_ip, mfg, user, pwd, stream_url)
                         if snap_bytes:
-                            current_hash = hashlib.md5(snap_bytes).hexdigest()
-                            last_hash = previous_hashes.get(cam_id)
-                            if last_hash and last_hash == current_hash:
-                                is_frozen = True
-                            previous_hashes[cam_id] = current_hash
+                            try:
+                                img = Image.open(io.BytesIO(snap_bytes))
+                                current_hash = imagehash.average_hash(img)
+                                last_hash = previous_hashes.get(cam_id)
+                                
+                                if last_hash is not None and (current_hash - last_hash) <= 2:
+                                    is_frozen = True
+                                    
+                                previous_hashes[cam_id] = current_hash
+                            except Exception as e:
+                                print(f"Error hashing image for {cam_name}: {e}")
+                                pass
                             
                     if cam_silenced:
                         client.publish(f"{prefix}/{cam_name}/ping", "MAINTENANCE", retain=True)

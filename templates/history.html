@@ -62,67 +62,58 @@
         </div>
     </div>
 
-<script>
+<script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script>
         // Initial format on first page load
-        function formatInitialDates() {
-            document.querySelectorAll('.log-time').forEach(el => {
-                const ts = parseFloat(el.getAttribute('data-ts')) * 1000;
-                const date = new Date(ts);
-                el.innerText = date.toLocaleString(undefined, {
-                    year: 'numeric', month: 'numeric', day: 'numeric',
-                    hour: '2-digit', minute: '2-digit', second: '2-digit'
-                });
+        document.querySelectorAll('.log-time').forEach(el => {
+            const ts = parseFloat(el.getAttribute('data-ts')) * 1000;
+            const date = new Date(ts);
+            el.innerText = date.toLocaleString(undefined, {
+                year: 'numeric', month: 'numeric', day: 'numeric',
+                hour: '2-digit', minute: '2-digit', second: '2-digit'
             });
-        }
-        formatInitialDates();
+        });
 
-        // Background AJAX polling to make the logs "Live"
-        function updateLogs() {
-            fetch('/api/logs')
-                .then(response => response.json())
-                .then(data => {
-                    const tbody = document.querySelector('tbody');
-                    tbody.innerHTML = ''; // Clear the current table
-                    
-                    if (data.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="4" class="text-center py-4 text-muted">No state changes logged yet.</td></tr>';
-                        return;
-                    }
+        // Listen for new events and append them to the top of the table natively
+        const socket = io();
+        socket.on('state_change', function(data) {
+            // Remove the "No state changes" message if it is currently visible
+            const emptyMsg = document.querySelector('td.text-center');
+            if (emptyMsg) emptyMsg.parentElement.remove();
 
-                    // Rebuild the table rows with the fresh data
-                    data.forEach(log => {
-                        // Format the timestamp
-                        const date = new Date(log.timestamp * 1000).toLocaleString(undefined, {
-                            year: 'numeric', month: 'numeric', day: 'numeric',
-                            hour: '2-digit', minute: '2-digit', second: '2-digit'
-                        });
-                        
-                        // Determine Device Badge
-                        let devBadge = log.device_type === 'Switch' 
-                            ? '<span class="badge bg-secondary">Switch</span>' 
-                            : '<span class="badge bg-dark border">Camera</span>';
-                            
-                        // Determine Status Badge Color
-                        let statBadge = 'bg-secondary';
-                        if (log.status === 'UP') statBadge = 'bg-success';
-                        else if (log.status.includes('Silenced')) statBadge = 'bg-warning text-dark';
-                        else if (log.status.includes('DOWN') || log.status.includes('UNREACHABLE') || log.status.includes('Frozen') || log.status.includes('ERR')) statBadge = 'bg-danger';
+            const tbody = document.querySelector('tbody');
+            const date = new Date(data.timestamp * 1000).toLocaleString(undefined, {
+                year: 'numeric', month: 'numeric', day: 'numeric',
+                hour: '2-digit', minute: '2-digit', second: '2-digit'
+            });
 
-                        // Create and append the row
-                        const row = `<tr>
-                            <td class="ps-4 text-muted">${date}</td>
-                            <td>${devBadge}</td>
-                            <td class="fw-bold">${log.device_name}</td>
-                            <td><span class="badge ${statBadge}">${log.status}</span></td>
-                        </tr>`;
-                        tbody.innerHTML += row;
-                    });
-                })
-                .catch(error => console.error('Error fetching live logs:', error));
-        }
+            // Format Badges based on the payload
+            let devBadge = data.device_type === 'Switch' 
+                ? '<span class="badge bg-secondary">Switch</span>' 
+                : '<span class="badge bg-dark border">Camera</span>';
+                
+            let statBadge = 'bg-secondary';
+            if (data.status === 'UP') statBadge = 'bg-success';
+            else if (data.status.includes('Silenced')) statBadge = 'bg-warning text-dark';
+            else if (data.status.includes('DOWN') || data.status.includes('UNREACHABLE') || data.status.includes('Frozen') || data.status.includes('ERR')) statBadge = 'bg-danger';
 
-        // Refresh the logs automatically every 5 seconds
-        setInterval(updateLogs, 5000);
+            // Create the new DOM node
+            const row = document.createElement('tr');
+            row.innerHTML = `
+                <td class="ps-4 text-muted">${date}</td>
+                <td>${devBadge}</td>
+                <td class="fw-bold">${data.name}</td>
+                <td><span class="badge ${statBadge}">${data.status}</span></td>
+            `;
+            
+            // Insert the new row at the very top of the table
+            tbody.insertBefore(row, tbody.firstChild);
+
+            // Optional: Prevent the table from growing infinitely in the browser memory
+            if (tbody.children.length > 500) {
+                tbody.removeChild(tbody.lastChild);
+            }
+        });
     </script>
 </body>
 </html>

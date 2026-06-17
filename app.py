@@ -23,7 +23,7 @@ from PIL import Image
 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 from urllib.parse import urlparse
 from functools import wraps
-from flask import Flask, render_template, request, redirect, url_for, abort, flash, Response, jsonify
+from flask import Flask, render_template, request, redirect, url_for, abort, flash, Response, jsonify, send_from_directory
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -31,7 +31,11 @@ from flask_socketio import SocketIO
 from authlib.integrations.flask_client import OAuth
 
 app = Flask(__name__)
+
+# Tell Flask it is behind a reverse proxy (NGINX)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
+# Initialize WebSockets with the eventlet async worker
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # --- GLOBAL TEMPLATE VARIABLES (CO-BRANDING) ---
@@ -406,6 +410,11 @@ def monitor_loop():
 # ==========================================
 # FLASK WEB ROUTES
 # ==========================================
+@app.route('/local_logo/<filename>')
+def serve_local_logo(filename):
+    """Safely serves persistent logos so they survive container rebuilds."""
+    return send_from_directory('/app/data/logos', filename)
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     fallback = request.args.get('fallback') == 'true'
@@ -1007,40 +1016,56 @@ def proxy_absolute_paths(e):
 # ==========================================
 def init_logos():
     global LOCAL_COMPANY_LOGO, LOCAL_CUSTOMER_LOGO
-    static_dir = os.path.join(app.root_path, 'static', 'logos')
-    os.makedirs(static_dir, exist_ok=True)
+    
+    # Save to the persistent volume, NOT the ephemeral container filesystem
+    logo_dir = '/app/data/logos'
+    os.makedirs(logo_dir, exist_ok=True)
     
     def process_logo(env_var, filename):
         val = os.environ.get(env_var, '').strip()
         if not val: return None
+        
+        filepath = os.path.join(logo_dir, filename)
+        serve_path = f"/local_logo/{filename}"
+        
         if val.startswith('http://') or val.startswith('https://'):
-            filepath = os.path.join(static_dir, filename)
             try:
-                resp = requests.get(val, timeout=10)
+                # 1. Attempt to grab the freshest version of the logo
+                resp = requests.get(val, timeout=5)
                 if resp.status_code == 200:
                     with open(filepath, 'wb') as f:
                         f.write(resp.content)
-                    return f"/static/logos/{filename}?t={int(time.time())}"
+                    # Success: Serve new file with a fresh timestamp to break browser caching
+                    return f"{serve_path}?t={int(time.time())}"
             except Exception as e:
-                print(f"Warning: Could not download {env_var}: {e}")
-            return val # Fallback to direct URL if download fails
-        return val # Fallback for base64 or local paths
+                print(f"Notice: Could not fetch fresh {env_var}. Attempting offline fallback. ({e})")
+            
+            # 2. Offline Fallback: If WAN is down but we have a previously saved logo, use it!
+            if os.path.exists(filepath):
+                return f"{serve_path}?t={int(os.path.getmtime(filepath))}"
+            
+            # 3. Total Failure: No WAN, and no cached file. Fallback to raw URL.
+            return val
+            
+        return val # Fallback for local paths or base64 strings
 
-    LOCAL_COMPANY_LOGO = process_logo('COMPANY_LOGO_URL', 'company_logo.img')
-    LOCAL_CUSTOMER_LOGO = process_logo('CUSTOMER_LOGO_URL', 'customer_logo.img')
+    LOCAL_COMPANY_LOGO = process_logo('COMPANY_LOGO_URL', 'company_logo.png')
+    LOCAL_CUSTOMER_LOGO = process_logo('CUSTOMER_LOGO_URL', 'customer_logo.png')
 
-try:
-    # Run setup blocks unconditionally on worker boot
+
+if __name__ == '__main__':
+    # Initialize DB and run the Smart Cache logo downloader
     init_db()
     init_logos()
     
-    os.makedirs('/app/data', exist_ok=True)
-    lock_file = '/app/data/monitor.lock'
-    if not os.path.exists(lock_file):
-        open(lock_file, 'w').close()
-        socketio.start_background_task(monitor_loop)
-except Exception as e:
-    print(f"Startup initialization error: {e}")
+    # Safely start background task without deprecated Flask 2.2 hooks
+    try:
+        os.makedirs('/app/data', exist_ok=True)
+        lock_file = '/app/data/monitor.lock'
+        if not os.path.exists(lock_file):
+            open(lock_file, 'w').close()
+            socketio.start_background_task(monitor_loop)
+    except Exception as e:
+        print(f"Could not initialize background task lock: {e}")
 
-if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5000)

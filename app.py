@@ -10,6 +10,7 @@ import subprocess
 import threading
 import io
 import csv
+import secrets
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
@@ -475,21 +476,123 @@ def export_logs():
     output = si.getvalue()
     return Response(output, mimetype="text/csv", headers={"Content-Disposition": "attachment;filename=cctv_event_logs.csv"})
 
-@app.route('/api/status')
+@app.route('/export_config')
 @login_required
-def api_status():
+@admin_required
+def export_config():
     conn = get_db()
-    switches = conn.execute("SELECT id, status FROM switches").fetchall()
-    cameras = conn.execute("SELECT id, status FROM cameras").fetchall()
-    conn.close()
+    si = io.StringIO()
+    cw = csv.writer(si)
+    cw.writerow(['Device_Type', 'Parent_Switch', 'Device_Name', 'IP_Address', 'Stream_URL', 'Manufacturer', 'Username', 'Password'])
     
-    status_data = {}
+    switches = conn.execute("SELECT name, ip FROM switches").fetchall()
     for s in switches:
-        status_data[f"switch_{s['id']}"] = s['status']
-    for c in cameras:
-        status_data[f"camera_{c['id']}"] = c['status']
+        cw.writerow(['Switch', '', s['name'], s['ip'], '', '', '', ''])
         
-    return jsonify(status_data)
+    cameras = conn.execute("""
+        SELECT c.name, c.ip, c.stream_url, c.manufacturer, c.username, c.password, s.name as switch_name 
+        FROM cameras c 
+        LEFT JOIN switches s ON c.switch_id = s.id
+    """).fetchall()
+    
+    for c in cameras:
+        parent = c['switch_name'] if c['switch_name'] else 'None'
+        cw.writerow(['Camera', parent, c['name'], c['ip'], c['stream_url'], c['manufacturer'], c['username'], c['password']])
+        
+    conn.close()
+    return Response(si.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment;filename=cctv_config.csv"})
+
+@app.route('/download_template')
+@login_required
+@admin_required
+def download_template():
+    si = io.StringIO()
+    cw = csv.writer(si)
+    cw.writerow(['Device_Type', 'Parent_Switch', 'Device_Name', 'IP_Address', 'Stream_URL', 'Manufacturer', 'Username', 'Password'])
+    cw.writerow(['Switch', '', 'Core-Switch-01', '192.168.1.5', '', '', '', ''])
+    cw.writerow(['Switch', '', 'Edge-PoE-North', '10.0.0.15', '', '', '', ''])
+    cw.writerow(['Camera', 'Core-Switch-01', 'Lobby-Cam-01', '192.168.1.100', 'rtsp://192.168.1.100:554/stream1', 'Hanwha', 'admin', 'SecurePassword123'])
+    cw.writerow(['Camera', 'Edge-PoE-North', 'Parking-PTZ', '10.0.0.20', 'rtsp://10.0.0.20:554/cam/realmonitor', 'Dahua', 'admin', 'SecurePassword123'])
+    cw.writerow(['Camera', 'None', 'Standalone-WiFi-Cam', '192.168.5.50', 'rtsp://192.168.5.50:554/11', 'Other', '', ''])
+    return Response(si.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment;filename=cctv_import_template.csv"})
+
+@app.route('/import_config', methods=['POST'])
+@login_required
+@admin_required
+def import_config():
+    if 'file' not in request.files:
+        flash('No file uploaded.', 'danger')
+        return redirect(url_for('index'))
+
+    file = request.files['file']
+    if file.filename == '':
+        flash('No file selected.', 'danger')
+        return redirect(url_for('index'))
+
+    try:
+        content = file.read().decode('utf-8-sig')
+        si = io.StringIO(content)
+        reader = csv.DictReader(si)
+        rows = list(reader)
+        
+        conn = get_db()
+        switch_map = {}
+        
+        for row in conn.execute("SELECT id, name FROM switches").fetchall():
+            switch_map[row['name']] = row['id']
+            
+        for row in rows:
+            dtype = row.get('Device_Type', '').strip().lower()
+            if dtype == 'switch':
+                name = row.get('Device_Name', '').strip()
+                ip = row.get('IP_Address', '').strip()
+                if name:
+                    existing = conn.execute("SELECT id FROM switches WHERE name = ?", (name,)).fetchone()
+                    if existing:
+                        conn.execute("UPDATE switches SET ip = ? WHERE id = ?", (ip, existing['id']))
+                        switch_map[name] = existing['id']
+                    else:
+                        cursor = conn.execute("INSERT INTO switches (name, ip) VALUES (?, ?)", (name, ip))
+                        switch_map[name] = cursor.lastrowid
+                        
+        for row in rows:
+            dtype = row.get('Device_Type', '').strip().lower()
+            if dtype == 'camera':
+                parent_switch = row.get('Parent_Switch', '').strip()
+                name = row.get('Device_Name', '').strip()
+                ip = row.get('IP_Address', '').strip()
+                url = row.get('Stream_URL', '').strip()
+                mfg = row.get('Manufacturer', '').strip() or 'Other'
+                user = row.get('Username', '').strip()
+                pwd = row.get('Password', '').strip()
+                
+                if not name:
+                    continue
+                    
+                switch_id = None
+                if parent_switch and parent_switch.lower() != 'none':
+                    switch_id = switch_map.get(parent_switch)
+                    if not switch_id:
+                        cursor = conn.execute("INSERT INTO switches (name, ip) VALUES (?, ?)", (parent_switch, '0.0.0.0'))
+                        switch_id = cursor.lastrowid
+                        switch_map[parent_switch] = switch_id
+
+                existing = conn.execute("SELECT id FROM cameras WHERE name = ?", (name,)).fetchone()
+                if existing:
+                    conn.execute("""UPDATE cameras SET switch_id=?, ip=?, stream_url=?, manufacturer=?, username=?, password=? WHERE id=?""",
+                                 (switch_id, ip, url, mfg, user, pwd, existing['id']))
+                else:
+                    conn.execute("""INSERT INTO cameras (switch_id, name, ip, stream_url, manufacturer, username, password) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                 (switch_id, name, ip, url, mfg, user, pwd))
+
+        conn.commit()
+        conn.close()
+        trigger_monitor_check()
+        flash('CSV Configuration imported successfully. Devices have been merged.', 'success')
+    except Exception as e:
+        flash(f'Error importing CSV: Invalid format or missing headers. Ensure you use the exact headers from the export tool. ({str(e)})', 'danger')
+
+    return redirect(url_for('index'))
 
 @app.route('/toggle_silence/<device_type>/<int:id>', methods=['POST'])
 @login_required

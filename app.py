@@ -31,19 +31,18 @@ from flask_socketio import SocketIO
 from authlib.integrations.flask_client import OAuth
 
 app = Flask(__name__)
-
-# Tell Flask it is behind a reverse proxy (NGINX)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
-
-# Initialize WebSockets with the eventlet async worker
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # --- GLOBAL TEMPLATE VARIABLES (CO-BRANDING) ---
+LOCAL_COMPANY_LOGO = None
+LOCAL_CUSTOMER_LOGO = None
+
 @app.context_processor
 def inject_globals():
     return {
-        'company_logo': os.environ.get('COMPANY_LOGO_URL', ''),
-        'customer_logo': os.environ.get('CUSTOMER_LOGO_URL', '')
+        'company_logo': LOCAL_COMPANY_LOGO,
+        'customer_logo': LOCAL_CUSTOMER_LOGO
     }
 
 # --- SECURITY HARDENING: SESSIONS ---
@@ -287,7 +286,6 @@ def monitor_loop():
                     cameras = cursor.fetchall()
                     camera_results = {}
                     
-                    # Concurrency optimization using Eventlet GreenPool
                     pool = eventlet.greenpool.GreenPool(size=20)
                     for c_id, cam_up, stream_ok, snap_bytes in pool.imap(threaded_camera_check, [dict(c) for c in cameras]):
                         camera_results[c_id] = (cam_up, stream_ok, snap_bytes)
@@ -1005,20 +1003,44 @@ def proxy_absolute_paths(e):
     return "404 - Not Found", 404
 
 # ==========================================
-# APPLICATION STARTUP
+# APPLICATION STARTUP & INITIALIZATION
 # ==========================================
-if __name__ == '__main__':
-    # Initialize DB schema before threads spawn
-    init_db()
+def init_logos():
+    global LOCAL_COMPANY_LOGO, LOCAL_CUSTOMER_LOGO
+    static_dir = os.path.join(app.root_path, 'static', 'logos')
+    os.makedirs(static_dir, exist_ok=True)
     
-    # Safely start background task without deprecated Flask 2.2 hooks
-    try:
-        os.makedirs('/app/data', exist_ok=True)
-        lock_file = '/app/data/monitor.lock'
-        if not os.path.exists(lock_file):
-            open(lock_file, 'w').close()
-            socketio.start_background_task(monitor_loop)
-    except Exception as e:
-        print(f"Could not initialize background task lock: {e}")
+    def process_logo(env_var, filename):
+        val = os.environ.get(env_var, '').strip()
+        if not val: return None
+        if val.startswith('http://') or val.startswith('https://'):
+            filepath = os.path.join(static_dir, filename)
+            try:
+                resp = requests.get(val, timeout=10)
+                if resp.status_code == 200:
+                    with open(filepath, 'wb') as f:
+                        f.write(resp.content)
+                    return f"/static/logos/{filename}?t={int(time.time())}"
+            except Exception as e:
+                print(f"Warning: Could not download {env_var}: {e}")
+            return val # Fallback to direct URL if download fails
+        return val # Fallback for base64 or local paths
 
+    LOCAL_COMPANY_LOGO = process_logo('COMPANY_LOGO_URL', 'company_logo.img')
+    LOCAL_CUSTOMER_LOGO = process_logo('CUSTOMER_LOGO_URL', 'customer_logo.img')
+
+try:
+    # Run setup blocks unconditionally on worker boot
+    init_db()
+    init_logos()
+    
+    os.makedirs('/app/data', exist_ok=True)
+    lock_file = '/app/data/monitor.lock'
+    if not os.path.exists(lock_file):
+        open(lock_file, 'w').close()
+        socketio.start_background_task(monitor_loop)
+except Exception as e:
+    print(f"Startup initialization error: {e}")
+
+if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5000)

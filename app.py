@@ -226,32 +226,28 @@ def monitor_loop():
     print("Starting concurrent background monitoring thread...")
     previous_hashes = {} 
     
+    # 1. Establish a persistent MQTT connection ONCE
+    conn = get_db()
+    settings_dict = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
+    conn.close()
+    broker = settings_dict.get('mqtt_broker', '127.0.0.1')
+    port = int(settings_dict.get('mqtt_port', 1883))
+    prefix = settings_dict.get('mqtt_prefix', 'zabbix/cctv')
+    interval = int(settings_dict.get('check_interval', 60))
+    
+    client = mqtt.Client("camera_monitor_service")
+    try:
+        client.connect(broker, port, 60)
+        client.loop_start() # Starts a silent thread to maintain MQTT pings
+    except Exception as e:
+        print(f"Initial MQTT connection failed: {e}")
+        
     while True:
         try:
             conn = get_db()
             cursor = conn.cursor()
             now = time.time()
-            
-            def set_status(table, item_id, item_name, dev_type, old_status, new_status):
-                if old_status != new_status:
-                    if old_status != 'UNKNOWN':
-                        cursor.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, dev_type, item_name, new_status))
-                    cursor.execute(f"UPDATE {table} SET status = ? WHERE id = ?", (new_status, item_id))
-                    socketio.emit('state_change', {
-                        'type': table, 'id': item_id, 'name': item_name,
-                        'status': new_status, 'device_type': dev_type, 'timestamp': now
-                    })
-            
-            cursor.execute("SELECT key, value FROM settings")
-            settings_dict = {row['key']: row['value'] for row in cursor.fetchall()}
-            broker = settings_dict.get('mqtt_broker', '127.0.0.1')
-            port = int(settings_dict.get('mqtt_port', 1883))
-            prefix = settings_dict.get('mqtt_prefix', 'zabbix/cctv')
-            interval = int(settings_dict.get('check_interval', 60))
-            
-            client = mqtt.Client("camera_monitor_service")
-            try: client.connect(broker, port, 60)
-            except Exception: pass
+            # ... (rest of the logic remains the same, do not disconnect at the end) ...
             
             # PROCESS SWITCHES & CAMERAS
             cursor.execute("SELECT * FROM switches")

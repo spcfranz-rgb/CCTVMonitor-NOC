@@ -62,16 +62,67 @@
         </div>
     </div>
 
-    <script>
-        document.querySelectorAll('.log-time').forEach(el => {
-            const ts = parseFloat(el.getAttribute('data-ts')) * 1000;
-            const date = new Date(ts);
-            // Formats to something like: "10/24/2023, 2:45:12 PM"
-            el.innerText = date.toLocaleString(undefined, {
-                year: 'numeric', month: 'numeric', day: 'numeric',
-                hour: '2-digit', minute: '2-digit', second: '2-digit'
+<script>
+        // Initial format on first page load
+        function formatInitialDates() {
+            document.querySelectorAll('.log-time').forEach(el => {
+                const ts = parseFloat(el.getAttribute('data-ts')) * 1000;
+                const date = new Date(ts);
+                el.innerText = date.toLocaleString(undefined, {
+                    year: 'numeric', month: 'numeric', day: 'numeric',
+                    hour: '2-digit', minute: '2-digit', second: '2-digit'
+                });
             });
-        });
+        }
+        formatInitialDates();
+
+        // Background AJAX polling to make the logs "Live"
+        function updateLogs() {
+            fetch('/api/logs')
+                .then(response => response.json())
+                .then(data => {
+                    const tbody = document.querySelector('tbody');
+                    tbody.innerHTML = ''; // Clear the current table
+                    
+                    if (data.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="4" class="text-center py-4 text-muted">No state changes logged yet.</td></tr>';
+                        return;
+                    }
+
+                    // Rebuild the table rows with the fresh data
+                    data.forEach(log => {
+                        // Format the timestamp
+                        const date = new Date(log.timestamp * 1000).toLocaleString(undefined, {
+                            year: 'numeric', month: 'numeric', day: 'numeric',
+                            hour: '2-digit', minute: '2-digit', second: '2-digit'
+                        });
+                        
+                        // Determine Device Badge
+                        let devBadge = log.device_type === 'Switch' 
+                            ? '<span class="badge bg-secondary">Switch</span>' 
+                            : '<span class="badge bg-dark border">Camera</span>';
+                            
+                        // Determine Status Badge Color
+                        let statBadge = 'bg-secondary';
+                        if (log.status === 'UP') statBadge = 'bg-success';
+                        else if (log.status.includes('Silenced')) statBadge = 'bg-warning text-dark';
+                        else if (log.status.includes('DOWN') || log.status.includes('UNREACHABLE') || log.status.includes('Frozen') || log.status.includes('ERR')) statBadge = 'bg-danger';
+
+                        // Create and append the row
+                        const row = `<tr>
+                            <td class="ps-4 text-muted">${date}</td>
+                            <td>${devBadge}</td>
+                            <td class="fw-bold">${log.device_name}</td>
+                            <td><span class="badge ${statBadge}">${log.status}</span></td>
+                        </tr>`;
+                        tbody.innerHTML += row;
+                    });
+                })
+                .catch(error => console.error('Error fetching live logs:', error));
+        }
+
+        // Refresh the logs automatically every 5 seconds
+        setInterval(updateLogs, 5000);
     </script>
 </body>
 </html>

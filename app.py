@@ -141,7 +141,7 @@ def init_db():
     cursor.execute("SELECT count(*) FROM settings")
     if cursor.fetchone()[0] == 0:
         settings = [
-            ('mqtt_broker', os.environ.get('DEFAULT_MQTT_BROKER', '192.168.1.50')),
+            ('mqtt_broker', os.environ.get('DEFAULT_MQTT_BROKER', '127.0.0.1')),
             ('mqtt_port', os.environ.get('DEFAULT_MQTT_PORT', '1883')),
             ('mqtt_prefix', os.environ.get('DEFAULT_MQTT_PREFIX', 'zabbix/cctv')),
             ('check_interval', os.environ.get('DEFAULT_CHECK_INTERVAL', '60'))
@@ -225,7 +225,7 @@ def monitor_loop():
     print("Starting concurrent background monitoring thread...")
     previous_hashes = {} 
     
-    # 1. Establish a persistent MQTT connection ONCE
+    # Establish a persistent MQTT connection ONCE
     conn = get_db()
     settings_dict = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
     conn.close()
@@ -339,7 +339,6 @@ def monitor_loop():
             standalone_cameras = cursor.fetchall()
             standalone_results = {}
             
-            # Concurrency optimization using Eventlet GreenPool
             standalone_pool = eventlet.greenpool.GreenPool(size=20)
             for c_id, cam_up, stream_ok, snap_bytes in standalone_pool.imap(threaded_camera_check, [dict(c) for c in standalone_cameras]):
                 standalone_results[c_id] = (cam_up, stream_ok, snap_bytes)
@@ -630,6 +629,74 @@ def import_config():
 
     return redirect(url_for('index'))
 
+@app.route('/api/scan_network', methods=['POST'])
+@login_required
+@admin_required
+def scan_network():
+    subnet = request.form.get('subnet')
+    if not subnet: return jsonify({'success': False, 'error': 'No subnet provided.'})
+        
+    try: network = ipaddress.ip_network(subnet, strict=False)
+    except ValueError: return jsonify({'success': False, 'error': 'Invalid subnet format. Use CIDR notation (e.g., 192.168.1.0/24)'})
+
+    hosts = [str(ip) for ip in network.hosts()]
+    if len(hosts) > 1024: return jsonify({'success': False, 'error': 'Subnet too large. Please scan a /22 or smaller.'})
+
+    def check_rtsp_port(ip):
+        try:
+            with socket.create_connection((ip, 554), timeout=1.5): return ip
+        except (socket.timeout, ConnectionRefusedError, OSError): return None
+
+    discovered_ips = []
+    pool = eventlet.greenpool.GreenPool(size=100)
+    for result in pool.imap(check_rtsp_port, hosts):
+        if result: discovered_ips.append(result)
+
+    conn = get_db()
+    existing_cameras = [row['ip'] for row in conn.execute("SELECT ip FROM cameras").fetchall()]
+    conn.close()
+    
+    new_discoveries = [ip for ip in discovered_ips if ip not in existing_cameras]
+
+    return jsonify({
+        'success': True, 
+        'discovered': new_discoveries,
+        'total_found': len(discovered_ips),
+        'already_added': len(discovered_ips) - len(new_discoveries)
+    })
+
+@app.route('/api/add_cameras_bulk', methods=['POST'])
+@login_required
+@admin_required
+def add_cameras_bulk():
+    data = request.json
+    if not data or not data.get('ips'): return jsonify({'success': False, 'error': 'No IP addresses selected.'})
+
+    ips = data['ips']
+    switch_id = data.get('switch_id') or None
+    mfg = data.get('manufacturer', 'Other')
+    user = data.get('username', '')
+    pwd = data.get('password', '')
+
+    conn = get_db()
+    added_count = 0
+    errors = []
+
+    for ip in ips:
+        name = f"AutoCam-{ip.replace('.', '-')}"
+        stream_url = f"rtsp://{ip}:554/live"
+        try:
+            conn.execute("""INSERT INTO cameras (switch_id, name, ip, stream_url, manufacturer, username, password) 
+                            VALUES (?, ?, ?, ?, ?, ?, ?)""", 
+                         (switch_id, name, ip, stream_url, mfg, user, pwd))
+            added_count += 1
+        except sqlite3.IntegrityError: errors.append(ip)
+
+    conn.commit()
+    conn.close()
+    trigger_monitor_check()
+    return jsonify({'success': True, 'added': added_count, 'errors': errors})
+
 @app.route('/toggle_silence/<device_type>/<int:id>', methods=['POST'])
 @login_required
 @operator_required
@@ -680,97 +747,6 @@ def run_speedtest():
     threading.Thread(target=execute_test).start()
     return jsonify({'status': 'running'})
 
-@app.route('/api/scan_network', methods=['POST'])
-@login_required
-@admin_required
-def scan_network():
-    subnet = request.form.get('subnet')
-    if not subnet:
-        return jsonify({'success': False, 'error': 'No subnet provided.'})
-        
-    try:
-        network = ipaddress.ip_network(subnet, strict=False)
-    except ValueError:
-        return jsonify({'success': False, 'error': 'Invalid subnet format. Use CIDR notation (e.g., 192.168.1.0/24)'})
-
-    # Generate list of all usable host IPs in the subnet
-    hosts = [str(ip) for ip in network.hosts()]
-    
-    # Do not scan massive networks that will crash the server memory
-    if len(hosts) > 1024:
-        return jsonify({'success': False, 'error': 'Subnet too large. Please scan a /22 or smaller.'})
-
-    def check_rtsp_port(ip):
-        """Attempts to open a TCP socket on port 554 (RTSP)"""
-        try:
-            with socket.create_connection((ip, 554), timeout=1.5):
-                return ip
-        except (socket.timeout, ConnectionRefusedError, OSError):
-            return None
-
-    # Use Eventlet to scan all IPs concurrently
-    discovered_ips = []
-    pool = eventlet.greenpool.GreenPool(size=100)
-    
-    for result in pool.imap(check_rtsp_port, hosts):
-        if result:
-            discovered_ips.append(result)
-
-    # Filter out IPs that are already in the database
-    conn = get_db()
-    existing_cameras = [row['ip'] for row in conn.execute("SELECT ip FROM cameras").fetchall()]
-    conn.close()
-    
-    new_discoveries = [ip for ip in discovered_ips if ip not in existing_cameras]
-
-    return jsonify({
-        'success': True, 
-        'discovered': new_discoveries,
-        'total_found': len(discovered_ips),
-        'already_added': len(discovered_ips) - len(new_discoveries)
-    })
-
-@app.route('/api/add_cameras_bulk', methods=['POST'])
-@login_required
-@admin_required
-def add_cameras_bulk():
-    data = request.json
-    if not data or not data.get('ips'):
-        return jsonify({'success': False, 'error': 'No IP addresses selected.'})
-
-    ips = data['ips']
-    switch_id = data.get('switch_id') or None
-    mfg = data.get('manufacturer', 'Other')
-    user = data.get('username', '')
-    pwd = data.get('password', '')
-
-    conn = get_db()
-    added_count = 0
-    errors = []
-
-    for ip in ips:
-        # Auto-generate a safe temporary name based on the IP address
-        name = f"AutoCam-{ip.replace('.', '-')}"
-        # Provide a generic fallback RTSP URL that the monitor won't immediately choke on
-        stream_url = f"rtsp://{ip}:554/live"
-        
-        try:
-            conn.execute("""INSERT INTO cameras (switch_id, name, ip, stream_url, manufacturer, username, password) 
-                            VALUES (?, ?, ?, ?, ?, ?, ?)""", 
-                         (switch_id, name, ip, stream_url, mfg, user, pwd))
-            added_count += 1
-        except sqlite3.IntegrityError:
-            # Skip if the auto-generated name or IP already somehow snuck into the database
-            errors.append(ip)
-
-    conn.commit()
-    conn.close()
-    
-    # Wake up the background thread to instantly scan the new batch
-    trigger_monitor_check()
-
-    return jsonify({'success': True, 'added': added_count, 'errors': errors})
-    
 @app.route('/update_settings', methods=['POST'])
 @login_required
 @admin_required
@@ -1006,15 +982,18 @@ def proxy_absolute_paths(e):
 # ==========================================
 # APPLICATION STARTUP
 # ==========================================
-# Start the background task directly (Compatible with Flask 2.3+)
-try:
-    os.makedirs('/app/data', exist_ok=True)
-    lock_file = '/app/data/monitor.lock'
-    if not os.path.exists(lock_file):
-        open(lock_file, 'w').close()
-        socketio.start_background_task(monitor_loop)
-except Exception as e:
-    print(f"Could not initialize background task lock: {e}")
-
 if __name__ == '__main__':
+    # Initialize DB schema before threads spawn
+    init_db()
+    
+    # Safely start background task without deprecated Flask 2.2 hooks
+    try:
+        os.makedirs('/app/data', exist_ok=True)
+        lock_file = '/app/data/monitor.lock'
+        if not os.path.exists(lock_file):
+            open(lock_file, 'w').close()
+            socketio.start_background_task(monitor_loop)
+    except Exception as e:
+        print(f"Could not initialize background task lock: {e}")
+
     socketio.run(app, host='0.0.0.0', port=5000)

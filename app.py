@@ -519,12 +519,16 @@ def test_alert():
 @admin_required
 def add_switch():
     conn = get_db()
-    conn.execute("INSERT INTO switches (name, ip) VALUES (?, ?)", (request.form['name'], request.form['ip']))
-    conn.commit()
-    conn.close()
-    
-    trigger_monitor_check()
-    flash('Switch added.', 'success')
+    try:
+        conn.execute("INSERT INTO switches (name, ip) VALUES (?, ?)", (request.form['name'], request.form['ip']))
+        conn.commit()
+        trigger_monitor_check()
+        flash('Switch added.', 'success')
+    except sqlite3.IntegrityError:
+        flash('Error: A switch with that name already exists.', 'danger')
+    finally:
+        conn.close()
+        
     return redirect(url_for('index'))
 
 @app.route('/edit_switch/<int:id>', methods=['GET', 'POST'])
@@ -533,13 +537,16 @@ def add_switch():
 def edit_switch(id):
     conn = get_db()
     if request.method == 'POST':
-        conn.execute("UPDATE switches SET name = ?, ip = ? WHERE id = ?", (request.form['name'], request.form['ip'], id))
-        conn.commit()
-        conn.close()
-        
-        trigger_monitor_check()
-        flash('Switch updated.', 'success')
-        return redirect(url_for('index'))
+        try:
+            conn.execute("UPDATE switches SET name = ?, ip = ? WHERE id = ?", (request.form['name'], request.form['ip'], id))
+            conn.commit()
+            trigger_monitor_check()
+            flash('Switch updated.', 'success')
+            conn.close()
+            return redirect(url_for('index'))
+        except sqlite3.IntegrityError:
+            flash('Error: A switch with that name already exists.', 'danger')
+            
     switch = conn.execute("SELECT * FROM switches WHERE id = ?", (id,)).fetchone()
     conn.close()
     return render_template('edit_switch.html', switch=switch)
@@ -566,17 +573,21 @@ def add_camera():
     switch_id = switch_id if switch_id else None
 
     conn = get_db()
-    conn.execute("""
-        INSERT INTO cameras (switch_id, name, ip, stream_url, manufacturer, username, password) 
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (switch_id, request.form['name'], request.form['ip'], 
-          request.form['stream_url'], request.form.get('manufacturer', 'Other'),
-          request.form.get('username', ''), request.form.get('password', '')))
-    conn.commit()
-    conn.close()
-    
-    trigger_monitor_check()
-    flash('Camera added.', 'success')
+    try:
+        conn.execute("""
+            INSERT INTO cameras (switch_id, name, ip, stream_url, manufacturer, username, password) 
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (switch_id, request.form['name'], request.form['ip'], 
+              request.form['stream_url'], request.form.get('manufacturer', 'Other'),
+              request.form.get('username', ''), request.form.get('password', '')))
+        conn.commit()
+        trigger_monitor_check()
+        flash('Camera added.', 'success')
+    except sqlite3.IntegrityError:
+        flash('Error: A camera with that name already exists.', 'danger')
+    finally:
+        conn.close()
+        
     return redirect(url_for('index'))
 
 @app.route('/edit_camera/<int:id>', methods=['GET', 'POST'])
@@ -588,18 +599,20 @@ def edit_camera(id):
         switch_id = request.form.get('switch_id')
         switch_id = switch_id if switch_id else None 
 
-        conn.execute("""
-            UPDATE cameras SET switch_id = ?, name = ?, ip = ?, stream_url = ?, 
-            manufacturer = ?, username = ?, password = ? WHERE id = ?
-        """, (switch_id, request.form['name'], request.form['ip'], 
-              request.form['stream_url'], request.form.get('manufacturer', 'Other'),
-              request.form.get('username', ''), request.form.get('password', ''), id))
-        conn.commit()
-        conn.close()
-        
-        trigger_monitor_check()
-        flash('Camera updated.', 'success')
-        return redirect(url_for('index'))
+        try:
+            conn.execute("""
+                UPDATE cameras SET switch_id = ?, name = ?, ip = ?, stream_url = ?, 
+                manufacturer = ?, username = ?, password = ? WHERE id = ?
+            """, (switch_id, request.form['name'], request.form['ip'], 
+                  request.form['stream_url'], request.form.get('manufacturer', 'Other'),
+                  request.form.get('username', ''), request.form.get('password', ''), id))
+            conn.commit()
+            trigger_monitor_check()
+            flash('Camera updated.', 'success')
+            conn.close()
+            return redirect(url_for('index'))
+        except sqlite3.IntegrityError:
+            flash('Error: A camera with that name already exists.', 'danger')
     
     camera = conn.execute("SELECT * FROM cameras WHERE id = ?", (id,)).fetchone()
     switches = conn.execute("SELECT * FROM switches").fetchall()

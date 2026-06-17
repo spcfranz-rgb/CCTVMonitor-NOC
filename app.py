@@ -729,6 +729,47 @@ def scan_network():
         'total_found': len(discovered_ips),
         'already_added': len(discovered_ips) - len(new_discoveries)
     })
+
+@app.route('/api/add_cameras_bulk', methods=['POST'])
+@login_required
+@admin_required
+def add_cameras_bulk():
+    data = request.json
+    if not data or not data.get('ips'):
+        return jsonify({'success': False, 'error': 'No IP addresses selected.'})
+
+    ips = data['ips']
+    switch_id = data.get('switch_id') or None
+    mfg = data.get('manufacturer', 'Other')
+    user = data.get('username', '')
+    pwd = data.get('password', '')
+
+    conn = get_db()
+    added_count = 0
+    errors = []
+
+    for ip in ips:
+        # Auto-generate a safe temporary name based on the IP address
+        name = f"AutoCam-{ip.replace('.', '-')}"
+        # Provide a generic fallback RTSP URL that the monitor won't immediately choke on
+        stream_url = f"rtsp://{ip}:554/live"
+        
+        try:
+            conn.execute("""INSERT INTO cameras (switch_id, name, ip, stream_url, manufacturer, username, password) 
+                            VALUES (?, ?, ?, ?, ?, ?, ?)""", 
+                         (switch_id, name, ip, stream_url, mfg, user, pwd))
+            added_count += 1
+        except sqlite3.IntegrityError:
+            # Skip if the auto-generated name or IP already somehow snuck into the database
+            errors.append(ip)
+
+    conn.commit()
+    conn.close()
+    
+    # Wake up the background thread to instantly scan the new batch
+    trigger_monitor_check()
+
+    return jsonify({'success': True, 'added': added_count, 'errors': errors})
     
 @app.route('/update_settings', methods=['POST'])
 @login_required

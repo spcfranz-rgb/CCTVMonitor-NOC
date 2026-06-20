@@ -18,7 +18,7 @@ services:
 
   # --- Your Custom Application ---
   cctv-dashboard:
-    build: https://github.com/spcfranz-rgb/CCTVMonitor-NOC.git#main
+    build: https://github.com/spcfranz-rgb/CCTVMonitor-NOC.git#test
     container_name: cctv-dashboard
     restart: unless-stopped
     ports:

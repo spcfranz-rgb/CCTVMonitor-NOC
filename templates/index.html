@@ -2,239 +2,698 @@
 <html lang="en" data-bs-theme="dark">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CCTV Monitor NOC</title>
-    
+    <title>CCTV Monitor Dashboard</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
-    
-    <style>
-        body { background-color: #121212; color: #e0e0e0; }
-        .card { background-color: #1e1e1e; border: 1px solid #333; }
-        .card-header { border-bottom: 1px solid #333; background-color: #252525; }
-        .logo-header { height: 50px; object-fit: contain; }
-        .terminal-output { 
-            max-height: 350px; 
-            overflow-y: auto; 
-            font-family: monospace; 
-            white-space: pre-wrap; 
-            border: 1px solid #333;
-            font-size: 0.85rem;
-        }
-    </style>
 </head>
-<body>
+<body class="container py-4">
 
-<div class="container-fluid py-4 px-4">
-    
-    <div class="d-flex justify-content-between align-items-center mb-4 pb-3 border-bottom border-secondary">
+    <div class="d-flex justify-content-between align-items-center mb-4 border-bottom pb-3">
         <div class="d-flex align-items-center">
-            <img src="{{ url_for('static', filename='company_logo.png') }}" onerror="this.style.display='none'" class="logo-header me-3" alt="Company Logo">
-            <h3 class="mb-0 text-light">CCTV NOC Dashboard</h3>
+            {% if company_logo %}
+                <img src="{{ company_logo }}" alt="Company Logo" style="height: 30px; width: auto; object-fit: contain;" class="me-3 border-end border-secondary pe-3">
+            {% endif %}
+            {% if customer_logo %}
+                <img src="{{ customer_logo }}" alt="Customer Logo" style="height: 40px; width: auto; object-fit: contain;" class="me-3">
+            {% endif %}
+            <h1 class="mb-0 h3">CCTV Dashboard</h1>
         </div>
-        <div>
-            <img src="{{ url_for('static', filename='customer_logo.png') }}" onerror="this.style.display='none'" class="logo-header" alt="Customer Logo">
+        <div class="d-flex align-items-center">
+            <a href="/history" class="btn btn-outline-info btn-sm me-3">View Event Logs</a>
+            <span class="me-3">Logged in as: <strong>{{ current_user.username }}</strong> ({{ current_user.role }})</span>
+            <a href="/logout" class="btn btn-outline-light btn-sm">Logout</a>
         </div>
     </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="alert alert-{{ category }} alert-dismissible fade show shadow-sm py-2" role="alert">
+            {{ message }}
+            <button type="button" class="btn-close py-2" data-bs-dismiss="alert" aria-label="Close"></button>
+          </div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
 
     <div class="row">
-        <div class="col-lg-6 mb-4">
-            <div class="card shadow-sm h-100">
-                <div class="card-header">
-                    <h5 class="mb-0">Manual Diagnostic Tool</h5>
-                </div>
+        <div class="col-md-4">
+            
+            <div class="card mb-4">
+                <div class="card-header"><h5 class="mb-0">Network Switches</h5></div>
                 <div class="card-body">
+                    <table class="table table-sm align-middle">
+                        <thead><tr><th>Name</th><th>IP/Host</th><th>Status</th>{% if current_user.role in ['admin', 'operator'] %}<th></th>{% endif %}</tr></thead>
+                        <tbody>
+                            {% for s in switches %}
+                            <tr>
+                                <td>{{ s.name }}</td>
+                                <td>
+                                    {{ s.ip }}
+                                    <a href="/tunnel/switch/{{ s.id }}/" target="_blank" class="badge bg-info text-decoration-none ms-2">WebUI</a>
+                                </td>
+                                <td>
+                                    <span id="status-switch-{{ s.id }}" class="badge {% if s.status == 'UP' %}bg-success{% elif 'Silenced' in s.status %}bg-warning text-dark{% elif 'DOWN' in s.status %}bg-danger{% else %}bg-secondary{% endif %}">
+                                        {{ s.status }}
+                                    </span>
+                                </td>
+                                {% if current_user.role in ['admin', 'operator'] %}
+                                <td class="text-end text-nowrap">
+                                    {% if s.is_silenced %}
+                                        <button class="btn btn-warning btn-sm" onclick="toggleSilence('switch', {{ s.id }}, 0)" title="Un-silence Device">🔔</button>
+                                    {% else %}
+                                        <button class="btn btn-outline-secondary btn-sm" onclick="toggleSilence('switch', {{ s.id }}, 24)" title="Silence Alerts (24h)">🔕</button>
+                                    {% endif %}
+                                    
+                                    {% if current_user.role == 'admin' %}
+                                    <a href="/edit_switch/{{ s.id }}" class="btn btn-outline-warning btn-sm">Edit</a>
+                                    <a href="/delete_switch/{{ s.id }}" class="btn btn-outline-danger btn-sm">X</a>
+                                    {% endif %}
+                                </td>
+                                {% endif %}
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
                     
-                    <div class="input-group mb-2">
-                        <input type="text" id="diagIp" class="form-control" placeholder="IP or Hostname (e.g. 192.168.1.5)">
-                        <button class="btn btn-outline-info" type="button" id="pingBtn" onclick="runPing()">Ping</button>
-                        <button class="btn btn-danger d-none" type="button" id="stopPingBtn" onclick="stopContinuousPing()">Stop Ping</button>
-                        <button class="btn btn-outline-warning" type="button" id="traceBtn" onclick="runTrace()">Trace</button>
-                    </div>
-                    
-                    <div class="form-check form-switch mb-3">
-                        <input class="form-check-input" type="checkbox" id="continuousPingCheck" role="switch">
-                        <label class="form-check-label small text-muted mt-1" for="continuousPingCheck">Continuous Stream (WebSocket)</label>
-                    </div>
-                    
-                    <div id="diagSpinner" class="text-center d-none mb-3">
-                        <div class="spinner-border spinner-border-sm text-info" role="status"></div>
-                        <span id="diagSpinnerText" class="ms-2 small text-muted">Running diagnostic...</span>
-                    </div>
-                    
-                    <pre id="diagOutput" class="bg-black text-light p-3 rounded d-none terminal-output"></pre>
+                    {% if current_user.role == 'admin' %}
+                    <hr>
+                    <h6>Add Switch</h6>
+                    <form action="/add_switch" method="POST">
+                        <input type="text" name="name" class="form-control mb-2" placeholder="Switch Name" required>
+                        <input type="text" name="ip" class="form-control mb-2" placeholder="IP / Hostname" required>
+                        <button type="submit" class="btn btn-primary btn-sm w-100">Add Switch</button>
+                    </form>
+                    {% endif %}
                 </div>
             </div>
+
+            {% if current_user.role == 'admin' %}
+            <div class="card mb-4">
+                <div class="card-header"><h5 class="mb-0">Global Settings</h5></div>
+                <div class="card-body bg-body-tertiary">
+                    <form action="/update_settings" method="POST">
+                        <div class="mb-2">
+                            <label class="form-label small text-muted mb-0">MQTT Broker IP</label>
+                            <input type="text" name="mqtt_broker" class="form-control form-control-sm" value="{{ settings.mqtt_broker }}" required>
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label small text-muted mb-0">MQTT Port</label>
+                            <input type="number" name="mqtt_port" class="form-control form-control-sm" value="{{ settings.mqtt_port }}" required>
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label small text-muted mb-0">MQTT Topic Prefix</label>
+                            <input type="text" name="mqtt_prefix" class="form-control form-control-sm" value="{{ settings.mqtt_prefix }}" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label small text-muted mb-0">Check Interval (Sec)</label>
+                            <input type="number" name="check_interval" class="form-control form-control-sm" value="{{ settings.check_interval }}" required>
+                        </div>
+                        <button type="submit" class="btn btn-warning btn-sm w-100">Save Settings</button>
+                    </form>
+                    
+                    <hr class="my-3 border-secondary">
+                    <h6>Backup & Restore</h6>
+                    <div class="d-flex gap-2 mb-3">
+                        <a href="/export_config" class="btn btn-outline-success btn-sm w-50">Export Config</a>
+                        <button type="button" class="btn btn-outline-info btn-sm w-50" data-bs-toggle="modal" data-bs-target="#importModal">Import Config</button>
+                    </div>
+
+                    <hr class="my-3 border-secondary">
+                    <form action="/test_alert" method="POST">
+                        <button type="submit" class="btn btn-outline-info btn-sm w-100">Test MQTT Alert</button>
+                    </form>
+                </div>
+            </div>
+            {% endif %}
+
+            {% if current_user.role in ['admin', 'operator'] %}
+            <div class="card mb-4">
+                <div class="card-header"><h5 class="mb-0">Manual Diagnostic Tool</h5></div>
+                <div class="card-body">
+                        <div class="input-group mb-2">
+                            <input type="text" id="diagIp" class="form-control form-control-sm" placeholder="IP or Hostname (e.g. 192.168.1.5)">
+                            <button class="btn btn-outline-info btn-sm" type="button" id="pingBtn" onclick="runPing()">Ping</button>
+                            <button class="btn btn-danger btn-sm d-none" type="button" id="stopPingBtn" onclick="stopContinuousPing()">Stop Ping</button>
+                            <button class="btn btn-outline-warning btn-sm" type="button" id="traceBtn" onclick="runTrace()">Trace</button>
+                        </div>
+                        
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="continuousPingCheck" role="switch">
+                            <label class="form-check-label small text-muted mt-1" for="continuousPingCheck">Continuous Stream</label>
+                        </div>
+                        
+                        <div id="diagSpinner" class="text-center d-none mb-2">
+                            <div class="spinner-border spinner-border-sm text-info" role="status"></div>
+                            <span id="diagSpinnerText" class="ms-2 small text-muted">Running diagnostic...</span>
+                        </div>
+                        
+                        <pre id="diagOutput" class="bg-black text-light p-2 rounded small d-none" style="max-height: 250px; overflow-y: auto; font-size: 0.75rem; white-space: pre-wrap;"></pre>
+                </div>
+            </div>
+            {% endif %}
+
+            {% if current_user.role in ['admin', 'operator'] %}
+            <div class="card mb-4">
+                <div class="card-header"><h5 class="mb-0">WAN Speed Test</h5></div>
+                <div class="card-body">
+                    <p class="small text-muted mb-3">Test the external internet connection speed of the gateway system.</p>
+                    <div id="speedtestDisplay" class="row text-center mb-3 d-none">
+                        <div class="col-4 border-end"><small class="text-muted d-block">Ping</small><strong id="st-ping" class="text-info">-</strong></div>
+                        <div class="col-4 border-end"><small class="text-muted d-block">Download</small><strong id="st-download" class="text-success">-</strong></div>
+                        <div class="col-4"><small class="text-muted d-block">Upload</small><strong id="st-upload" class="text-warning">-</strong></div>
+                        <div class="col-12 mt-2"><small class="text-muted small">ISP: <span id="st-isp" class="fw-bold text-light">-</span></small></div>
+                    </div>
+                    <div id="speedtestSpinner" class="text-center d-none mb-3">
+                        <div class="spinner-border spinner-border-sm text-warning" role="status"></div>
+                        <span class="ms-2 small text-muted">Running network benchmarks (takes ~30s)...</span>
+                    </div>
+                    <button class="btn btn-outline-warning btn-sm w-100" type="button" id="speedtestBtn" onclick="runSpeedTest()">Run Speed Test</button>
+                    <div id="speedtestError" class="alert alert-danger py-1 small mt-2 d-none"></div>
+                </div>
+            </div>
+            {% endif %}
+
+            {% if current_user.role == 'admin' %}
+            <div class="card mb-4">
+                <div class="card-header"><h5 class="mb-0">User Management</h5></div>
+                <div class="card-body">
+                    <table class="table table-sm align-middle">
+                        <thead><tr><th>Username</th><th>Role</th><th></th></tr></thead>
+                        <tbody>
+                            {% for u in users %}
+                            <tr>
+                                <td>{{ u.username }}</td>
+                                <td>{{ u.role }}</td>
+                                <td class="text-end">
+                                    {% if u.id != current_user.id %}
+                                    <a href="/delete_user/{{ u.id }}" class="btn btn-outline-danger btn-sm">X</a>
+                                    {% endif %}
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                    <hr>
+                    <form action="/add_user" method="POST" class="row gx-1">
+                        <div class="col-12 mb-2"><input type="text" name="username" class="form-control form-control-sm" placeholder="Username" required></div>
+                        <div class="col-6 mb-2"><input type="password" name="password" class="form-control form-control-sm" placeholder="Password" required></div>
+                        <div class="col-6 mb-2">
+                            <select name="role" class="form-select form-select-sm" required>
+                                <option value="user">Viewer Only</option>
+                                <option value="operator">Operator (Diagnostics)</option>
+                                <option value="admin">Admin (Full Config)</option>
+                            </select>
+                        </div>
+                        <div class="col-12"><button type="submit" class="btn btn-secondary btn-sm w-100">Add User</button></div>
+                    </form>
+                </div>
+            </div>
+            {% endif %}
+
         </div>
 
-        <div class="col-lg-6 mb-4">
-            <div class="card shadow-sm h-100">
-                <div class="card-header">
-                    <h5 class="mb-0">Live Network Status</h5>
-                </div>
+        <div class="col-md-8">
+            <div class="card">
+                <div class="card-header"><h5 class="mb-0">Cameras</h5></div>
                 <div class="card-body">
-                    <div class="alert alert-dark text-center border-secondary" role="alert">
-                        MQTT Background Monitor Active
+                    <table class="table table-sm align-middle">
+                        <thead><tr><th>Name</th><th>IP/Host</th><th>Switch</th><th>Status</th>{% if current_user.role in ['admin', 'operator'] %}<th></th>{% endif %}</tr></thead>
+                        <tbody>
+                            {% for c in cameras %}
+                            <tr>
+                                <td>
+                                    {{ c.name }}
+                                    <button class="btn btn-sm btn-outline-secondary ms-2 py-0" onclick="showPreview({{ c.id }}, '{{ c.name }}')">Preview</button>
+                                </td>
+                                <td>
+                                    {{ c.ip }}
+                                    <a href="/tunnel/camera/{{ c.id }}/" target="_blank" class="badge bg-info text-decoration-none ms-2">WebUI</a>
+                                </td>
+                                <td><small class="text-muted">{{ c.switch_name or 'Standalone' }}</small></td>
+                                <td>
+                                    <span id="status-camera-{{ c.id }}" class="badge {% if c.status == 'UP' %}bg-success{% elif 'Silenced' in c.status %}bg-warning text-dark{% elif 'DOWN' in c.status or 'UNREACHABLE' in c.status or 'Frozen' in c.status %}bg-danger{% else %}bg-secondary{% endif %}">
+                                        {{ c.status }}
+                                    </span>
+                                </td>
+                                {% if current_user.role in ['admin', 'operator'] %}
+                                <td class="text-end text-nowrap">
+                                    {% if c.is_silenced %}
+                                        <button class="btn btn-warning btn-sm" onclick="toggleSilence('camera', {{ c.id }}, 0)" title="Un-silence Device">🔔</button>
+                                    {% else %}
+                                        <button class="btn btn-outline-secondary btn-sm" onclick="toggleSilence('camera', {{ c.id }}, 24)" title="Silence Alerts (24h)">🔕</button>
+                                    {% endif %}
+                                    
+                                    {% if current_user.role == 'admin' %}
+                                    <a href="/edit_camera/{{ c.id }}" class="btn btn-outline-warning btn-sm">Edit</a>
+                                    <a href="/delete_camera/{{ c.id }}" class="btn btn-outline-danger btn-sm">X</a>
+                                    {% endif %}
+                                </td>
+                                {% endif %}
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+
+                    {% if current_user.role == 'admin' %}
+                    <hr>
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <h6 class="mb-0">Add Camera</h6>
+                        <div class="dropdown">
+                            <button class="btn btn-outline-info btn-sm dropdown-toggle py-0" type="button" data-bs-toggle="dropdown" data-bs-auto-close="outside" aria-expanded="false">
+                                Auto-Discover
+                            </button>
+                            <div class="dropdown-menu dropdown-menu-end p-3 shadow" style="width: 320px;">
+                                <p class="small text-muted mb-2">Scan a local subnet for port 554 (RTSP).</p>
+                                <div class="input-group input-group-sm mb-2">
+                                    <input type="text" id="scanSubnetInput" class="form-control" placeholder="192.168.1.0/24" value="192.168.1.0/24">
+                                    <button class="btn btn-primary" type="button" id="scanSubnetBtn" onclick="runNetworkScan()">Scan</button>
+                                </div>
+                                <div id="scanSpinner" class="text-center d-none mb-2">
+                                    <div class="spinner-border spinner-border-sm text-info" role="status"></div>
+                                    <span class="ms-2 small text-muted">Sweeping subnet...</span>
+                                </div>
+                                <div id="scanResults" class="small mt-2"></div>
+                                <div id="bulkAddOptions" class="d-none mt-3 pt-2 border-top">
+                                    <label class="form-label small fw-bold mb-1">Mass-Add Selected</label>
+                                    <select id="bulkMfg" class="form-select form-select-sm mb-1">
+                                        <option value="Other">Other (FFmpeg RTSP)</option>
+                                        <option value="Hanwha">Hanwha / Wisenet</option>
+                                        <option value="Hikvision">Hikvision</option>
+                                        <option value="Dahua">Dahua</option>
+                                    </select>
+                                    <div class="input-group input-group-sm mb-2">
+                                        <input type="text" id="bulkUser" class="form-control" placeholder="Shared User">
+                                        <input type="password" id="bulkPass" class="form-control" placeholder="Shared Pass">
+                                    </div>
+                                    <button class="btn btn-success btn-sm w-100" id="submitBulkBtn" onclick="submitBulkAdd()">Add Checked Cameras</button>
+                                </div>
+                            </div>
+                        </div>
                     </div>
-                    </div>
+
+                    <form action="/add_camera" method="POST">
+                        <div class="row gx-2 mb-2">
+                            <div class="col-md-3">
+                                <select name="switch_id" class="form-select form-select-sm">
+                                    <option value="" selected>None (Standalone)</option>
+                                    {% for s in switches %}
+                                    <option value="{{ s.id }}">{{ s.name }}</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                            <div class="col-md-3"><input type="text" name="name" class="form-control form-control-sm" placeholder="Cam Name" required></div>
+                            <div class="col-md-3"><input type="text" name="ip" class="form-control form-control-sm" placeholder="IP / Hostname" required></div>
+                            <div class="col-md-3">
+                                <select name="manufacturer" class="form-select form-select-sm" required>
+                                    <option value="Other">Other (FFmpeg RTSP)</option>
+                                    <option value="Hanwha">Hanwha / Wisenet</option>
+                                    <option value="Hikvision">Hikvision</option>
+                                    <option value="Dahua">Dahua</option>
+                                    <option value="Amcrest">Amcrest</option>
+                                    <option value="Axis">Axis</option>
+                                    <option value="Foscam">Foscam</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="row gx-2">
+                            <div class="col-md-3"><input type="text" name="username" class="form-control form-control-sm" placeholder="Camera User"></div>
+                            <div class="col-md-3"><input type="password" name="password" class="form-control form-control-sm" placeholder="Camera Pass"></div>
+                            <div class="col-md-5"><input type="text" name="stream_url" class="form-control form-control-sm" placeholder="RTSP URL (Fallback/Monitor)" required></div>
+                            <div class="col-md-1"><button type="submit" class="btn btn-primary btn-sm w-100">+</button></div>
+                        </div>
+                    </form>
+                    {% endif %}
+                </div>
             </div>
         </div>
     </div>
-</div>
 
-<script>
-    // 1. Initialize the WebSocket connection to the Python backend
-    const socket = io();
+    <div class="modal fade" id="previewModal" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog modal-lg modal-dialog-centered">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" id="previewModalLabel">Camera Preview</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body text-center bg-dark" style="min-height: 300px;">
+            <div class="spinner-border text-primary mt-5" id="previewSpinner" role="status">
+                <span class="visually-hidden">Loading...</span>
+            </div>
+            <img id="previewImage" src="" class="img-fluid d-none rounded" alt="Stream Preview">
+          </div>
+        </div>
+      </div>
+    </div>
 
-    // Verify connection in the browser console
-    socket.on('connect', function() {
-        console.log('WebSocket successfully connected to Gunicorn Eventlet Worker.');
-    });
+    {% if current_user.role == 'admin' %}
+    <div class="modal fade" id="importModal" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title">Import Configuration</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <form action="/import_config" method="POST" enctype="multipart/form-data">
+              <div class="modal-body">
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <p class="small text-muted mb-0">Upload a <code>.csv</code> configuration file.</p>
+                    <a href="/download_template" class="btn btn-sm btn-outline-info py-0">Download Template</a>
+                </div>
+                <div class="alert alert-warning py-2 small">
+                    <strong>Note:</strong> This is a non-destructive merge. Existing devices with the exact same name will be updated. New devices will be added. No devices will be deleted.
+                </div>
+                <input type="file" name="file" accept=".csv" class="form-control form-control-sm border-secondary" required>
+              </div>
+              <div class="modal-footer d-flex justify-content-between border-top-0 pt-0">
+                  <button type="button" class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                  <button type="submit" class="btn btn-primary btn-sm">Upload & Import</button>
+              </div>
+          </form>
+        </div>
+      </div>
+    </div>
+    {% endif %}
 
-    // 2. Main Ping Function (Handles both Standard and Continuous)
-    function runPing() {
-        const ipInput = document.getElementById('diagIp');
-        const pBtn = document.getElementById('pingBtn');
-        const sBtn = document.getElementById('stopPingBtn');
-        const tBtn = document.getElementById('traceBtn');
-        const spinner = document.getElementById('diagSpinner');
-        const spinnerText = document.getElementById('diagSpinnerText');
-        const output = document.getElementById('diagOutput');
-        const isContinuous = document.getElementById('continuousPingCheck').checked;
-        const ip = ipInput.value.trim();
-
-        if (!ip) { 
-            alert('Please enter an IP address or Hostname.'); 
-            return; 
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    
+    <script>
+        // Silencing Script
+        function toggleSilence(type, id, hours) {
+            const formData = new FormData();
+            formData.append('hours', hours);
+            fetch('/toggle_silence/' + type + '/' + id, { method: 'POST', body: formData })
+            .then(res => res.json())
+            .then(data => { if (data.success) { location.reload(); } });
         }
 
-        // Reset Output Window
-        output.classList.remove('d-none', 'text-danger', 'text-success');
-        output.textContent = '';
-        output.classList.add('text-light');
+        // Snapshot Preview Script
+        let modalInstance;
+        let previewInterval;
+        let currentPreviewId;
 
-        if (isContinuous) {
-            // --- CONTINUOUS PING (WebSockets) ---
-            pBtn.classList.add('d-none');
-            sBtn.classList.remove('d-none');
-            tBtn.disabled = true;
-            ipInput.disabled = true;
-            spinnerText.innerText = 'Pinging continuously (Streaming via WebSockets)...';
-            spinner.classList.remove('d-none');
+        function showPreview(id, name) {
+            currentPreviewId = id;
+            if (!modalInstance) {
+                modalInstance = new bootstrap.Modal(document.getElementById('previewModal'));
+                document.getElementById('previewModal').addEventListener('hidden.bs.modal', function () {
+                    if (previewInterval) { clearInterval(previewInterval); previewInterval = null; }
+                });
+            }
+            document.getElementById('previewModalLabel').innerText = 'Live Preview: ' + name;
+            const img = document.getElementById('previewImage');
+            const spinner = document.getElementById('previewSpinner');
             
-            // Send the command to app.py to spawn the background process
-            socket.emit('start_continuous_ping', {ip: ip});
-        } else {
-            // --- STANDARD PING (AJAX/Fetch) ---
-            pBtn.disabled = true; 
-            tBtn.disabled = true; 
-            ipInput.disabled = true;
-            spinnerText.innerText = 'Sending 4 packets...';
-            spinner.classList.remove('d-none');
-
-            const formData = new FormData(); 
-            formData.append('ip', ip);
-
-            // Talk to the standard Flask API route
-            fetch('/api/ping', { method: 'POST', body: formData })
-            .then(response => response.json())
-            .then(data => {
-                output.textContent = data.output;
-                if (data.success) { 
-                    output.classList.replace('text-light', 'text-success'); 
-                } else { 
-                    output.classList.replace('text-light', 'text-danger'); 
+            function fetchSnapshot(isFirstLoad = false) {
+                const timestamp = new Date().getTime();
+                const newSrc = '/snapshot/' + currentPreviewId + '?t=' + timestamp;
+                if (isFirstLoad) {
+                    img.classList.add('d-none'); spinner.classList.remove('d-none'); img.src = newSrc;
+                } else {
+                    const tempImg = new Image();
+                    tempImg.onload = function() { img.src = this.src; }; tempImg.src = newSrc;
                 }
+            }
+
+            img.onload = function() { spinner.classList.add('d-none'); img.classList.remove('d-none'); };
+            img.onerror = function() {
+                spinner.classList.add('d-none');
+                if (!previewInterval) { alert('Failed to load snapshot.'); modalInstance.hide(); }
+            };
+            
+            if (previewInterval) clearInterval(previewInterval);
+            fetchSnapshot(true);
+            previewInterval = setInterval(() => { fetchSnapshot(false); }, 10000);
+            modalInstance.show();
+        }
+
+        // Diagnostic Ping Script
+        function runPing() {
+            const ipInput = document.getElementById('diagIp');
+            const pBtn = document.getElementById('pingBtn');
+            const sBtn = document.getElementById('stopPingBtn');
+            const tBtn = document.getElementById('traceBtn');
+            const spinner = document.getElementById('diagSpinner');
+            const spinnerText = document.getElementById('diagSpinnerText');
+            const output = document.getElementById('diagOutput');
+            const isContinuous = document.getElementById('continuousPingCheck').checked;
+            const ip = ipInput.value.trim();
+
+            if (!ip) { alert('Please enter an IP address or Hostname.'); return; }
+
+            // Reset UI State
+            output.classList.remove('d-none', 'text-danger', 'text-success');
+            output.textContent = '';
+            output.classList.add('text-light');
+
+            if (isContinuous) {
+                // --- CONTINUOUS PING (WebSockets) ---
+                pBtn.classList.add('d-none');
+                sBtn.classList.remove('d-none');
+                tBtn.disabled = true;
+                ipInput.disabled = true;
+                spinnerText.innerText = 'Pinging continuously...';
+                spinner.classList.remove('d-none');
+                
+                socket.emit('start_continuous_ping', {ip: ip});
+            } else {
+                // --- STANDARD 4-PACKET PING (AJAX Fetch) ---
+                pBtn.disabled = true; tBtn.disabled = true; ipInput.disabled = true;
+                spinnerText.innerText = 'Sending 4 packets...';
+                spinner.classList.remove('d-none');
+
+                const formData = new FormData(); formData.append('ip', ip);
+
+                fetch('/api/ping', { method: 'POST', body: formData })
+                .then(response => response.json())
+                .then(data => {
+                    output.textContent = data.output;
+                    if (data.success) { output.classList.replace('text-light', 'text-success'); } 
+                    else { output.classList.replace('text-light', 'text-danger'); }
+                })
+                .catch(error => {
+                    output.textContent = 'Network Error: ' + error;
+                    output.classList.replace('text-light', 'text-danger');
+                })
+                .finally(() => {
+                    pBtn.disabled = false; tBtn.disabled = false; ipInput.disabled = false; spinner.classList.add('d-none');
+                });
+            }
+        }
+
+        // Stop Continuous Ping Button Logic
+        function stopContinuousPing() {
+            socket.emit('stop_continuous_ping');
+            resetPingUI();
+        }
+
+        // Reset UI when ping stops or finishes
+        function resetPingUI() {
+            document.getElementById('pingBtn').classList.remove('d-none');
+            document.getElementById('stopPingBtn').classList.add('d-none');
+            document.getElementById('traceBtn').disabled = false;
+            document.getElementById('diagIp').disabled = false;
+            document.getElementById('diagSpinner').classList.add('d-none');
+        }
+
+        // Diagnostic Traceroute Script
+        function runTrace() {
+            const ipInput = document.getElementById('diagIp');
+            const pBtn = document.getElementById('pingBtn');
+            const tBtn = document.getElementById('traceBtn');
+            const spinner = document.getElementById('diagSpinner');
+            const spinnerText = document.getElementById('diagSpinnerText');
+            const output = document.getElementById('diagOutput');
+            const ip = ipInput.value.trim();
+
+            if (!ip) { alert('Please enter an IP address or Hostname.'); return; }
+
+            pBtn.disabled = true; tBtn.disabled = true; ipInput.disabled = true;
+            spinnerText.innerText = 'Tracing route (may take up to 60s)...';
+            spinner.classList.remove('d-none');
+            output.classList.add('d-none'); output.textContent = '';
+
+            const formData = new FormData(); formData.append('target', ip);
+
+            fetch('/api/traceroute', { method: 'POST', body: formData })
+            .then(res => res.json())
+            .then(data => {
+                if (data.status !== 'running') { throw new Error('Could not initialize trace worker.'); }
             })
-            .catch(error => {
-                output.textContent = 'Network Error: ' + error;
-                output.classList.replace('text-light', 'text-danger');
-            })
-            .finally(() => {
-                resetPingUI();
+            .catch(err => {
+                output.textContent = 'Execution Error: ' + err.message;
+                output.classList.remove('text-success'); output.classList.add('text-danger');
+                output.classList.remove('d-none');
+                pBtn.disabled = false; tBtn.disabled = false; ipInput.disabled = false; spinner.classList.add('d-none');
             });
         }
-    }
-
-    // 3. Stop Button Logic
-    function stopContinuousPing() {
-        // Tell app.py to kill the subprocess
-        socket.emit('stop_continuous_ping');
-        resetPingUI();
         
-        const output = document.getElementById('diagOutput');
-        output.textContent += '\n--- Process Terminated by User ---\n';
-        output.scrollTop = output.scrollHeight;
-    }
-
-    // 4. UI Reset Utility
-    function resetPingUI() {
-        document.getElementById('pingBtn').classList.remove('d-none');
-        document.getElementById('pingBtn').disabled = false;
-        document.getElementById('stopPingBtn').classList.add('d-none');
-        document.getElementById('traceBtn').disabled = false;
-        document.getElementById('diagIp').disabled = false;
-        document.getElementById('diagSpinner').classList.add('d-none');
-    }
-
-    // 5. WebSocket Listeners (Catching data from app.py)
-    socket.on('ping_output', function(data) {
-        const output = document.getElementById('diagOutput');
-        output.textContent += data.line;
-        output.scrollTop = output.scrollHeight; // Auto-scroll down
-    });
-
-    socket.on('ping_stopped', function() {
-        resetPingUI();
-    });
-
-    // 6. Traceroute Logic (AJAX/Fetch)
-    function runTrace() {
-        const ipInput = document.getElementById('diagIp');
-        const pBtn = document.getElementById('pingBtn');
-        const tBtn = document.getElementById('traceBtn');
-        const spinner = document.getElementById('diagSpinner');
-        const spinnerText = document.getElementById('diagSpinnerText');
-        const output = document.getElementById('diagOutput');
-        const ip = ipInput.value.trim();
-
-        if (!ip) { 
-            alert('Please enter an IP address or Hostname.'); 
-            return; 
+        // Let user hit enter on diagnostic input to default to Ping
+        const diagIpElement = document.getElementById("diagIp");
+        if (diagIpElement) {
+            diagIpElement.addEventListener("keypress", function(event) {
+                if (event.key === "Enter") { event.preventDefault(); document.getElementById("pingBtn").click(); }
+            });
         }
 
-        pBtn.disabled = true; 
-        tBtn.disabled = true; 
-        ipInput.disabled = true;
-        spinnerText.innerText = 'Routing packets (This may take up to 30 seconds)...';
-        spinner.classList.remove('d-none');
+        // Speed Test Script
+        function runSpeedTest() {
+            const btn = document.getElementById('speedtestBtn');
+            const spinner = document.getElementById('speedtestSpinner');
+            const display = document.getElementById('speedtestDisplay');
+            const errDiv = document.getElementById('speedtestError');
+
+            btn.disabled = true; spinner.classList.remove('d-none');
+            errDiv.classList.add('d-none'); display.classList.add('d-none');
+
+            fetch('/api/speedtest', { method: 'POST' })
+            .then(res => res.json())
+            .then(data => { if (data.status !== 'running') { throw new Error('Could not initialize test worker.'); } })
+            .catch(err => {
+                errDiv.textContent = 'Execution Error: ' + err.message; errDiv.classList.remove('d-none');
+                btn.disabled = false; spinner.classList.add('d-none');
+            });
+        }
+
+        // Network Scanner & Mass Add Logic
+        function toggleAllCheckboxes(state) {
+            document.querySelectorAll('.bulk-ip-check').forEach(chk => chk.checked = state);
+        }
+
+        function runNetworkScan() {
+            const btn = document.getElementById('scanSubnetBtn');
+            const input = document.getElementById('scanSubnetInput');
+            const spinner = document.getElementById('scanSpinner');
+            const resultsDiv = document.getElementById('scanResults');
+            const bulkOptions = document.getElementById('bulkAddOptions');
+            
+            const subnet = input.value.trim();
+            if (!subnet) return;
+
+            btn.disabled = true; spinner.classList.remove('d-none');
+            resultsDiv.innerHTML = ''; bulkOptions.classList.add('d-none');
+
+            const formData = new FormData(); formData.append('subnet', subnet);
+            fetch('/api/scan_network', { method: 'POST', body: formData })
+            .then(res => res.json())
+            .then(data => {
+                if (!data.success) { resultsDiv.innerHTML = `<span class="text-danger">${data.error}</span>`; return; }
+                if (data.discovered.length === 0) {
+                    resultsDiv.innerHTML = `<span class="text-muted">No new cameras found. (Found ${data.total_found} total, ${data.already_added} already managed).</span>`;
+                    return;
+                }
+
+                let html = `<div class="alert alert-success py-1 mb-2 px-2 text-center">Found ${data.discovered.length} new devices!</div>
+                <div class="mb-1 text-end"><a href="javascript:void(0)" class="text-decoration-none me-2" onclick="toggleAllCheckboxes(true)">Select All</a> <a href="javascript:void(0)" class="text-decoration-none text-secondary" onclick="toggleAllCheckboxes(false)">None</a></div>
+                <ul class="list-group list-group-flush border rounded mb-2" style="max-height: 150px; overflow-y: auto;">`;
+                
+                data.discovered.forEach(ip => {
+                    html += `<li class="list-group-item py-1 px-2 d-flex align-items-center">
+                        <input class="form-check-input me-2 bulk-ip-check" type="checkbox" value="${ip}" checked>
+                        <span class="text-primary cursor-pointer flex-grow-1" style="cursor: pointer;" onclick="document.querySelector('input[name=\\'ip\\']').value = '${ip}'; alert('IP copied to manual form below.');" title="Click to auto-fill manual form below">${ip}</span>
+                    </li>`;
+                });
+                
+                html += `</ul><small class="text-muted mt-1 d-block lh-sm" style="font-size: 0.7rem;">Check boxes to mass-add, or click a blue IP to drop it into the manual form below.</small>`;
+                resultsDiv.innerHTML = html; bulkOptions.classList.remove('d-none');
+            })
+            .catch(err => { resultsDiv.innerHTML = `<span class="text-danger">Network Error: ${err.message}</span>`; })
+            .finally(() => { btn.disabled = false; spinner.classList.add('d-none'); });
+        }
+
+        function submitBulkAdd() {
+            const btn = document.getElementById('submitBulkBtn');
+            const checkboxes = document.querySelectorAll('.bulk-ip-check:checked');
+            if (checkboxes.length === 0) { alert("Please check at least one IP address to mass-add."); return; }
+
+            const ips = Array.from(checkboxes).map(chk => chk.value);
+            const mfg = document.getElementById('bulkMfg').value;
+            const user = document.getElementById('bulkUser').value.trim();
+            const pass = document.getElementById('bulkPass').value;
+            const switchId = document.querySelector('select[name="switch_id"]').value;
+
+            btn.disabled = true; btn.innerText = "Processing...";
+
+            fetch('/api/add_cameras_bulk', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ips: ips, manufacturer: mfg, username: user, password: pass, switch_id: switchId })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) { alert(`Successfully added ${data.added} cameras!`); location.reload(); } 
+                else { alert(`Error: ${data.error}`); btn.disabled = false; btn.innerText = "Add Checked Cameras"; }
+            })
+            .catch(err => { alert(`Network Error: ${err.message}`); btn.disabled = false; btn.innerText = "Add Checked Cameras"; });
+        }
+    </script>
+
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script>
+        const socket = io();
         
-        output.classList.remove('d-none', 'text-danger', 'text-success');
-        output.textContent = '';
-        output.classList.add('text-light');
-
-        const formData = new FormData(); 
-        formData.append('ip', ip);
-
-        fetch('/api/trace', { method: 'POST', body: formData })
-        .then(response => response.json())
-        .then(data => {
-            output.textContent = data.output;
-            if (data.success) { 
-                output.classList.replace('text-light', 'text-success'); 
-            } else { 
-                output.classList.replace('text-light', 'text-danger'); 
+        socket.on('state_change', function(data) {
+            const key = (data.type === 'switches' ? 'switch-' : 'camera-') + data.id;
+            const badge = document.getElementById('status-' + key);
+            if (badge) {
+                badge.innerText = data.status; badge.className = 'badge'; 
+                if (data.status === 'UP') badge.classList.add('bg-success');
+                else if (data.status.includes('Silenced')) badge.classList.add('bg-warning', 'text-dark');
+                else if (data.status.includes('DOWN') || data.status.includes('UNREACHABLE') || data.status.includes('ERR') || data.status.includes('Frozen')) badge.classList.add('bg-danger');
+                else badge.classList.add('bg-secondary');
             }
-        })
-        .catch(error => {
-            output.textContent = 'Network Error: ' + error;
-            output.classList.replace('text-light', 'text-danger');
-        })
-        .finally(() => {
+        });
+
+        // Listeners for the WebSocket Stream (Continuous Ping)
+        socket.on('ping_output', function(data) {
+            const output = document.getElementById('diagOutput');
+            output.textContent += data.line;
+            // Auto-scroll to the bottom as new lines come in
+            output.scrollTop = output.scrollHeight; 
+        });
+
+        socket.on('ping_stopped', function() {
             resetPingUI();
         });
-    }
-</script>
+
+        socket.on('traceroute_result', function(data) {
+            const ipInput = document.getElementById('diagIp');
+            const pBtn = document.getElementById('pingBtn');
+            const tBtn = document.getElementById('traceBtn');
+            const spinner = document.getElementById('diagSpinner');
+            const output = document.getElementById('diagOutput');
+
+            if (pBtn && tBtn) {
+                pBtn.disabled = false; tBtn.disabled = false; ipInput.disabled = false;
+                spinner.classList.add('d-none');
+
+                if (data.success) {
+                    output.textContent = data.output;
+                    output.classList.remove('text-danger'); output.classList.add('text-success');
+                } else {
+                    output.textContent = 'Traceroute Failed:\n' + data.error;
+                    output.classList.remove('text-success'); output.classList.add('text-danger');
+                }
+                output.classList.remove('d-none');
+            }
+        });
+
+        socket.on('speedtest_result', function(data) {
+            const btn = document.getElementById('speedtestBtn');
+            const spinner = document.getElementById('speedtestSpinner');
+            const display = document.getElementById('speedtestDisplay');
+            const errDiv = document.getElementById('speedtestError');
+            if (btn && spinner) {
+                btn.disabled = false; spinner.classList.add('d-none');
+                if (data.success) {
+                    document.getElementById('st-ping').innerText = data.ping;
+                    document.getElementById('st-download').innerText = data.download;
+                    document.getElementById('st-upload').innerText = data.upload;
+                    document.getElementById('st-isp').innerText = data.isp;
+                    display.classList.remove('d-none');
+                } else {
+                    errDiv.textContent = 'Test Failed: ' + data.error; errDiv.classList.remove('d-none');
+                }
+            }
+        });
+    </script>
 </body>
 </html>

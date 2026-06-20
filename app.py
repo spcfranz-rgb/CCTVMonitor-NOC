@@ -118,6 +118,9 @@ def trigger_monitor_check():
 # DATABASE INITIALIZATION
 # ==========================================
 def get_db():
+    # Defensive safeguard: Ensure the folder exists before touching SQLite
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     try: conn.execute("PRAGMA journal_mode=WAL;")
     except sqlite3.OperationalError: pass

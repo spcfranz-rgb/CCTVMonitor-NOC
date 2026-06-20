@@ -24,7 +24,7 @@ services:
     ports:
       - "5000:5000"
     environment:
-- SECRET_KEY=${SECRET_KEY}
+      - SECRET_KEY=${SECRET_KEY}
       - COMPANY_LOGO_URL=${COMPANY_LOGO_URL}
       - CUSTOMER_LOGO_URL=${CUSTOMER_LOGO_URL}
       - DEFAULT_MQTT_BROKER=mqtt-broker

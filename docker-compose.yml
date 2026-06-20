@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   cctv-dashboard:
     # This tells Docker to pull and build directly from your GitHub repo!

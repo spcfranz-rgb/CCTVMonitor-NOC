@@ -818,9 +818,13 @@ def toggle_silence(device_type, id):
 @operator_required
 def manual_ping():
     ip = request.form.get('ip')
-    if not ip: return jsonify({'success': False, 'output': 'No IP address provided.'})
+    
+    # --- SECURITY PATCH: Validate Input ---
+    if not is_valid_target(ip): 
+        return jsonify({'success': False, 'output': 'Security Error: Invalid IP address or hostname format.'})
+    
     try:
-        cmd = ['ping', '-c', '4', '-W', '2', ip]
+        cmd = ['ping', '-c', '4', '-W', '2', ip.strip()]
         process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
         if process.returncode == 0: return jsonify({'success': True, 'output': process.stdout})
         else: return jsonify({'success': False, 'output': process.stdout or process.stderr or 'Ping failed.'})
@@ -832,11 +836,14 @@ def manual_ping():
 @operator_required
 def run_traceroute():
     target = request.form.get('target')
-    if not target: return jsonify({'success': False, 'error': 'No target provided.'})
+    
+    # --- SECURITY PATCH: Validate Input ---
+    if not is_valid_target(target): 
+        return jsonify({'success': False, 'error': 'Security Error: Invalid IP address or hostname format.'})
 
     def execute_trace():
         try:
-            cmd = ['traceroute', '-w', '2', '-m', '30', '-q', '1', target]
+            cmd = ['traceroute', '-w', '2', '-m', '30', '-q', '1', target.strip()]
             process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
             
             if process.returncode == 0:

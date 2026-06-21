@@ -1,6 +1,4 @@
 # CRITICAL: Monkey patching must occur before ANY other imports to make standard libraries async-compatible
-import atexit
-import signal
 import eventlet
 eventlet.monkey_patch()
 
@@ -16,13 +14,15 @@ import json
 import hashlib
 import base64
 import re
-import shutil
+import atexit
+import signal
 from datetime import datetime
 import eventlet.greenpool
 
-import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+import requests
 import ipaddress
 import paho.mqtt.client as mqtt
 import imagehash
@@ -37,14 +37,18 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from flask_socketio import SocketIO
 from authlib.integrations.flask_client import OAuth
 from cryptography.fernet import Fernet
+from getmac import get_mac_address
 
 app = Flask(__name__)
 
 # Tell Flask it is behind a reverse proxy (NGINX)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-# Initialize WebSockets with the eventlet async worker
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+# Limit uploads to 2 Megabytes to prevent RAM exhaustion DoS attacks (CSV Bombing)
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
+
+# Initialize WebSockets with the eventlet async worker (Logs muted to hide Errno 9 disconnects)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', logger=False, engineio_logger=False)
 
 # --- GLOBAL TEMPLATE VARIABLES (CO-BRANDING) ---
 LOCAL_COMPANY_LOGO = None
@@ -56,17 +60,6 @@ def inject_globals():
         'company_logo': LOCAL_COMPANY_LOGO,
         'customer_logo': LOCAL_CUSTOMER_LOGO
     }
-@app.after_request
-def add_header(response):
-    """
-    Forces the browser to never cache the HTML/API responses.
-    Ensures NOC operators always see real-time data.
-    """
-    if 'Cache-Control' not in response.headers:
-        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
-        response.headers['Pragma'] = 'no-cache'
-        response.headers['Expires'] = '-1'
-    return response
 
 # --- SECURITY HARDENING: SESSIONS & ENCRYPTION ---
 app.secret_key = os.environ.get('SECRET_KEY')
@@ -77,8 +70,6 @@ if not app.secret_key:
 app.config['SESSION_COOKIE_HTTPONLY'] = True 
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE'] = os.environ.get('REQUIRE_HTTPS', 'False').lower() == 'true'
-# Limit uploads to 2 Megabytes to prevent RAM exhaustion DoS attacks
-app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
 
 def get_cipher():
     """Derives a secure 32-byte Fernet key from the Flask SECRET_KEY."""
@@ -92,6 +83,7 @@ def encrypt_pwd(pwd):
     return get_cipher().encrypt(pwd.encode('utf-8')).decode('utf-8')
 
 def decrypt_pwd(pwd):
+    """Decrypts database passwords into memory. Falls back to plaintext for legacy migration."""
     if not pwd: return ''
     try:
         return get_cipher().decrypt(pwd.encode('utf-8')).decode('utf-8')
@@ -211,6 +203,11 @@ def init_db():
         cursor.execute("ALTER TABLE cameras ADD COLUMN silenced_until REAL DEFAULT 0")
     except sqlite3.OperationalError: pass
 
+    try:
+        cursor.execute("ALTER TABLE switches ADD COLUMN mac_address TEXT DEFAULT ''")
+        cursor.execute("ALTER TABLE cameras ADD COLUMN mac_address TEXT DEFAULT ''")
+    except sqlite3.OperationalError: pass
+
     cursor.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT, role TEXT)")
     
     cursor.execute("SELECT count(*) FROM settings")
@@ -245,7 +242,6 @@ def sync_db_loop():
         time.sleep(300) # Wait 5 minutes
         if os.path.exists(DB_PATH_RAM):
             try:
-                # The SQLite Backup API safely locks and copies without corrupting active connections
                 source = sqlite3.connect(DB_PATH_RAM)
                 dest = sqlite3.connect(DB_PATH_DISK)
                 with dest:
@@ -256,6 +252,7 @@ def sync_db_loop():
                 print(f"Failed to sync database to disk: {e}")
 
 def graceful_shutdown(*args):
+    """Fires when Docker stops the container to save the RAM disk to the SD Card."""
     print("Container shutting down. Forcing final database sync to disk...")
     if os.path.exists(DB_PATH_RAM):
         try:
@@ -267,9 +264,9 @@ def graceful_shutdown(*args):
             print("Final sync complete. Safe to exit.")
         except Exception as e: print(f"Emergency Sync Failed: {e}")
 
-# Register the hook for both standard exits and Docker SIGTERM signals
 atexit.register(graceful_shutdown)
 signal.signal(signal.SIGTERM, graceful_shutdown)
+signal.signal(signal.SIGINT, graceful_shutdown)
 
 def log_prune_loop():
     """Background thread to safely prune old logs once a day."""
@@ -296,26 +293,14 @@ SNAPSHOT_SEMAPHORE = eventlet.semaphore.Semaphore(2)
 
 def is_valid_target(target):
     """Sanitizes user input to prevent Argument Injection and DoS."""
-    if not target:
-        return False
-        
+    if not target: return False
     target = str(target).strip()
-    
-    # 1. Block Argument Injection (prevent passing flags like '-n' or '-c')
-    if target.startswith('-'):
-        return False
-        
-    # 2. Check if it is a mathematically valid IPv4 or IPv6 address
+    if target.startswith('-'): return False
     try:
         ipaddress.ip_address(target)
         return True
-    except ValueError:
-        pass
-        
-    # 3. Check if it is a valid Local or Public Hostname
-    if re.match(r'^[A-Za-z0-9_.-]+$', target):
-        return True
-        
+    except ValueError: pass
+    if re.match(r'^[A-Za-z0-9_.-]+$', target): return True
     return False
 
 def is_pingable(target):
@@ -366,12 +351,25 @@ def threaded_camera_check(cam):
     cam_up = is_pingable(cam['ip']) or is_port_open(cam['ip'], 554) or is_port_open(cam['ip'], 80)
     stream_ok = False
     snap_bytes = None
+    mac = cam.get('mac_address', '')
+    
     if cam_up:
+        # ARP Sweep for MAC Address (Requires Docker Host Network Mode)
+        if not mac:
+            fetched_mac = get_mac_address(ip=cam['ip'])
+            if fetched_mac:
+                mac = fetched_mac.upper()
+                conn = get_db()
+                conn.execute("UPDATE cameras SET mac_address = ? WHERE id = ?", (mac, cam['id']))
+                conn.commit()
+                conn.close()
+
         stream_ok = is_stream_active(cam['stream_url'])
         if stream_ok:
             # SECURE THE CPU: Threads must acquire this lock before decoding video
             with SNAPSHOT_SEMAPHORE:
                 snap_bytes = get_snapshot_bytes(cam['ip'], cam['manufacturer'], cam['username'], cam['password'], cam['stream_url'])
+                
     return cam['id'], cam_up, stream_ok, snap_bytes
 
 def monitor_loop():
@@ -413,12 +411,13 @@ def monitor_loop():
             dynamic_settings = {row['key']: row['value'] for row in cursor.fetchall()}
             interval = int(dynamic_settings.get('check_interval', 60))
             
-            # PROCESS SWITCHES & CAMERAS
+            # PROCESS SWITCHES
             cursor.execute("SELECT * FROM switches")
             switches = cursor.fetchall()
             
             for switch in switches:
-                switch_id, switch_name, switch_ip, s_until = switch['id'], switch['name'], switch['ip'], switch['silenced_until']
+                switch_id, switch_name, switch_ip = switch['id'], switch['name'], switch['ip']
+                s_until, mac = switch['silenced_until'], switch.get('mac_address', '')
                 silenced = s_until > now
                 is_up = is_pingable(switch_ip) or is_port_open(switch_ip, 80) or is_port_open(switch_ip, 443)
                 
@@ -426,13 +425,17 @@ def monitor_loop():
                 client.publish(f"{prefix}/{switch_name}/ping", switch_payload, retain=True)
                 
                 if is_up:
+                    if not mac:
+                        fetched_mac = get_mac_address(ip=switch_ip)
+                        if fetched_mac:
+                            conn.execute("UPDATE switches SET mac_address = ? WHERE id = ?", (fetched_mac.upper(), switch_id))
+                            
                     new_s_stat = 'UP' if not silenced else 'UP (Silenced)'
                     set_status('switches', switch_id, switch_name, 'Switch', switch['status'], new_s_stat)
                     
                     cursor.execute("SELECT * FROM cameras WHERE switch_id = ?", (switch_id,))
                     cameras = cursor.fetchall()
                     
-                    # Decrypt passwords before passing to background threads
                     camera_list = []
                     for c in cameras:
                         cd = dict(c)
@@ -495,7 +498,6 @@ def monitor_loop():
             cursor.execute("SELECT * FROM cameras WHERE switch_id IS NULL OR switch_id = ''")
             standalone_cameras = cursor.fetchall()
             
-            # Decrypt standalone passwords
             standalone_list = []
             for c in standalone_cameras:
                 cd = dict(c)
@@ -1198,7 +1200,24 @@ def proxy_request(device_type, device_id, req_path, method, headers, data, cooki
             
     except requests.exceptions.RequestException as e:
         return f"Tunnel Error connecting to {device['ip']}: {str(e)}", 502
-        
+
+@app.route('/tunnel/<device_type>/<int:device_id>/', defaults={'req_path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE'])
+@app.route('/tunnel/<device_type>/<int:device_id>/<path:req_path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
+@login_required
+def tunnel(device_type, device_id, req_path):
+    return proxy_request(device_type, device_id, req_path, request.method, request.headers, request.get_data(), request.cookies)
+
+@app.errorhandler(404)
+def proxy_absolute_paths(e):
+    if not current_user.is_authenticated: return "404 - Not Found", 404
+    referer = request.headers.get('Referer')
+    if referer:
+        parsed_referer = urlparse(referer)
+        parts = parsed_referer.path.split('/')
+        if len(parts) >= 4 and parts[1] == 'tunnel':
+            return proxy_request(parts[2], parts[3], request.path, request.method, request.headers, request.get_data(), request.cookies)
+    return "404 - Not Found", 404
+
 # ==========================================
 # APPLICATION STARTUP & INITIALIZATION
 # ==========================================

@@ -1098,39 +1098,48 @@ def proxy_request(device_type, device_id, req_path, method, headers, data, cooki
     query_string = request.query_string.decode('utf-8')
     full_req_path = f"{req_path}?{query_string}" if query_string else req_path
     target_url = f"http://{resolved_ip}/{full_req_path.lstrip('/')}"
+    
+    # Strip headers that break proxying
     clean_headers = {k: v for k, v in headers if k.lower() not in ['host', 'origin', 'referer', 'accept-encoding']}
     clean_headers['Host'] = device['ip']
     
     try:
         resp = requests.request(method=method, url=target_url, headers=clean_headers, data=data, cookies=cookies, allow_redirects=False, stream=True, timeout=15)
+        
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
         resp_headers = [(name, value) for (name, value) in resp.raw.headers.items() if name.lower() not in excluded_headers]
+        
+        # 1. UPGRADE: Bulletproof HTTP 301/302 Redirect Interception
         for i, (name, value) in enumerate(resp_headers):
             if name.lower() == 'location':
-                if value.startswith(f"http://{device['ip']}"): value = value.replace(f"http://{device['ip']}", f"/tunnel/{device_type}/{device_id}")
-                elif value.startswith(f"http://{resolved_ip}"): value = value.replace(f"http://{resolved_ip}", f"/tunnel/{device_type}/{device_id}")
-                elif value.startswith('/'): value = f"/tunnel/{device_type}/{device_id}{value}"
-                resp_headers[i] = (name, value)
-        return Response(resp.iter_content(chunk_size=10*1024), resp.status_code, resp_headers)
+                parsed = urlparse(value)
+                if parsed.hostname in [device['ip'], resolved_ip]:
+                    new_loc = f"/tunnel/{device_type}/{device_id}{parsed.path}"
+                    if parsed.query: new_loc += f"?{parsed.query}"
+                    resp_headers[i] = (name, new_loc)
+                elif not parsed.hostname and value.startswith('/'):
+                    resp_headers[i] = (name, f"/tunnel/{device_type}/{device_id}{value}")
+
+        # 2. UPGRADE: The "Sub-Filter" HTML Payload Interception
+        content_type = resp.headers.get('Content-Type', '').lower()
+        if 'text/html' in content_type or 'javascript' in content_type:
+            # Decode the text payload
+            payload = resp.content.decode('utf-8', errors='ignore')
+            
+            # Scrub hardcoded IPs from the HTML so the browser doesn't break out of the tunnel
+            payload = payload.replace(f"http://{device['ip']}:80", f"/tunnel/{device_type}/{device_id}")
+            payload = payload.replace(f"https://{device['ip']}:443", f"/tunnel/{device_type}/{device_id}")
+            payload = payload.replace(f"http://{device['ip']}", f"/tunnel/{device_type}/{device_id}")
+            payload = payload.replace(f"https://{device['ip']}", f"/tunnel/{device_type}/{device_id}")
+            payload = payload.replace(f"//{device['ip']}", f"/tunnel/{device_type}/{device_id}")
+            
+            return Response(payload, resp.status_code, resp_headers)
+        else:
+            # Stream binary data (Video, Images, Firmware) untouched for max performance
+            return Response(resp.iter_content(chunk_size=10*1024), resp.status_code, resp_headers)
+            
     except requests.exceptions.RequestException as e:
         return f"Tunnel Error connecting to {device['ip']}: {str(e)}", 502
-
-@app.route('/tunnel/<device_type>/<int:device_id>/', defaults={'req_path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE'])
-@app.route('/tunnel/<device_type>/<int:device_id>/<path:req_path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-@login_required
-def tunnel(device_type, device_id, req_path):
-    return proxy_request(device_type, device_id, req_path, request.method, request.headers, request.get_data(), request.cookies)
-
-@app.errorhandler(404)
-def proxy_absolute_paths(e):
-    if not current_user.is_authenticated: return "404 - Not Found", 404
-    referer = request.headers.get('Referer')
-    if referer:
-        parsed_referer = urlparse(referer)
-        parts = parsed_referer.path.split('/')
-        if len(parts) >= 4 and parts[1] == 'tunnel':
-            return proxy_request(parts[2], parts[3], request.path, request.method, request.headers, request.get_data(), request.cookies)
-    return "404 - Not Found", 404
 
 # ==========================================
 # APPLICATION STARTUP & INITIALIZATION

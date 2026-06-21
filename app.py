@@ -56,6 +56,17 @@ def inject_globals():
         'company_logo': LOCAL_COMPANY_LOGO,
         'customer_logo': LOCAL_CUSTOMER_LOGO
     }
+@app.after_request
+def add_header(response):
+    """
+    Forces the browser to never cache the HTML/API responses.
+    Ensures NOC operators always see real-time data.
+    """
+    if 'Cache-Control' not in response.headers:
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '-1'
+    return response
 
 # --- SECURITY HARDENING: SESSIONS & ENCRYPTION ---
 app.secret_key = os.environ.get('SECRET_KEY')

@@ -127,7 +127,9 @@
             {% endif %}
 
             {% if current_user.role in ['admin', 'operator'] %}
-            <div class="card-body">
+            <div class="card mb-4">
+                <div class="card-header"><h5 class="mb-0">Manual Diagnostic Tool</h5></div>
+                <div class="card-body">
                         <div class="input-group mb-3">
                             <input type="text" id="diagIp" class="form-control form-control-sm" placeholder="IP or Hostname (e.g. 192.168.1.5)">
                             <button class="btn btn-outline-info btn-sm" type="button" id="pingBtn" onclick="runPing()">Ping</button>
@@ -140,6 +142,7 @@
                         </div>
                         
                         <pre id="diagOutput" class="bg-black text-light p-2 rounded small d-none" style="max-height: 250px; overflow-y: auto; font-size: 0.75rem; white-space: pre-wrap;"></pre>
+                </div>
             </div>
             {% endif %}
 
@@ -417,7 +420,7 @@
             modalInstance.show();
         }
 
-        // Diagnostic Ping Script
+        // Diagnostic Ping Script (Fetch Standard)
         function runPing() {
             const ipInput = document.getElementById('diagIp');
             const pBtn = document.getElementById('pingBtn');
@@ -429,12 +432,10 @@
 
             if (!ip) { alert('Please enter an IP address or Hostname.'); return; }
 
-            // Reset UI State
             output.classList.remove('d-none', 'text-danger', 'text-success');
             output.textContent = '';
             output.classList.add('text-light');
 
-            // Lock UI and show spinner
             pBtn.disabled = true; 
             tBtn.disabled = true; 
             ipInput.disabled = true;
@@ -460,7 +461,6 @@
             });
         }
 
-        // Reset UI when ping/trace stops or finishes
         function resetPingUI() {
             document.getElementById('pingBtn').disabled = false;
             document.getElementById('traceBtn').disabled = false;

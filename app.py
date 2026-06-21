@@ -237,6 +237,31 @@ def sync_db_loop():
 # ==========================================
 # BACKGROUND MONITORING & NETWORK TASKS
 # ==========================================
+def is_valid_target(target):
+    """Sanitizes user input to prevent Argument Injection and DoS."""
+    if not target:
+        return False
+        
+    target = str(target).strip()
+    
+    # 1. Block Argument Injection (prevent passing flags like '-n' or '-c')
+    if target.startswith('-'):
+        return False
+        
+    # 2. Check if it is a mathematically valid IPv4 or IPv6 address
+    try:
+        ipaddress.ip_address(target)
+        return True
+    except ValueError:
+        pass
+        
+    # 3. Check if it is a valid Local or Public Hostname
+    # Strictly allows only Alphanumeric characters, periods, hyphens, and underscores.
+    # Instantly rejects spaces, semicolons, ampersands, and shell characters.
+    if re.match(r'^[A-Za-z0-9_.-]+$', target):
+        return True
+        
+    return False
 def is_pingable(target):
     response = subprocess.call(['ping', '-c', '1', '-W', '2', target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return response == 0

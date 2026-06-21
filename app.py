@@ -19,6 +19,8 @@ from datetime import datetime
 import eventlet.greenpool
 
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import ipaddress
 import paho.mqtt.client as mqtt
 import imagehash
@@ -1097,19 +1099,31 @@ def proxy_request(device_type, device_id, req_path, method, headers, data, cooki
 
     query_string = request.query_string.decode('utf-8')
     full_req_path = f"{req_path}?{query_string}" if query_string else req_path
-    target_url = f"http://{resolved_ip}/{full_req_path.lstrip('/')}"
     
     # Strip headers that break proxying
     clean_headers = {k: v for k, v in headers if k.lower() not in ['host', 'origin', 'referer', 'accept-encoding']}
     clean_headers['Host'] = device['ip']
     
+    # Default to standard HTTP
+    target_url = f"http://{resolved_ip}/{full_req_path.lstrip('/')}"
+    
     try:
-        resp = requests.request(method=method, url=target_url, headers=clean_headers, data=data, cookies=cookies, allow_redirects=False, stream=True, timeout=15)
+        # 1. Attempt standard HTTP request
+        # verify=False prevents crashes from self-signed device certificates
+        resp = requests.request(method=method, url=target_url, headers=clean_headers, data=data, cookies=cookies, allow_redirects=False, stream=True, timeout=10, verify=False)
+        
+        # 2. Transparent HTTPS Upgrade (Anti-Infinite-Loop)
+        if resp.status_code in [301, 302, 307, 308]:
+            loc = resp.headers.get('Location', '')
+            # If the router demands an HTTPS connection, the proxy natively upgrades without telling the browser
+            if loc.startswith(f"https://{device['ip']}") or loc.startswith(f"https://{resolved_ip}"):
+                target_url = f"https://{resolved_ip}/{full_req_path.lstrip('/')}"
+                resp = requests.request(method=method, url=target_url, headers=clean_headers, data=data, cookies=cookies, allow_redirects=False, stream=True, timeout=10, verify=False)
         
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
         resp_headers = [(name, value) for (name, value) in resp.raw.headers.items() if name.lower() not in excluded_headers]
         
-        # 1. UPGRADE: Bulletproof HTTP 301/302 Redirect Interception
+        # 3. HTTP Header Rewrite
         for i, (name, value) in enumerate(resp_headers):
             if name.lower() == 'location':
                 parsed = urlparse(value)
@@ -1120,27 +1134,26 @@ def proxy_request(device_type, device_id, req_path, method, headers, data, cooki
                 elif not parsed.hostname and value.startswith('/'):
                     resp_headers[i] = (name, f"/tunnel/{device_type}/{device_id}{value}")
 
-        # 2. UPGRADE: The "Sub-Filter" HTML Payload Interception
+        # 4. Aggressive Deep-Payload IP Scrubbing (Anti-Leak)
         content_type = resp.headers.get('Content-Type', '').lower()
-        if 'text/html' in content_type or 'javascript' in content_type:
-            # Decode the text payload
+        if 'text/html' in content_type or 'javascript' in content_type or 'json' in content_type:
             payload = resp.content.decode('utf-8', errors='ignore')
             
-            # Scrub hardcoded IPs from the HTML so the browser doesn't break out of the tunnel
-            payload = payload.replace(f"http://{device['ip']}:80", f"/tunnel/{device_type}/{device_id}")
-            payload = payload.replace(f"https://{device['ip']}:443", f"/tunnel/{device_type}/{device_id}")
-            payload = payload.replace(f"http://{device['ip']}", f"/tunnel/{device_type}/{device_id}")
-            payload = payload.replace(f"https://{device['ip']}", f"/tunnel/{device_type}/{device_id}")
-            payload = payload.replace(f"//{device['ip']}", f"/tunnel/{device_type}/{device_id}")
+            # Scrub absolute protocol wrappers (http:// and https://)
+            payload = re.sub(rf"https?://{re.escape(device['ip'])}(:\d+)?", f"http://{request.host}/tunnel/{device_type}/{device_id}", payload)
+            payload = re.sub(rf"https?:\\/\\/{re.escape(device['ip'])}(:\d+)?", f"http:\\/\\/{request.host}/tunnel/{device_type}/{device_id}", payload)
+            
+            # Replace naked IPs dynamically built in JS variables 
+            # (Uses regex word boundaries \b to prevent 192.168.1.1 from breaking 192.168.1.100)
+            payload = re.sub(rf"\b{re.escape(device['ip'])}\b", f"{request.host}/tunnel/{device_type}/{device_id}", payload)
             
             return Response(payload, resp.status_code, resp_headers)
         else:
-            # Stream binary data (Video, Images, Firmware) untouched for max performance
+            # Stream binary data (Video, Images, Firmware files) untouched for max performance
             return Response(resp.iter_content(chunk_size=10*1024), resp.status_code, resp_headers)
             
     except requests.exceptions.RequestException as e:
         return f"Tunnel Error connecting to {device['ip']}: {str(e)}", 502
-
 # ==========================================
 # APPLICATION STARTUP & INITIALIZATION
 # ==========================================

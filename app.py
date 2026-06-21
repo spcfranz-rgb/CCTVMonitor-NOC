@@ -1,4 +1,6 @@
 # CRITICAL: Monkey patching must occur before ANY other imports to make standard libraries async-compatible
+import atexit
+import signal
 import eventlet
 eventlet.monkey_patch()
 
@@ -64,6 +66,8 @@ if not app.secret_key:
 app.config['SESSION_COOKIE_HTTPONLY'] = True 
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE'] = os.environ.get('REQUIRE_HTTPS', 'False').lower() == 'true'
+# Limit uploads to 2 Megabytes to prevent RAM exhaustion DoS attacks
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
 
 def get_cipher():
     """Derives a secure 32-byte Fernet key from the Flask SECRET_KEY."""
@@ -77,12 +81,15 @@ def encrypt_pwd(pwd):
     return get_cipher().encrypt(pwd.encode('utf-8')).decode('utf-8')
 
 def decrypt_pwd(pwd):
-    """Decrypts database passwords into memory. Falls back to plaintext for legacy migration."""
     if not pwd: return ''
     try:
         return get_cipher().decrypt(pwd.encode('utf-8')).decode('utf-8')
     except Exception:
-        # Fallback mechanism: If decryption fails, assume it's a legacy plaintext password
+        # If it looks like a Fernet token but failed, the SECRET_KEY is wrong/lost.
+        if pwd.startswith('gAAAAA'):
+            print("ERROR: Database decryption failed! Secret Key mismatch.")
+            return '' 
+        # Otherwise, safely assume it is a legacy plaintext password
         return pwd
 
 # --- AUTHENTIK OIDC SETUP ---
@@ -147,13 +154,21 @@ def trigger_monitor_check():
 # DATABASE INITIALIZATION & RAM SYNC
 # ==========================================
 def init_ram_db():
-    """Loads the physical database into RAM on container boot."""
+    """Safely loads the physical database into RAM on container boot using SQLite API."""
     os.makedirs(os.path.dirname(DB_PATH_RAM), exist_ok=True)
     os.makedirs(os.path.dirname(DB_PATH_DISK), exist_ok=True)
     
     if os.path.exists(DB_PATH_DISK) and not os.path.exists(DB_PATH_RAM):
         print("Restoring database from physical disk to RAM...")
-        shutil.copy2(DB_PATH_DISK, DB_PATH_RAM)
+        try:
+            disk_conn = sqlite3.connect(DB_PATH_DISK)
+            ram_conn = sqlite3.connect(DB_PATH_RAM)
+            with ram_conn:
+                disk_conn.backup(ram_conn)
+            disk_conn.close()
+            ram_conn.close()
+        except Exception as e:
+            print(f"Boot restoration failed: {e}")
 
 def get_db():
     """All active connections point exclusively to the RAM disk."""
@@ -228,6 +243,22 @@ def sync_db_loop():
                 source.close()
             except Exception as e:
                 print(f"Failed to sync database to disk: {e}")
+
+def graceful_shutdown(*args):
+    print("Container shutting down. Forcing final database sync to disk...")
+    if os.path.exists(DB_PATH_RAM):
+        try:
+            source = sqlite3.connect(DB_PATH_RAM)
+            dest = sqlite3.connect(DB_PATH_DISK)
+            with dest: source.backup(dest)
+            dest.close()
+            source.close()
+            print("Final sync complete. Safe to exit.")
+        except Exception as e: print(f"Emergency Sync Failed: {e}")
+
+# Register the hook for both standard exits and Docker SIGTERM signals
+atexit.register(graceful_shutdown)
+signal.signal(signal.SIGTERM, graceful_shutdown)
 
 def log_prune_loop():
     """Background thread to safely prune old logs once a day."""

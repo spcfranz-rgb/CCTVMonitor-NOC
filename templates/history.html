@@ -2,66 +2,52 @@
 <html lang="en" data-bs-theme="dark">
 <head>
     <meta charset="UTF-8">
-    <title>Event Logs - CCTV Monitor</title>
+    <title>Event History - CCTV Monitor</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
 </head>
 <body class="container py-4">
-
+    
     <div class="d-flex justify-content-between align-items-center mb-4 border-bottom pb-3">
-        <div class="d-flex align-items-center">
-            {% if company_logo %}
-                <img src="{{ company_logo }}" alt="Company Logo" style="height: 30px; width: auto; object-fit: contain;" class="me-3 border-end border-secondary pe-3">
-            {% endif %}
-            {% if customer_logo %}
-                <img src="{{ customer_logo }}" alt="Customer Logo" style="height: 40px; width: auto; object-fit: contain;" class="me-3">
-            {% endif %}
-            <h1 class="mb-0 h3">System Event Logs</h1>
-        </div>
-        <div class="d-flex align-items-center">
-            <a href="/export_logs" class="btn btn-outline-success btn-sm me-3">Export to CSV</a>
-            <a href="/" class="btn btn-outline-info btn-sm me-3">Back to Dashboard</a>
-            <span class="me-3">Logged in as: <strong>{{ current_user.username }}</strong></span>
-            <a href="/logout" class="btn btn-outline-light btn-sm">Logout</a>
+        <h2 class="mb-0">Event History <span class="text-muted fs-5">(Last 500)</span></h2>
+        <div>
+            <a href="/export_logs" class="btn btn-success btn-sm me-2">Export to CSV</a>
+            <a href="/" class="btn btn-outline-secondary btn-sm">Back to Dashboard</a>
         </div>
     </div>
 
-    <div class="card shadow-sm">
-        <div class="card-header bg-dark text-white d-flex justify-content-between align-items-center">
-            <h5 class="mb-0">Recent State Changes</h5>
-            <small class="text-muted">Auto-prunes logs older than 7 days</small>
-        </div>
+    <div class="card bg-dark border-secondary shadow-sm">
         <div class="card-body p-0">
-            <div class="table-responsive" style="max-height: 70vh; overflow-y: auto;">
-                <table class="table table-hover table-striped mb-0 align-middle">
-                    <thead class="table-dark position-sticky top-0 shadow-sm">
+            <div class="table-responsive" style="max-height: 70vh;">
+                <table class="table table-dark table-hover table-sm align-middle mb-0">
+                    <thead class="table-active" style="position: sticky; top: 0; z-index: 1;">
                         <tr>
-                            <th scope="col" class="ps-4">Timestamp (Local)</th>
-                            <th scope="col">Device Type</th>
-                            <th scope="col">Device Name</th>
-                            <th scope="col">New Status</th>
+                            <th class="ps-3 py-2">Timestamp (Local)</th>
+                            <th>Type</th>
+                            <th>Device Name</th>
+                            <th>Status Change</th>
                         </tr>
                     </thead>
                     <tbody>
                         {% for log in logs %}
                         <tr>
-                            <td class="ps-4 text-muted log-time" data-ts="{{ log.timestamp }}"></td>
-                            <td>
-                                {% if log.device_type == 'Switch' %}
-                                    <span class="badge bg-secondary">Switch</span>
-                                {% else %}
-                                    <span class="badge bg-dark border">Camera</span>
-                                {% endif %}
-                            </td>
+                            <td class="ps-3 text-muted"><script>document.write(new Date({{ log.timestamp }} * 1000).toLocaleString());</script></td>
+                            <td><span class="badge bg-secondary">{{ log.device_type }}</span></td>
                             <td class="fw-bold">{{ log.device_name }}</td>
                             <td>
-                                <span class="badge {% if log.status == 'UP' %}bg-success{% elif 'Silenced' in log.status %}bg-warning text-dark{% elif 'DOWN' in log.status or 'UNREACHABLE' in log.status or 'Frozen' in log.status or 'ERR' in log.status %}bg-danger{% else %}bg-secondary{% endif %}">
-                                    {{ log.status }}
-                                </span>
+                                {% if 'UP' in log.status %}
+                                    <span class="text-success">{{ log.status }}</span>
+                                {% elif 'DOWN' in log.status or 'UNREACHABLE' in log.status or 'ERR' in log.status %}
+                                    <span class="text-danger">{{ log.status }}</span>
+                                {% elif 'Silenced' in log.status or 'MAINTENANCE' in log.status %}
+                                    <span class="text-warning">{{ log.status }}</span>
+                                {% else %}
+                                    <span class="text-info">{{ log.status }}</span>
+                                {% endif %}
                             </td>
                         </tr>
                         {% else %}
                         <tr>
-                            <td colspan="4" class="text-center py-4 text-muted">No state changes logged yet.</td>
+                            <td colspan="4" class="text-center py-4 text-muted">No status changes recorded yet.</td>
                         </tr>
                         {% endfor %}
                     </tbody>
@@ -70,53 +56,5 @@
         </div>
     </div>
 
-    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
-    <script>
-        // Initial format on first page load
-        document.querySelectorAll('.log-time').forEach(el => {
-            const ts = parseFloat(el.getAttribute('data-ts')) * 1000;
-            const date = new Date(ts);
-            el.innerText = date.toLocaleString(undefined, {
-                year: 'numeric', month: 'numeric', day: 'numeric',
-                hour: '2-digit', minute: '2-digit', second: '2-digit'
-            });
-        });
-
-        // Listen for new events and append them to the top of the table natively
-        const socket = io();
-        socket.on('state_change', function(data) {
-            const emptyMsg = document.querySelector('td.text-center');
-            if (emptyMsg) emptyMsg.parentElement.remove();
-
-            const tbody = document.querySelector('tbody');
-            const date = new Date(data.timestamp * 1000).toLocaleString(undefined, {
-                year: 'numeric', month: 'numeric', day: 'numeric',
-                hour: '2-digit', minute: '2-digit', second: '2-digit'
-            });
-
-            let devBadge = data.device_type === 'Switch' 
-                ? '<span class="badge bg-secondary">Switch</span>' 
-                : '<span class="badge bg-dark border">Camera</span>';
-                
-            let statBadge = 'bg-secondary';
-            if (data.status === 'UP') statBadge = 'bg-success';
-            else if (data.status.includes('Silenced')) statBadge = 'bg-warning text-dark';
-            else if (data.status.includes('DOWN') || data.status.includes('UNREACHABLE') || data.status.includes('Frozen') || data.status.includes('ERR')) statBadge = 'bg-danger';
-
-            const row = document.createElement('tr');
-            row.innerHTML = `
-                <td class="ps-4 text-muted">${date}</td>
-                <td>${devBadge}</td>
-                <td class="fw-bold">${data.name}</td>
-                <td><span class="badge ${statBadge}">${data.status}</span></td>
-            `;
-            
-            tbody.insertBefore(row, tbody.firstChild);
-
-            if (tbody.children.length > 500) {
-                tbody.removeChild(tbody.lastChild);
-            }
-        });
-    </script>
 </body>
 </html>

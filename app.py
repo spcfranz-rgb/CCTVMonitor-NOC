@@ -11,7 +11,6 @@ import threading
 import io
 import csv
 import json
-import secrets
 from datetime import datetime
 import eventlet.greenpool
 
@@ -118,9 +117,7 @@ def trigger_monitor_check():
 # DATABASE INITIALIZATION
 # ==========================================
 def get_db():
-    # Defensive safeguard: Ensure the folder exists before touching SQLite
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     try: conn.execute("PRAGMA journal_mode=WAL;")
     except sqlite3.OperationalError: pass
@@ -236,7 +233,6 @@ def monitor_loop():
     print("Starting concurrent background monitoring thread...")
     previous_hashes = {} 
     
-    # Establish a persistent MQTT connection ONCE
     conn = get_db()
     settings_dict = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
     conn.close()
@@ -268,7 +264,6 @@ def monitor_loop():
                         'status': new_status, 'device_type': dev_type, 'timestamp': now
                     })
             
-            # Re-fetch settings in case they were updated via UI
             cursor.execute("SELECT key, value FROM settings")
             dynamic_settings = {row['key']: row['value'] for row in cursor.fetchall()}
             interval = int(dynamic_settings.get('check_interval', 60))
@@ -415,7 +410,6 @@ def monitor_loop():
 # ==========================================
 @app.route('/local_logo/<filename>')
 def serve_local_logo(filename):
-    """Safely serves persistent logos so they survive container rebuilds."""
     return send_from_directory('/app/data/logos', filename)
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -1020,7 +1014,6 @@ def proxy_absolute_paths(e):
 def init_logos():
     global LOCAL_COMPANY_LOGO, LOCAL_CUSTOMER_LOGO
     
-    # Save to the persistent volume, NOT the ephemeral container filesystem
     logo_dir = '/app/data/logos'
     os.makedirs(logo_dir, exist_ok=True)
     
@@ -1033,24 +1026,20 @@ def init_logos():
         
         if val.startswith('http://') or val.startswith('https://'):
             try:
-                # 1. Attempt to grab the freshest version of the logo
                 resp = requests.get(val, timeout=5)
                 if resp.status_code == 200:
                     with open(filepath, 'wb') as f:
                         f.write(resp.content)
-                    # Success: Serve new file with a fresh timestamp to break browser caching
                     return f"{serve_path}?t={int(time.time())}"
             except Exception as e:
                 print(f"Notice: Could not fetch fresh {env_var}. Attempting offline fallback. ({e})")
             
-            # 2. Offline Fallback: If WAN is down but we have a previously saved logo, use it!
             if os.path.exists(filepath):
                 return f"{serve_path}?t={int(os.path.getmtime(filepath))}"
             
-            # 3. Total Failure: No WAN, and no cached file. Fallback to raw URL.
             return val
             
-        return val # Fallback for local paths or base64 strings
+        return val
 
     LOCAL_COMPANY_LOGO = process_logo('COMPANY_LOGO_URL', 'company_logo.png')
     LOCAL_CUSTOMER_LOGO = process_logo('CUSTOMER_LOGO_URL', 'customer_logo.png')
@@ -1059,7 +1048,6 @@ def init_logos():
 # ==========================================
 # GUNICORN / FLASK BOOTLOADER
 # ==========================================
-# This MUST be outside the __main__ block so Gunicorn runs it on boot!
 try:
     init_db()
     init_logos()

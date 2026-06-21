@@ -11,6 +11,8 @@ import threading
 import io
 import csv
 import json
+import hashlib
+import base64
 from datetime import datetime
 import eventlet.greenpool
 
@@ -28,6 +30,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from flask_socketio import SocketIO
 from authlib.integrations.flask_client import OAuth
+from cryptography.fernet import Fernet
 
 app = Flask(__name__)
 
@@ -48,7 +51,7 @@ def inject_globals():
         'customer_logo': LOCAL_CUSTOMER_LOGO
     }
 
-# --- SECURITY HARDENING: SESSIONS ---
+# --- SECURITY HARDENING: SESSIONS & ENCRYPTION ---
 app.secret_key = os.environ.get('SECRET_KEY')
 if not app.secret_key:
     print("WARNING: SECRET_KEY environment variable is missing. Using insecure development key.")
@@ -57,6 +60,26 @@ if not app.secret_key:
 app.config['SESSION_COOKIE_HTTPONLY'] = True 
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE'] = os.environ.get('REQUIRE_HTTPS', 'False').lower() == 'true'
+
+def get_cipher():
+    """Derives a secure 32-byte Fernet key from the Flask SECRET_KEY."""
+    key_bytes = app.secret_key.encode('utf-8')
+    fernet_key = base64.urlsafe_b64encode(hashlib.sha256(key_bytes).digest())
+    return Fernet(fernet_key)
+
+def encrypt_pwd(pwd):
+    """Encrypts plaintext passwords for database storage."""
+    if not pwd: return ''
+    return get_cipher().encrypt(pwd.encode('utf-8')).decode('utf-8')
+
+def decrypt_pwd(pwd):
+    """Decrypts database passwords into memory. Falls back to plaintext for legacy migration."""
+    if not pwd: return ''
+    try:
+        return get_cipher().decrypt(pwd.encode('utf-8')).decode('utf-8')
+    except Exception:
+        # Fallback mechanism: If decryption fails, assume it's a legacy plaintext password
+        return pwd
 
 # --- AUTHENTIK OIDC SETUP ---
 oauth = OAuth(app)
@@ -77,6 +100,8 @@ if AUTHENTIK_URL:
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = 'login'
+
+# --- DATABASE PATHS ---
 DB_PATH_DISK = '/app/data/cctv.db'        # Persistent SD Card Storage
 DB_PATH_RAM = '/app/data_ram/cctv.db'     # High-Speed RAM Storage
 FORCE_CHECK_FLAG = '/app/data_ram/force_check.flag'
@@ -114,9 +139,6 @@ def trigger_monitor_check():
     try: open(FORCE_CHECK_FLAG, 'w').close()
     except Exception: pass
 
-# ==========================================
-# DATABASE INITIALIZATION
-# ==========================================
 # ==========================================
 # DATABASE INITIALIZATION & RAM SYNC
 # ==========================================
@@ -202,7 +224,6 @@ def sync_db_loop():
                     source.backup(dest)
                 dest.close()
                 source.close()
-                print("Successfully synced RAM database to persistent physical storage.")
             except Exception as e:
                 print(f"Failed to sync database to disk: {e}")
 
@@ -320,10 +341,17 @@ def monitor_loop():
                     
                     cursor.execute("SELECT * FROM cameras WHERE switch_id = ?", (switch_id,))
                     cameras = cursor.fetchall()
-                    camera_results = {}
                     
+                    # Decrypt passwords before passing to background threads
+                    camera_list = []
+                    for c in cameras:
+                        cd = dict(c)
+                        cd['password'] = decrypt_pwd(cd['password'])
+                        camera_list.append(cd)
+                        
+                    camera_results = {}
                     pool = eventlet.greenpool.GreenPool(size=20)
-                    for c_id, cam_up, stream_ok, snap_bytes in pool.imap(threaded_camera_check, [dict(c) for c in cameras]):
+                    for c_id, cam_up, stream_ok, snap_bytes in pool.imap(threaded_camera_check, camera_list):
                         camera_results[c_id] = (cam_up, stream_ok, snap_bytes)
                     
                     for cam in cameras:
@@ -376,10 +404,17 @@ def monitor_loop():
             # PROCESS STANDALONE CAMERAS
             cursor.execute("SELECT * FROM cameras WHERE switch_id IS NULL OR switch_id = ''")
             standalone_cameras = cursor.fetchall()
-            standalone_results = {}
             
+            # Decrypt standalone passwords
+            standalone_list = []
+            for c in standalone_cameras:
+                cd = dict(c)
+                cd['password'] = decrypt_pwd(cd['password'])
+                standalone_list.append(cd)
+                
+            standalone_results = {}
             standalone_pool = eventlet.greenpool.GreenPool(size=20)
-            for c_id, cam_up, stream_ok, snap_bytes in standalone_pool.imap(threaded_camera_check, [dict(c) for c in standalone_cameras]):
+            for c_id, cam_up, stream_ok, snap_bytes in standalone_pool.imap(threaded_camera_check, standalone_list):
                 standalone_results[c_id] = (cam_up, stream_ok, snap_bytes)
                     
             for cam in standalone_cameras:
@@ -572,7 +607,7 @@ def export_config():
     
     for c in cameras:
         parent = c['switch_name'] if c['switch_name'] else 'None'
-        cw.writerow(['Camera', parent, c['name'], c['ip'], c['stream_url'], c['manufacturer'], c['username'], c['password']])
+        cw.writerow(['Camera', parent, c['name'], c['ip'], c['stream_url'], c['manufacturer'], c['username'], decrypt_pwd(c['password'])])
         
     conn.close()
     return Response(si.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment;filename=cctv_config.csv"})
@@ -635,7 +670,7 @@ def import_config():
                 url = row.get('Stream_URL', '').strip()
                 mfg = row.get('Manufacturer', '').strip() or 'Other'
                 user = row.get('Username', '').strip()
-                pwd = row.get('Password', '').strip()
+                pwd = encrypt_pwd(row.get('Password', '').strip())
                 
                 if not name: continue
                     
@@ -711,7 +746,7 @@ def add_cameras_bulk():
     switch_id = data.get('switch_id') or None
     mfg = data.get('manufacturer', 'Other')
     user = data.get('username', '')
-    pwd = data.get('password', '')
+    pwd = encrypt_pwd(data.get('password', ''))
 
     conn = get_db()
     added_count = 0
@@ -903,7 +938,7 @@ def add_camera():
     conn = get_db()
     try:
         conn.execute("""INSERT INTO cameras (switch_id, name, ip, stream_url, manufacturer, username, password) VALUES (?, ?, ?, ?, ?, ?, ?)""", 
-                     (switch_id, request.form['name'], request.form['ip'], request.form['stream_url'], request.form.get('manufacturer', 'Other'), request.form.get('username', ''), request.form.get('password', '')))
+                     (switch_id, request.form['name'], request.form['ip'], request.form['stream_url'], request.form.get('manufacturer', 'Other'), request.form.get('username', ''), encrypt_pwd(request.form.get('password', ''))))
         conn.commit()
         trigger_monitor_check()
         flash('Camera added.', 'success')
@@ -921,7 +956,7 @@ def edit_camera(id):
         switch_id = switch_id if switch_id else None 
         try:
             conn.execute("""UPDATE cameras SET switch_id = ?, name = ?, ip = ?, stream_url = ?, manufacturer = ?, username = ?, password = ? WHERE id = ?""", 
-                         (switch_id, request.form['name'], request.form['ip'], request.form['stream_url'], request.form.get('manufacturer', 'Other'), request.form.get('username', ''), request.form.get('password', ''), id))
+                         (switch_id, request.form['name'], request.form['ip'], request.form['stream_url'], request.form.get('manufacturer', 'Other'), request.form.get('username', ''), encrypt_pwd(request.form.get('password', '')), id))
             conn.commit()
             trigger_monitor_check()
             flash('Camera updated.', 'success')
@@ -930,6 +965,10 @@ def edit_camera(id):
         except sqlite3.IntegrityError: flash('Error: A camera with that name already exists.', 'danger')
     
     camera = conn.execute("SELECT * FROM cameras WHERE id = ?", (id,)).fetchone()
+    if camera:
+        camera = dict(camera)
+        camera['password'] = decrypt_pwd(camera['password']) # Decrypt for the HTML form display
+        
     switches = conn.execute("SELECT * FROM switches").fetchall()
     conn.close()
     return render_template('edit_camera.html', camera=camera, switches=switches)
@@ -983,7 +1022,9 @@ def snapshot(id):
     camera = conn.execute("SELECT stream_url, ip, manufacturer, username, password FROM cameras WHERE id = ?", (id,)).fetchone()
     conn.close()
     if not camera: return "Camera not found", 404
-    snap_bytes = get_snapshot_bytes(camera['ip'], camera['manufacturer'], camera['username'], camera['password'], camera['stream_url'])
+    
+    pwd = decrypt_pwd(camera['password'])
+    snap_bytes = get_snapshot_bytes(camera['ip'], camera['manufacturer'], camera['username'], pwd, camera['stream_url'])
     if snap_bytes: return Response(snap_bytes, mimetype='image/jpeg')
     else: return "Failed to grab snapshot", 500
 
@@ -1082,18 +1123,14 @@ def init_logos():
 # ==========================================
 # GUNICORN / FLASK BOOTLOADER
 # ==========================================
-# ==========================================
-# GUNICORN / FLASK BOOTLOADER
-# ==========================================
 try:
     init_db()
     init_logos()
     
     os.makedirs('/app/data', exist_ok=True)
-    lock_file = '/app/data_ram/monitor.lock' # Moved lock file to RAM
+    lock_file = '/app/data_ram/monitor.lock'
     if not os.path.exists(lock_file):
         open(lock_file, 'w').close()
-        # Spawn the two background workers
         socketio.start_background_task(monitor_loop)
         socketio.start_background_task(sync_db_loop)
 except Exception as e:

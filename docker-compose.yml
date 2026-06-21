@@ -1,22 +1,5 @@
-services:
-  # --- The Built-In MQTT Broker ---
-  mqtt-broker:
-    image: eclipse-mosquitto:latest
-    container_name: cctv-mqtt
-    restart: unless-stopped
-    ports:
-      - "1883:1883"
-      - "9001:9001" # WebSockets (optional, for future use)
-    volumes:
-      # Map the config file you just created
-      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
-      # Persistent storage for MQTT messages
-      - ./data/mosquitto-data:/mosquitto/data
-      - ./data/mosquitto-log:/mosquitto/log
-
-  # --- Your Custom Application ---
-  cctv-dashboard:
-    build: https://github.com/spcfranz-rgb/CCTVMonitor-NOC.git#test
+cctv-dashboard:
+    build: https://github.com/spcfranz-rgb/CCTVMonitor-NOC.git#main
     container_name: cctv-dashboard
     restart: unless-stopped
     ports:
@@ -27,14 +10,12 @@ services:
       - CUSTOMER_LOGO_URL=${CUSTOMER_LOGO_URL}
       - DEFAULT_MQTT_BROKER=mqtt-broker
       - DEFAULT_MQTT_PORT=1883
-      
-      # REMOVE THE HASHES FROM THESE THREE LINES:
       - AUTHENTIK_URL=${AUTHENTIK_URL}
       - AUTHENTIK_CLIENT_ID=${AUTHENTIK_CLIENT_ID}
       - AUTHENTIK_CLIENT_SECRET=${AUTHENTIK_CLIENT_SECRET}
-      
     volumes:
       - ./data:/app/data
+    tmpfs:
+      - /app/data_ram
     depends_on:
-      # Ensure the broker boots up before the Python app tries to connect
       - mqtt-broker

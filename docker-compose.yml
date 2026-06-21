@@ -15,21 +15,18 @@ services:
     container_name: cctv-dashboard
     restart: unless-stopped
     
-    # 1. Force the container to run as standard user UID 1000 (instead of root 0)
-    user: "1000:1000"
+    # 1. Break out of the Docker bridge to read physical Layer 2 MAC addresses
+    network_mode: "host" 
     
-    # 2. Grant the specific kernel capability required for Ping/Traceroute
-    cap_add:
-      - NET_RAW
-      
-    ports:
-      - "5000:5000"
     environment:
       - SECRET_KEY=${SECRET_KEY}
       - COMPANY_LOGO_URL=${COMPANY_LOGO_URL}
       - CUSTOMER_LOGO_URL=${CUSTOMER_LOGO_URL}
-      - DEFAULT_MQTT_BROKER=mqtt-broker
+      
+      # 2. Update broker to localhost since Docker DNS is bypassed in host mode
+      - DEFAULT_MQTT_BROKER=127.0.0.1 
       - DEFAULT_MQTT_PORT=1883
+      
       - AUTHENTIK_URL=${AUTHENTIK_URL}
       - AUTHENTIK_CLIENT_ID=${AUTHENTIK_CLIENT_ID}
       - AUTHENTIK_CLIENT_SECRET=${AUTHENTIK_CLIENT_SECRET}

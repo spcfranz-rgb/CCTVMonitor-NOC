@@ -56,7 +56,9 @@
                                         {% else %}
                                             <div class="small text-muted" style="font-size: 0.75rem;">Waiting for ARP...</div>
                                         {% endif %}
+                                        {% if current_user.role in ['admin', 'operator'] %}
                                         <a href="/tunnel/switch/{{ s.id }}/" target="_blank" class="badge bg-info text-decoration-none mt-1">WebUI</a>
+                                        {% endif %}
                                     </td>
                                     <td>
                                         <span id="status-switch-{{ s.id }}" class="badge {% if s.status == 'UP' %}bg-success{% elif 'Silenced' in s.status %}bg-warning text-dark{% elif 'DOWN' in s.status %}bg-danger{% else %}bg-secondary{% endif %}">
@@ -237,7 +239,9 @@
                                         {% else %}
                                             <div class="small text-muted" style="font-size: 0.75rem;">Waiting for ARP...</div>
                                         {% endif %}
+                                        {% if current_user.role in ['admin', 'operator'] %}
                                         <a href="/tunnel/camera/{{ c.id }}/" target="_blank" class="badge bg-info text-decoration-none mt-1">WebUI</a>
+                                        {% endif %}
                                     </td>
                                     <td><small class="text-muted">{{ c.switch_name or 'Standalone' }}</small></td>
                                     <td>

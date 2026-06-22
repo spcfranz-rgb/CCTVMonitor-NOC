@@ -1219,12 +1219,16 @@ def proxy_request(device_type, device_id, req_path, method, headers, data, cooki
 @app.route('/tunnel/<device_type>/<int:device_id>/', defaults={'req_path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE'])
 @app.route('/tunnel/<device_type>/<int:device_id>/<path:req_path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
 @login_required
+@operator_required
 def tunnel(device_type, device_id, req_path):
     return proxy_request(device_type, device_id, req_path, request.method, request.headers, request.get_data(), request.cookies)
 
 @app.errorhandler(404)
 def proxy_absolute_paths(e):
     if not current_user.is_authenticated: return "404 - Not Found", 404
+    # Ensure unauthorized users can't bypass the proxy lock via 404 fallback
+    if current_user.role not in ['admin', 'operator']: return "403 - Forbidden", 403 
+    
     referer = request.headers.get('Referer')
     if referer:
         parsed_referer = urlparse(referer)

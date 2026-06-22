@@ -41,7 +41,7 @@ from getmac import get_mac_address
 
 app = Flask(__name__)
 
-# Tell Flask it is behind a reverse proxy (NGINX)
+# Tell Flask it is behind a reverse proxy (NGINX/Headscale)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 # Limit uploads to 2 Megabytes to prevent RAM exhaustion DoS attacks (CSV Bombing)
@@ -916,26 +916,41 @@ def run_traceroute():
     threading.Thread(target=execute_trace).start()
     return jsonify({'status': 'running'})
 
+# --- NATIVE OOKLA SPEEDTEST INTEGRATION ---
 @app.route('/api/speedtest', methods=['POST'])
 @login_required
 @operator_required
 def run_speedtest():
     def execute_test():
         try:
-            cmd = ['speedtest-cli', '--secure', '--json']
+            # We explicitly accept the license to prevent the headless container from freezing
+            cmd = ['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json']
             process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+            
             if process.returncode == 0:
                 data = json.loads(process.stdout)
-                download = round(data.get('download', 0) / 1000000, 2)
-                upload = round(data.get('upload', 0) / 1000000, 2)
-                ping = round(data.get('ping', 0), 1)
-                isp = data.get('client', {}).get('isp', 'Unknown')
-                socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': isp})
+                
+                # Convert bytes per second to Megabits per second
+                download = round((data['download']['bandwidth'] * 8) / 1000000, 2)
+                upload = round((data['upload']['bandwidth'] * 8) / 1000000, 2)
+                ping = round(data['ping']['latency'], 1)
+                isp = data.get('isp', 'Unknown')
+                
+                socketio.emit('speedtest_result', {
+                    'success': True, 
+                    'download': f"{download} Mbps", 
+                    'upload': f"{upload} Mbps", 
+                    'ping': f"{ping} ms", 
+                    'isp': isp
+                })
             else: 
                 error_msg = process.stderr.strip() or process.stdout.strip() or "Unknown execution error."
-                socketio.emit('speedtest_result', {'success': False, 'error': f'Speedtest API Error: {error_msg}'})
-        except subprocess.TimeoutExpired: socketio.emit('speedtest_result', {'success': False, 'error': 'Speed test timed out.'})
-        except Exception as e: socketio.emit('speedtest_result', {'success': False, 'error': str(e)})
+                socketio.emit('speedtest_result', {'success': False, 'error': f'Speedtest CLI Error: {error_msg}'})
+                
+        except subprocess.TimeoutExpired: 
+            socketio.emit('speedtest_result', {'success': False, 'error': 'Speedtest timed out after 60 seconds.'})
+        except Exception as e: 
+            socketio.emit('speedtest_result', {'success': False, 'error': str(e)})
 
     threading.Thread(target=execute_test).start()
     return jsonify({'status': 'running'})

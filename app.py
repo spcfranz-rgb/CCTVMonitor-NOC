@@ -916,35 +916,52 @@ def run_traceroute():
     threading.Thread(target=execute_trace).start()
     return jsonify({'status': 'running'})
 
-# --- NATIVE OOKLA SPEEDTEST INTEGRATION ---
+# --- NATIVE OOKLA SPEEDTEST WITH SERVER TRACKING ---
 @app.route('/api/speedtest', methods=['POST'])
 @login_required
 @operator_required
 def run_speedtest():
     def execute_test():
         try:
-            # We explicitly accept the license to prevent the headless container from freezing
             cmd = ['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json']
             process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
             
             if process.returncode == 0:
                 data = json.loads(process.stdout)
                 
-                # Convert bytes per second to Megabits per second
                 download = round((data['download']['bandwidth'] * 8) / 1000000, 2)
                 upload = round((data['upload']['bandwidth'] * 8) / 1000000, 2)
                 ping = round(data['ping']['latency'], 1)
                 isp = data.get('isp', 'Unknown')
+                
+                # Extract Target Server Information
+                server_info = data.get('server', {})
+                server_name = server_info.get('name', 'Unknown Server')
+                server_loc = server_info.get('location', 'Unknown Location')
+                server_string = f"{server_name} ({server_loc})"
                 
                 socketio.emit('speedtest_result', {
                     'success': True, 
                     'download': f"{download} Mbps", 
                     'upload': f"{upload} Mbps", 
                     'ping': f"{ping} ms", 
-                    'isp': isp
+                    'isp': isp,
+                    'server': server_string
                 })
             else: 
                 error_msg = process.stderr.strip() or process.stdout.strip() or "Unknown execution error."
+                
+                # Fallback: Capture nearby servers if the test fails to connect
+                try:
+                    fallback = subprocess.run(['speedtest', '-L', '-f', 'json'], capture_output=True, text=True, timeout=10)
+                    fallback_data = json.loads(fallback.stdout)
+                    servers = fallback_data.get('servers', [])
+                    if servers:
+                        server_list = ", ".join([f"{s['name']} ({s['location']})" for s in servers[:3]])
+                        error_msg += f" | Available Nearby Servers: {server_list}"
+                except Exception:
+                    pass
+                    
                 socketio.emit('speedtest_result', {'success': False, 'error': f'Speedtest CLI Error: {error_msg}'})
                 
         except subprocess.TimeoutExpired: 

@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   mqtt-broker:
     image: eclipse-mosquitto:latest
@@ -11,25 +13,30 @@ services:
       - ./data/mosquitto-log:/mosquitto/log
 
   cctv-dashboard:
-    build: https://github.com/spcfranz-rgb/CCTVMonitor-NOC.git#test
+    # Let Komodo handle the GitHub cloning, just build the local files
+    build: .
     container_name: cctv-dashboard
     restart: unless-stopped
     
     # 1. Break out of the Docker bridge to read physical Layer 2 MAC addresses
     network_mode: "host" 
     
+    # 2. REQUIRED: Elevate privileges so ping, traceroute, and ARP scans have raw socket access
+    user: root
+    
     environment:
       - SECRET_KEY=${SECRET_KEY}
       - COMPANY_LOGO_URL=${COMPANY_LOGO_URL}
       - CUSTOMER_LOGO_URL=${CUSTOMER_LOGO_URL}
       
-      # 2. Update broker to localhost since Docker DNS is bypassed in host mode
+      # 3. Update broker to localhost since Docker DNS is bypassed in host mode
       - DEFAULT_MQTT_BROKER=127.0.0.1 
       - DEFAULT_MQTT_PORT=1883
       
       - AUTHENTIK_URL=${AUTHENTIK_URL}
       - AUTHENTIK_CLIENT_ID=${AUTHENTIK_CLIENT_ID}
       - AUTHENTIK_CLIENT_SECRET=${AUTHENTIK_CLIENT_SECRET}
+      
     volumes:
       - ./data:/app/data
     tmpfs:

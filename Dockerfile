@@ -5,6 +5,7 @@ FROM python:3.9-slim
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         iputils-ping \
+        traceroute \
         ffmpeg \
         sqlite3 \
         curl \
@@ -19,18 +20,15 @@ RUN apt-get update && \
 WORKDIR /app
 
 # Copy the requirements file and install dependencies
-# We append Gunicorn here so you don't have to manually edit requirements.txt
+# Appending gunicorn and eventlet for the async WebSockets
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt gunicorn==21.2.0
+RUN pip install --no-cache-dir -r requirements.txt gunicorn==21.2.0 eventlet
 
 # Copy the rest of your application code into the container
 COPY . .
 
-# Sanitize the startup script (removes Windows line-endings if copy-pasted) and make it executable
-RUN sed -i 's/\r$//' start.sh && chmod +x start.sh
-
 # Expose the port the web GUI will run on
 EXPOSE 5000
 
-# Boot the container using our custom startup script
-CMD ["./start.sh"]
+# Boot the container using Gunicorn with Eventlet async workers
+CMD ["gunicorn", "--worker-class", "eventlet", "-w", "1", "-b", "0.0.0.0:5000", "app:app"]

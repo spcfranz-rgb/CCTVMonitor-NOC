@@ -11,17 +11,23 @@ services:
       - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
       - ./data/mosquitto-data:/mosquitto/data
       - ./data/mosquitto-log:/mosquitto/log
+    # Log Rotation: Caps at 50MB total (10MB x 5 files) and compresses old logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+        compress: "true"
 
   cctv-dashboard:
-    # Let Komodo handle the GitHub cloning, just build the local files
     build: .
     container_name: cctv-dashboard
     restart: unless-stopped
     
-    # 1. Break out of the Docker bridge to read physical Layer 2 MAC addresses
+    # Break out of the Docker bridge to read physical Layer 2 MAC addresses
     network_mode: "host" 
     
-    # 2. REQUIRED: Elevate privileges so ping, traceroute, and ARP scans have raw socket access
+    # REQUIRED: Elevate privileges so ping, traceroute, and ARP scans have raw socket access
     user: root
     
     environment:
@@ -29,7 +35,7 @@ services:
       - COMPANY_LOGO_URL=${COMPANY_LOGO_URL}
       - CUSTOMER_LOGO_URL=${CUSTOMER_LOGO_URL}
       
-      # 3. Update broker to localhost since Docker DNS is bypassed in host mode
+      # Update broker to localhost since Docker DNS is bypassed in host mode
       - DEFAULT_MQTT_BROKER=127.0.0.1 
       - DEFAULT_MQTT_PORT=1883
       
@@ -43,3 +49,11 @@ services:
       - /app/data_ram
     depends_on:
       - mqtt-broker
+      
+    # Log Rotation: Caps at 50MB total (10MB x 5 files) and compresses old logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+        compress: "true"

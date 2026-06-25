@@ -512,7 +512,6 @@
                     // Buffer DOM updates to prevent layout thrashing
                     let htmlBuffer = '';
                     data.devices.forEach(d => {
-                        // Escape variables locally via text node creation if untrusted, but for LAN IPs string interpolation is generally safe here.
                         htmlBuffer += `<tr>
                             <td class="text-info font-monospace">${d.ip}</td>
                             <td class="font-monospace text-light">${d.mac}</td>
@@ -532,8 +531,10 @@
             formData.append('hours', hours);
 
             const badge = document.getElementById(`status-${type}-${id}`);
-            badge.innerText = 'Updating...';
-            badge.className = 'badge bg-secondary';
+            if (badge) {
+                badge.innerText = 'Updating...';
+                badge.className = 'badge bg-secondary';
+            }
 
             fetch('/toggle_silence/' + type + '/' + id, { method: 'POST', body: formData })
             .then(res => res.json())
@@ -543,6 +544,8 @@
                     setTimeout(() => location.reload(), 1500); 
                 } else {
                     showToast(hours > 0 ? "Device silenced successfully." : "Silence removed.", "success");
+                    // Force a reload to instantly re-render the correct UI buttons
+                    setTimeout(() => location.reload(), 600); 
                 }
             })
             .catch(() => {

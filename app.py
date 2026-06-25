@@ -688,8 +688,7 @@ def index():
     users = conn.execute("SELECT id, username, role FROM users").fetchall()
     conn.close()
     
-    # --- CACHE DEFEAT LOGIC ---
-    from flask import make_response # (You can also move this import to the top of app.py)
+    return render_template('index.html', switches=switches, cameras=cameras, settings=settings_dict, users=users)
     
     # Wrap the template rendering in a response object
     response = make_response(render_template(

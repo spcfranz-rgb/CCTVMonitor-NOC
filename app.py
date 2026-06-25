@@ -325,8 +325,7 @@ def is_stream_active(url):
     except subprocess.TimeoutExpired: return False
 
 def get_camlan_arp_table():
-    """Reads the raw Linux ARP cache directly from the kernel in memory."""
-    target_interface = os.environ.get('CAMLAN_INTERFACE', 'eth0')
+    """Reads the raw Linux ARP cache directly from the kernel across all interfaces."""
     arp_entries = []
     
     try:
@@ -340,8 +339,8 @@ def get_camlan_arp_table():
                     mac = parts[3]
                     interface = parts[5]
 
-                    # Filter specifically for the physical CCTV port and strip empty MACs
-                    if interface == target_interface and mac != "00:00:00:00:00:00":
+                    # Filter out empty/null MAC addresses, but allow ALL interfaces
+                    if mac != "00:00:00:00:00:00":
                         arp_entries.append({
                             "ip": ip,
                             "mac": mac.upper(),
@@ -849,7 +848,7 @@ def fetch_arp_table():
         return jsonify({
             "status": "success",
             "count": len(devices),
-            "interface_scanned": os.environ.get('CAMLAN_INTERFACE', 'eth0'),
+            "interface_scanned": "All Interfaces", # <-- Updated this line
             "devices": devices
         }), 200
     except Exception as e:

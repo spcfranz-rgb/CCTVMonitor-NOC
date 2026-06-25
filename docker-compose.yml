@@ -21,7 +21,7 @@ services:
 
   cctv-dashboard:
     build: .
-    container_name: cctv-dashboard
+    container_name: lighthouse-dashboard
     restart: unless-stopped
     network_mode: "host" 
     user: root

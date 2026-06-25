@@ -318,7 +318,7 @@ def is_port_open(target, port, timeout=2):
 
 def is_stream_active(url):
     try:
-        response = subprocess.call(['ffprobe', '-rtsp_transport', 'tcp', '-v', 'error', '-i', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        response = subprocess.call(['ffprobe', '-rtsp_transport', '-v', 'error', '-i', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
         return response == 0
     except subprocess.TimeoutExpired: return False
 

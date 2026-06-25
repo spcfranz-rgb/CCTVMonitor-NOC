@@ -322,6 +322,34 @@ def is_stream_active(url):
         return response == 0
     except subprocess.TimeoutExpired: return False
 
+def get_camlan_arp_table():
+    """Reads the raw Linux ARP cache directly from the kernel in memory."""
+    target_interface = os.environ.get('CAMLAN_INTERFACE', 'eth0')
+    arp_entries = []
+    
+    try:
+        with open('/proc/net/arp', 'r') as f:
+            lines = f.readlines()[1:] # Skip the header row
+            
+            for line in lines:
+                parts = line.split()
+                if len(parts) >= 6:
+                    ip = parts[0]
+                    mac = parts[3]
+                    interface = parts[5]
+
+                    # Filter specifically for the physical CCTV port and strip empty MACs
+                    if interface == target_interface and mac != "00:00:00:00:00:00":
+                        arp_entries.append({
+                            "ip": ip,
+                            "mac": mac.upper(),
+                            "interface": interface
+                        })
+    except FileNotFoundError:
+        print("CRITICAL: /proc/net/arp not found. Ensure Docker is using network_mode: host")
+        
+    return arp_entries
+
 def get_snapshot_bytes(ip, mfg, user, pwd, stream_url):
     if mfg and mfg != 'Other':
         url = None
@@ -790,6 +818,25 @@ def import_config():
         flash(f'Error importing CSV: Invalid format or missing headers. ({str(e)})', 'danger')
 
     return redirect(url_for('index'))
+
+@app.route('/api/network/arp', methods=['GET'])
+@login_required
+@operator_required
+def fetch_arp_table():
+    """REST endpoint for the frontend UI to poll active cameras on the LAN."""
+    try:
+        devices = get_camlan_arp_table()
+        return jsonify({
+            "status": "success",
+            "count": len(devices),
+            "interface_scanned": os.environ.get('CAMLAN_INTERFACE', 'eth0'),
+            "devices": devices
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
 
 @app.route('/api/scan_network', methods=['POST'])
 @login_required

@@ -6,10 +6,12 @@ services:
     ports:
       - "1883:1883"
     volumes:
+      # CONFIG: Relative mount (Pulled fresh from GitHub every deployment)
       - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
-      - ./data/mosquitto-data:/mosquitto/data
-      - ./data/mosquitto-log:/mosquitto/log
-    # Log Rotation: Caps at 50MB total (10MB x 5 files) and compresses old logs
+      
+      # DATA: Absolute mounts (Survives repo wipes)
+      - /opt/cctv-data/mosquitto/data:/mosquitto/data
+      - /opt/cctv-data/mosquitto/log:/mosquitto/log
     logging:
       driver: "json-file"
       options:
@@ -21,34 +23,24 @@ services:
     build: .
     container_name: cctv-dashboard
     restart: unless-stopped
-    
-    # Break out of the Docker bridge to read physical Layer 2 MAC addresses
     network_mode: "host" 
-    
-    # REQUIRED: Elevate privileges so ping, traceroute, and ARP scans have raw socket access
     user: root
-    
     environment:
       - SECRET_KEY=${SECRET_KEY}
       - COMPANY_LOGO_URL=${COMPANY_LOGO_URL}
       - CUSTOMER_LOGO_URL=${CUSTOMER_LOGO_URL}
-      
-      # Update broker to localhost since Docker DNS is bypassed in host mode
       - DEFAULT_MQTT_BROKER=127.0.0.1 
       - DEFAULT_MQTT_PORT=1883
-      
       - AUTHENTIK_URL=${AUTHENTIK_URL}
       - AUTHENTIK_CLIENT_ID=${AUTHENTIK_CLIENT_ID}
       - AUTHENTIK_CLIENT_SECRET=${AUTHENTIK_CLIENT_SECRET}
-      
     volumes:
-      - ./data:/app/data
+      # DATA: Absolute mount for the Python backend database (Survives repo wipes)
+      - /opt/cctv-data/dashboard:/app/data
     tmpfs:
       - /app/data_ram
     depends_on:
       - mqtt-broker
-      
-    # Log Rotation: Caps at 50MB total (10MB x 5 files) and compresses old logs
     logging:
       driver: "json-file"
       options:

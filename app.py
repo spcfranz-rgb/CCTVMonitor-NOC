@@ -60,7 +60,6 @@ app.config['SESSION_COOKIE_SECURE'] = os.environ.get('REQUIRE_HTTPS', 'False').l
 # --- SECURITY: CONTENT SECURITY POLICY (CSP) ---
 @app.after_request
 def apply_csp(response):
-    # Protects against XSS by strictly defining where resources can load from
     csp = (
         "default-src 'self'; "
         "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdn.socket.io; "
@@ -274,7 +273,6 @@ def log_prune_loop():
 SNAPSHOT_SEMAPHORE = eventlet.semaphore.Semaphore(4)
 
 def get_local_subnet():
-    """Detects the primary local subnet automatically to pre-fill the UI."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -1101,7 +1099,13 @@ def snapshot(id):
 # ==========================================
 # WEB UI TUNNELING (REVERSE PROXY)
 # ==========================================
-def proxy_request(device_type, device_id, req_path, method, headers, data, cookies):
+# SECURED: Exempt the proxy tunnel from CSRF checks so camera WebUIs don't crash on POST
+@csrf.exempt
+@app.route('/tunnel/<device_type>/<int:device_id>/', defaults={'req_path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE'])
+@app.route('/tunnel/<device_type>/<int:device_id>/<path:req_path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
+@login_required
+@operator_required
+def tunnel(device_type, device_id, req_path):
     conn = get_db()
     if device_type == 'switch': device = conn.execute("SELECT ip FROM switches WHERE id = ?", (device_id,)).fetchone()
     elif device_type == 'camera': device = conn.execute("SELECT ip FROM cameras WHERE id = ?", (device_id,)).fetchone()
@@ -1119,17 +1123,17 @@ def proxy_request(device_type, device_id, req_path, method, headers, data, cooki
     query_string = request.query_string.decode('utf-8')
     full_req_path = f"{req_path}?{query_string}" if query_string else req_path
     
-    clean_headers = {k: v for k, v in headers if k.lower() not in ['host', 'origin', 'referer', 'accept-encoding']}
+    clean_headers = {k: v for k, v in request.headers if k.lower() not in ['host', 'origin', 'referer', 'accept-encoding']}
     clean_headers['Host'] = device['ip']
     target_url = f"http://{resolved_ip}/{full_req_path.lstrip('/')}"
     
     try:
-        resp = requests.request(method=method, url=target_url, headers=clean_headers, data=data, cookies=cookies, allow_redirects=False, stream=True, timeout=10, verify=False)
+        resp = requests.request(method=request.method, url=target_url, headers=clean_headers, data=request.get_data(), cookies=request.cookies, allow_redirects=False, stream=True, timeout=10, verify=False)
         if resp.status_code in [301, 302, 307, 308]:
             loc = resp.headers.get('Location', '')
             if loc.startswith(f"https://{device['ip']}") or loc.startswith(f"https://{resolved_ip}"):
                 target_url = f"https://{resolved_ip}/{full_req_path.lstrip('/')}"
-                resp = requests.request(method=method, url=target_url, headers=clean_headers, data=data, cookies=cookies, allow_redirects=False, stream=True, timeout=10, verify=False)
+                resp = requests.request(method=request.method, url=target_url, headers=clean_headers, data=request.get_data(), cookies=request.cookies, allow_redirects=False, stream=True, timeout=10, verify=False)
         
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
         resp_headers = [(name, value) for (name, value) in resp.raw.headers.items() if name.lower() not in excluded_headers]
@@ -1159,13 +1163,7 @@ def proxy_request(device_type, device_id, req_path, method, headers, data, cooki
     except requests.exceptions.RequestException as e:
         return f"Tunnel Error connecting to {device['ip']}: {str(e)}", 502
 
-@app.route('/tunnel/<device_type>/<int:device_id>/', defaults={'req_path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE'])
-@app.route('/tunnel/<device_type>/<int:device_id>/<path:req_path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-@login_required
-@operator_required
-def tunnel(device_type, device_id, req_path):
-    return proxy_request(device_type, device_id, req_path, request.method, request.headers, request.get_data(), request.cookies)
-
+@csrf.exempt
 @app.errorhandler(404)
 def proxy_absolute_paths(e):
     if not current_user.is_authenticated: return "404 - Not Found", 404
@@ -1175,7 +1173,7 @@ def proxy_absolute_paths(e):
         parsed_referer = urlparse(referer)
         parts = parsed_referer.path.split('/')
         if len(parts) >= 4 and parts[1] == 'tunnel':
-            return proxy_request(parts[2], parts[3], request.path, request.method, request.headers, request.get_data(), request.cookies)
+            return tunnel(parts[2], parts[3], request.path)
     return "404 - Not Found", 404
 
 def init_logos():

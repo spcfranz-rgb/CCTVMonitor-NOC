@@ -41,6 +41,8 @@ from getmac import get_mac_address
 
 app = Flask(__name__)
 
+app.config['TEMPLATES_AUTO_RELOAD'] = True
+
 # Tell Flask it is behind a reverse proxy (NGINX/Headscale)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 

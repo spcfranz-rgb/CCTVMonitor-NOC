@@ -688,7 +688,24 @@ def index():
     users = conn.execute("SELECT id, username, role FROM users").fetchall()
     conn.close()
     
-    return render_template('index.html', switches=switches, cameras=cameras, settings=settings_dict, users=users)
+    # --- CACHE DEFEAT LOGIC ---
+    from flask import make_response # (You can also move this import to the top of app.py)
+    
+    # Wrap the template rendering in a response object
+    response = make_response(render_template(
+        'index.html', 
+        switches=switches, 
+        cameras=cameras, 
+        settings=settings_dict, 
+        users=users
+    ))
+    
+    # Strict headers telling Proxies and Browsers NEVER to cache the HTML
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    
+    return response
 
 @app.route('/history')
 @login_required

@@ -480,7 +480,9 @@ def monitor_loop():
                         camera_results[c_id] = (cam_up, stream_ok, snap_bytes)
                     
                     for cam in cameras:
-                        cam_id, cam_name, cam_silenced = cam['id'], cam['name'], (cam['silenced_until'] > now)
+                        cam_silenced = (cam.get('silenced_until', 0) > now) or (switch.get('silenced_until', 0) > now)
+    
+                        cam_id, cam_name = cam['id'], cam['name']
                         cam_up, stream_ok, snap_bytes = camera_results[cam_id]
                         is_frozen = False
                         

@@ -447,11 +447,9 @@
             fetch('/toggle_silence/' + type + '/' + id, { method: 'POST', body: formData })
             .then(res => res.json())
             .then(data => { 
-                if (data.success) { 
-                    // 2. We can either reload or let the WebSocket handle the final state
-                    location.reload(); 
-                } else {
+                if (!data.success) {
                     alert("Failed to silence device.");
+                    location.reload(); // Only reload if it actually fails
                 }
             });
         }

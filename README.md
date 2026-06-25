@@ -1,4 +1,4 @@
-# CCTVMonitor-NOC
+# Lighthouse
 
 A production-grade Edge Network Operations Center (NOC) gateway designed for Raspberry Pi 5 deployments. This system provides deep remote management, camera health monitoring, and network diagnostics for on-site CCTV LANs, strictly secured behind a Headscale/Tailscale VPN mesh.
 

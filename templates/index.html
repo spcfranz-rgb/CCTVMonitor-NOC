@@ -37,311 +37,364 @@
       {% endif %}
     {% endwith %}
 
-    <div class="row">
-        <div class="col-md-4">
-            
-            <div class="card mb-4">
-                <div class="card-header"><h5 class="mb-0">Network Switches</h5></div>
-                <div class="card-body">
-                    <div class="table-responsive">
-                        <table class="table table-sm align-middle text-nowrap">
-                            <thead><tr><th>Name</th><th>IP/Host</th><th>Status</th>{% if current_user.role in ['admin', 'operator'] %}<th></th>{% endif %}</tr></thead>
-                            <tbody>
-                                {% for s in switches %}
-                                <tr>
-                                    <td>{{ s.name }}</td>
-                                    <td>
-                                        <div class="fw-bold">{{ s.ip }}</div>
-                                        {% if s.mac_address %}
-                                            <div class="small text-muted" style="font-family: monospace; font-size: 0.75rem;">{{ s.mac_address }}</div>
-                                        {% else %}
-                                            <div class="small text-muted" style="font-size: 0.75rem;">Waiting for ARP...</div>
-                                        {% endif %}
-                                        {% if current_user.role in ['admin', 'operator'] %}
-                                        <a href="/tunnel/switch/{{ s.id }}/" target="_blank" class="badge bg-info text-decoration-none mt-1">WebUI</a>
-                                        {% endif %}
-                                    </td>
-                                    <td>
-                                        <span id="status-switch-{{ s.id }}" class="badge {% if s.status == 'UP' %}bg-success{% elif 'Silenced' in s.status %}bg-warning text-dark{% elif 'DOWN' in s.status %}bg-danger{% else %}bg-secondary{% endif %}">
-                                            {{ s.status }}
-                                        </span>
-                                    </td>
-                                    {% if current_user.role in ['admin', 'operator'] %}
-                                    <td class="text-end text-nowrap">
-                                        {% if s.is_silenced %}
-                                            <button class="btn btn-warning btn-sm" onclick="toggleSilence('switch', {{ s.id }}, 0)" title="Un-silence Device">🔇</button>
-                                        {% else %}
-                                            <button class="btn btn-outline-secondary btn-sm" onclick="toggleSilence('switch', {{ s.id }}, 24)" title="Silence Alerts (24h)">🔔</button>
-                                        {% endif %}
-                                        
-                                        {% if current_user.role == 'admin' %}
-                                        <a href="/edit_switch/{{ s.id }}" class="btn btn-outline-warning btn-sm">Edit</a>
-                                        <a href="/delete_switch/{{ s.id }}" class="btn btn-outline-danger btn-sm">X</a>
-                                        {% endif %}
-                                    </td>
-                                    {% endif %}
-                                </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
+    <ul class="nav nav-tabs mb-4 border-secondary" id="dashboardTabs" role="tablist">
+        <li class="nav-item" role="presentation">
+            <button class="nav-link active text-light bg-dark border-secondary" id="monitoring-tab" data-bs-toggle="tab" data-bs-target="#tab-monitoring" type="button" role="tab" aria-selected="true">
+                📡 Live Monitoring
+            </button>
+        </li>
+        {% if current_user.role in ['admin', 'operator'] %}
+        <li class="nav-item" role="presentation">
+            <button class="nav-link text-info border-secondary" id="diagnostics-tab" data-bs-toggle="tab" data-bs-target="#tab-diagnostics" type="button" role="tab" aria-selected="false">
+                🛠️ Diagnostics
+            </button>
+        </li>
+        {% endif %}
+        {% if current_user.role == 'admin' %}
+        <li class="nav-item" role="presentation">
+            <button class="nav-link text-warning border-secondary" id="admin-tab" data-bs-toggle="tab" data-bs-target="#tab-admin" type="button" role="tab" aria-selected="false">
+                ⚙️ Administration
+            </button>
+        </li>
+        {% endif %}
+    </ul>
+
+    <div class="tab-content" id="dashboardTabsContent">
+
+        <div class="tab-pane fade show active" id="tab-monitoring" role="tabpanel">
+            <div class="row">
+                <div class="col-xl-4 col-lg-5">
                     
-                    {% if current_user.role == 'admin' %}
-                    <hr>
-                    <h6>Add Switch</h6>
-                    <form action="/add_switch" method="POST">
-                        <input type="text" name="name" class="form-control mb-2" placeholder="Switch Name" required>
-                        <input type="text" name="ip" class="form-control mb-2" placeholder="IP / Hostname" required>
-                        <button type="submit" class="btn btn-primary btn-sm w-100">Add Switch</button>
-                    </form>
-                    {% endif %}
-                </div>
-            </div>
+                    <div class="card mb-4 shadow-sm">
+                        <div class="card-header"><h5 class="mb-0">Network Switches</h5></div>
+                        <div class="card-body">
+                            <div class="table-responsive">
+                                <table class="table table-sm align-middle text-nowrap">
+                                    <thead><tr><th>Name</th><th>IP/Host</th><th>Status</th>{% if current_user.role in ['admin', 'operator'] %}<th></th>{% endif %}</tr></thead>
+                                    <tbody>
+                                        {% for s in switches %}
+                                        <tr>
+                                            <td>{{ s.name }}</td>
+                                            <td>
+                                                <div class="fw-bold">{{ s.ip }}</div>
+                                                {% if s.mac_address %}
+                                                    <div class="small text-muted" style="font-family: monospace; font-size: 0.75rem;">{{ s.mac_address }}</div>
+                                                {% else %}
+                                                    <div class="small text-muted" style="font-size: 0.75rem;">Waiting for ARP...</div>
+                                                {% endif %}
+                                                {% if current_user.role in ['admin', 'operator'] %}
+                                                <a href="/tunnel/switch/{{ s.id }}/" target="_blank" class="badge bg-info text-decoration-none mt-1">WebUI</a>
+                                                {% endif %}
+                                            </td>
+                                            <td>
+                                                <span id="status-switch-{{ s.id }}" class="badge {% if s.status == 'UP' %}bg-success{% elif 'Silenced' in s.status %}bg-warning text-dark{% elif 'DOWN' in s.status %}bg-danger{% else %}bg-secondary{% endif %}">
+                                                    {{ s.status }}
+                                                </span>
+                                            </td>
+                                            {% if current_user.role in ['admin', 'operator'] %}
+                                            <td class="text-end text-nowrap">
+                                                {% if s.is_silenced %}
+                                                    <button class="btn btn-warning btn-sm" onclick="toggleSilence('switch', {{ s.id }}, 0)" title="Un-silence Device">🔇</button>
+                                                {% else %}
+                                                    <button class="btn btn-outline-secondary btn-sm" onclick="toggleSilence('switch', {{ s.id }}, 24)" title="Silence Alerts (24h)">🔔</button>
+                                                {% endif %}
+                                                
+                                                {% if current_user.role == 'admin' %}
+                                                <a href="/edit_switch/{{ s.id }}" class="btn btn-outline-warning btn-sm">Edit</a>
+                                                <a href="/delete_switch/{{ s.id }}" class="btn btn-outline-danger btn-sm">X</a>
+                                                {% endif %}
+                                            </td>
+                                            {% endif %}
+                                        </tr>
+                                        {% endfor %}
+                                    </tbody>
+                                </table>
+                            </div>
+                            
+                            {% if current_user.role == 'admin' %}
+                            <hr>
+                            <h6>Add Switch</h6>
+                            <form action="/add_switch" method="POST">
+                                <input type="text" name="name" class="form-control mb-2" placeholder="Switch Name" required>
+                                <input type="text" name="ip" class="form-control mb-2" placeholder="IP / Hostname" required>
+                                <button type="submit" class="btn btn-primary btn-sm w-100">Add Switch</button>
+                            </form>
+                            {% endif %}
+                        </div>
+                    </div>
 
-            {% if current_user.role == 'admin' %}
-            <div class="card mb-4">
-                <div class="card-header"><h5 class="mb-0">Global Settings</h5></div>
-                <div class="card-body bg-body-tertiary">
-                    <form action="/update_settings" method="POST">
-                        <div class="mb-2">
-                            <label class="form-label small text-muted mb-0">MQTT Broker IP</label>
-                            <input type="text" name="mqtt_broker" class="form-control form-control-sm" value="{{ settings.mqtt_broker }}" required>
-                        </div>
-                        <div class="mb-2">
-                            <label class="form-label small text-muted mb-0">MQTT Port</label>
-                            <input type="number" name="mqtt_port" class="form-control form-control-sm" value="{{ settings.mqtt_port }}" required>
-                        </div>
-                        <div class="mb-2">
-                            <label class="form-label small text-muted mb-0">MQTT Topic Prefix</label>
-                            <input type="text" name="mqtt_prefix" class="form-control form-control-sm" value="{{ settings.mqtt_prefix }}" required>
-                        </div>
-                        <div class="mb-3">
-                            <label class="form-label small text-muted mb-0">Check Interval (Sec)</label>
-                            <input type="number" name="check_interval" class="form-control form-control-sm" value="{{ settings.check_interval }}" required>
-                        </div>
-                        <button type="submit" class="btn btn-warning btn-sm w-100">Save Settings</button>
-                    </form>
+                </div>
+
+                <div class="col-xl-8 col-lg-7">
                     
-                    <hr class="my-3 border-secondary">
-                    <h6>Backup & Restore</h6>
-                    <div class="d-flex gap-2 mb-3">
-                        <a href="/export_config" class="btn btn-outline-success btn-sm w-50">Export Config</a>
-                        <button type="button" class="btn btn-outline-info btn-sm w-50" data-bs-toggle="modal" data-bs-target="#importModal">Import Config</button>
-                    </div>
-
-                    <hr class="my-3 border-secondary">
-                    <form action="/test_alert" method="POST">
-                        <button type="submit" class="btn btn-outline-info btn-sm w-100">Test MQTT Alert</button>
-                    </form>
-                </div>
-            </div>
-            {% endif %}
-
-            {% if current_user.role in ['admin', 'operator'] %}
-            <div class="card mb-4">
-                <div class="card-header"><h5 class="mb-0">Manual Diagnostic Tool</h5></div>
-                <div class="card-body">
-                        <div class="input-group mb-3">
-                            <input type="text" id="diagIp" class="form-control form-control-sm" placeholder="IP or Hostname (e.g. 192.168.1.5)">
-                            <button class="btn btn-outline-info btn-sm" type="button" id="pingBtn" onclick="runPing()">Ping</button>
-                            <button class="btn btn-outline-warning btn-sm" type="button" id="traceBtn" onclick="runTrace()">Trace</button>
+                    <div class="card shadow-sm mb-4">
+                        <div class="card-header d-flex justify-content-between align-items-center">
+                            <h5 class="mb-0">Cameras</h5>
                         </div>
-                        
-                        <div id="diagSpinner" class="text-center d-none mb-2">
-                            <div class="spinner-border spinner-border-sm text-info" role="status"></div>
-                            <span id="diagSpinnerText" class="ms-2 small text-muted">Running diagnostic...</span>
-                        </div>
-                        
-                        <pre id="diagOutput" class="bg-black text-light p-2 rounded small d-none" style="max-height: 250px; overflow-y: auto; font-size: 0.75rem; white-space: pre-wrap;"></pre>
-                </div>
-            </div>
-            {% endif %}
+                        <div class="card-body">
+                            <div class="table-responsive">
+                                <table class="table table-sm align-middle text-nowrap">
+                                    <thead><tr><th>Name</th><th>IP/Host</th><th>Switch</th><th>Status</th>{% if current_user.role in ['admin', 'operator'] %}<th></th>{% endif %}</tr></thead>
+                                    <tbody>
+                                        {% for c in cameras %}
+                                        <tr>
+                                            <td>
+                                                {{ c.name }}
+                                                <button class="btn btn-sm btn-outline-secondary ms-2 py-0" onclick="showPreview({{ c.id }}, '{{ c.name }}')">Preview</button>
+                                            </td>
+                                            <td>
+                                                <div class="fw-bold">{{ c.ip }}</div>
+                                                {% if c.mac_address %}
+                                                    <div class="small text-muted" style="font-family: monospace; font-size: 0.75rem;">{{ c.mac_address }}</div>
+                                                {% else %}
+                                                    <div class="small text-muted" style="font-size: 0.75rem;">Waiting for ARP...</div>
+                                                {% endif %}
+                                                {% if current_user.role in ['admin', 'operator'] %}
+                                                <a href="/tunnel/camera/{{ c.id }}/" target="_blank" class="badge bg-info text-decoration-none mt-1">WebUI</a>
+                                                {% endif %}
+                                            </td>
+                                            <td><small class="text-muted">{{ c.switch_name or 'Standalone' }}</small></td>
+                                            <td>
+                                                <span id="status-camera-{{ c.id }}" class="badge {% if c.status == 'UP' %}bg-success{% elif 'Silenced' in c.status %}bg-warning text-dark{% elif 'DOWN' in c.status or 'UNREACHABLE' in c.status or 'Frozen' in c.status %}bg-danger{% else %}bg-secondary{% endif %}">
+                                                    {{ c.status }}
+                                                </span>
+                                            </td>
+                                            {% if current_user.role in ['admin', 'operator'] %}
+                                            <td class="text-end text-nowrap">
+                                                {% if c.is_silenced %}
+                                                    <button class="btn btn-warning btn-sm" onclick="toggleSilence('camera', {{ c.id }}, 0)" title="Un-silence Device">🔇</button>
+                                                {% else %}
+                                                    <button class="btn btn-outline-secondary btn-sm" onclick="toggleSilence('camera', {{ c.id }}, 24)" title="Silence Alerts (24h)">🔔</button>
+                                                {% endif %}
+                                                
+                                                {% if current_user.role == 'admin' %}
+                                                <a href="/edit_camera/{{ c.id }}" class="btn btn-outline-warning btn-sm">Edit</a>
+                                                <a href="/delete_camera/{{ c.id }}" class="btn btn-outline-danger btn-sm">X</a>
+                                                {% endif %}
+                                            </td>
+                                            {% endif %}
+                                        </tr>
+                                        {% endfor %}
+                                    </tbody>
+                                </table>
+                            </div>
 
-            {% if current_user.role in ['admin', 'operator'] %}
-            <div class="card mb-4">
-                <div class="card-header"><h5 class="mb-0">WAN Speed Test</h5></div>
-                <div class="card-body">
-                    <p class="small text-muted mb-3">Test the external internet connection speed of the gateway system.</p>
-                    <div id="speedtestDisplay" class="row text-center mb-3 d-none">
-                        <div class="col-4 border-end"><small class="text-muted d-block">Ping</small><strong id="st-ping" class="text-info">-</strong></div>
-                        <div class="col-4 border-end"><small class="text-muted d-block">Download</small><strong id="st-download" class="text-success">-</strong></div>
-                        <div class="col-4"><small class="text-muted d-block">Upload</small><strong id="st-upload" class="text-warning">-</strong></div>
-                        <div class="col-12 mt-2"><small class="text-muted small">ISP: <span id="st-isp" class="fw-bold text-light">-</span></small></div>
-                    </div>
-                    <div id="speedtestSpinner" class="text-center d-none mb-3">
-                        <div class="spinner-border spinner-border-sm text-warning" role="status"></div>
-                        <span class="ms-2 small text-muted">Running network benchmarks (takes ~30s)...</span>
-                    </div>
-                    <button class="btn btn-outline-warning btn-sm w-100" type="button" id="speedtestBtn" onclick="runSpeedTest()">Run Speed Test</button>
-                    <div id="speedtestError" class="alert alert-danger py-1 small mt-2 d-none"></div>
-                </div>
-            </div>
-            {% endif %}
-
-            {% if current_user.role == 'admin' %}
-            <div class="card mb-4">
-                <div class="card-header"><h5 class="mb-0">User Management</h5></div>
-                <div class="card-body">
-                    <div class="table-responsive">
-                        <table class="table table-sm align-middle text-nowrap">
-                            <thead><tr><th>Username</th><th>Role</th><th></th></tr></thead>
-                            <tbody>
-                                {% for u in users %}
-                                <tr>
-                                    <td>{{ u.username }}</td>
-                                    <td>{{ u.role }}</td>
-                                    <td class="text-end">
-                                        {% if u.id != current_user.id %}
-                                        <a href="/delete_user/{{ u.id }}" class="btn btn-outline-danger btn-sm">X</a>
-                                        {% endif %}
-                                    </td>
-                                </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
-                    <hr>
-                    <form action="/add_user" method="POST" class="row gx-1">
-                        <div class="col-12 mb-2"><input type="text" name="username" class="form-control form-control-sm" placeholder="Username" required></div>
-                        <div class="col-6 mb-2"><input type="password" name="password" class="form-control form-control-sm" placeholder="Password" required></div>
-                        <div class="col-6 mb-2">
-                            <select name="role" class="form-select form-select-sm" required>
-                                <option value="user">Viewer Only</option>
-                                <option value="operator">Operator (Diagnostics)</option>
-                                <option value="admin">Admin (Full Config)</option>
-                            </select>
-                        </div>
-                        <div class="col-12"><button type="submit" class="btn btn-secondary btn-sm w-100">Add User</button></div>
-                    </form>
-                </div>
-            </div>
-            {% endif %}
-
-        </div>
-
-        <div class="col-md-8">
-            <div class="card">
-                <div class="card-header"><h5 class="mb-0">Cameras</h5></div>
-                <div class="card-body">
-                    <div class="table-responsive">
-                        <table class="table table-sm align-middle text-nowrap">
-                            <thead><tr><th>Name</th><th>IP/Host</th><th>Switch</th><th>Status</th>{% if current_user.role in ['admin', 'operator'] %}<th></th>{% endif %}</tr></thead>
-                            <tbody>
-                                {% for c in cameras %}
-                                <tr>
-                                    <td>
-                                        {{ c.name }}
-                                        <button class="btn btn-sm btn-outline-secondary ms-2 py-0" onclick="showPreview({{ c.id }}, '{{ c.name }}')">Preview</button>
-                                    </td>
-                                    <td>
-                                        <div class="fw-bold">{{ c.ip }}</div>
-                                        {% if c.mac_address %}
-                                            <div class="small text-muted" style="font-family: monospace; font-size: 0.75rem;">{{ c.mac_address }}</div>
-                                        {% else %}
-                                            <div class="small text-muted" style="font-size: 0.75rem;">Waiting for ARP...</div>
-                                        {% endif %}
-                                        {% if current_user.role in ['admin', 'operator'] %}
-                                        <a href="/tunnel/camera/{{ c.id }}/" target="_blank" class="badge bg-info text-decoration-none mt-1">WebUI</a>
-                                        {% endif %}
-                                    </td>
-                                    <td><small class="text-muted">{{ c.switch_name or 'Standalone' }}</small></td>
-                                    <td>
-                                        <span id="status-camera-{{ c.id }}" class="badge {% if c.status == 'UP' %}bg-success{% elif 'Silenced' in c.status %}bg-warning text-dark{% elif 'DOWN' in c.status or 'UNREACHABLE' in c.status or 'Frozen' in c.status %}bg-danger{% else %}bg-secondary{% endif %}">
-                                            {{ c.status }}
-                                        </span>
-                                    </td>
-                                    {% if current_user.role in ['admin', 'operator'] %}
-                                    <td class="text-end text-nowrap">
-                                        {% if c.is_silenced %}
-                                            <button class="btn btn-warning btn-sm" onclick="toggleSilence('camera', {{ c.id }}, 0)" title="Un-silence Device">🔇</button>
-                                        {% else %}
-                                            <button class="btn btn-outline-secondary btn-sm" onclick="toggleSilence('camera', {{ c.id }}, 24)" title="Silence Alerts (24h)">🔔</button>
-                                        {% endif %}
-                                        
-                                        {% if current_user.role == 'admin' %}
-                                        <a href="/edit_camera/{{ c.id }}" class="btn btn-outline-warning btn-sm">Edit</a>
-                                        <a href="/delete_camera/{{ c.id }}" class="btn btn-outline-danger btn-sm">X</a>
-                                        {% endif %}
-                                    </td>
-                                    {% endif %}
-                                </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
-
-                    {% if current_user.role == 'admin' %}
-                    <hr>
-                    <div class="d-flex justify-content-between align-items-center mb-2">
-                        <h6 class="mb-0">Add Camera</h6>
-                        <div class="dropdown">
-                            <button class="btn btn-outline-info btn-sm dropdown-toggle py-0" type="button" data-bs-toggle="dropdown" data-bs-auto-close="outside" aria-expanded="false">
-                                Auto-Discover
-                            </button>
-                            <div class="dropdown-menu dropdown-menu-end p-3 shadow" style="width: 100%; max-width: 320px;">
-                                <p class="small text-muted mb-2">Scan a local subnet for port 554 (RTSP).</p>
-                                <div class="input-group input-group-sm mb-2">
-                                    <input type="text" id="scanSubnetInput" class="form-control" placeholder="192.168.1.0/24" value="192.168.1.0/24">
-                                    <button class="btn btn-primary" type="button" id="scanSubnetBtn" onclick="runNetworkScan()">Scan</button>
-                                </div>
-                                <div id="scanSpinner" class="text-center d-none mb-2">
-                                    <div class="spinner-border spinner-border-sm text-info" role="status"></div>
-                                    <span class="ms-2 small text-muted">Sweeping subnet...</span>
-                                </div>
-                                <div id="scanResults" class="small mt-2"></div>
-                                <div id="bulkAddOptions" class="d-none mt-3 pt-2 border-top">
-                                    <label class="form-label small fw-bold mb-1">Mass-Add Selected</label>
-                                    <select id="bulkMfg" class="form-select form-select-sm mb-1">
-                                        <option value="Other">Other (FFmpeg RTSP)</option>
-                                        <option value="Hanwha">Hanwha / Wisenet</option>
-                                        <option value="Hikvision">Hikvision</option>
-                                        <option value="Dahua">Dahua</option>
-                                    </select>
-                                    <div class="input-group input-group-sm mb-2">
-                                        <input type="text" id="bulkUser" class="form-control" placeholder="Shared User">
-                                        <input type="password" id="bulkPass" class="form-control" placeholder="Shared Pass">
+                            {% if current_user.role == 'admin' %}
+                            <hr>
+                            <div class="d-flex justify-content-between align-items-center mb-2">
+                                <h6 class="mb-0">Add Camera</h6>
+                                <div class="dropdown">
+                                    <button class="btn btn-outline-info btn-sm dropdown-toggle py-0" type="button" data-bs-toggle="dropdown" data-bs-auto-close="outside" aria-expanded="false">
+                                        Auto-Discover
+                                    </button>
+                                    <div class="dropdown-menu dropdown-menu-end p-3 shadow" style="width: 100%; max-width: 320px;">
+                                        <p class="small text-muted mb-2">Scan a local subnet for port 554 (RTSP).</p>
+                                        <div class="input-group input-group-sm mb-2">
+                                            <input type="text" id="scanSubnetInput" class="form-control" placeholder="192.168.1.0/24" value="192.168.1.0/24">
+                                            <button class="btn btn-primary" type="button" id="scanSubnetBtn" onclick="runNetworkScan()">Scan</button>
+                                        </div>
+                                        <div id="scanSpinner" class="text-center d-none mb-2">
+                                            <div class="spinner-border spinner-border-sm text-info" role="status"></div>
+                                            <span class="ms-2 small text-muted">Sweeping subnet...</span>
+                                        </div>
+                                        <div id="scanResults" class="small mt-2"></div>
+                                        <div id="bulkAddOptions" class="d-none mt-3 pt-2 border-top">
+                                            <label class="form-label small fw-bold mb-1">Mass-Add Selected</label>
+                                            <select id="bulkMfg" class="form-select form-select-sm mb-1">
+                                                <option value="Other">Other (FFmpeg RTSP)</option>
+                                                <option value="Hanwha">Hanwha / Wisenet</option>
+                                                <option value="Hikvision">Hikvision</option>
+                                                <option value="Dahua">Dahua</option>
+                                            </select>
+                                            <div class="input-group input-group-sm mb-2">
+                                                <input type="text" id="bulkUser" class="form-control" placeholder="Shared User">
+                                                <input type="password" id="bulkPass" class="form-control" placeholder="Shared Pass">
+                                            </div>
+                                            <button class="btn btn-success btn-sm w-100" id="submitBulkBtn" onclick="submitBulkAdd()">Add Checked Cameras</button>
+                                        </div>
                                     </div>
-                                    <button class="btn btn-success btn-sm w-100" id="submitBulkBtn" onclick="submitBulkAdd()">Add Checked Cameras</button>
                                 </div>
                             </div>
+
+                            <form action="/add_camera" method="POST">
+                                <div class="row gx-2 mb-2">
+                                    <div class="col-md-3">
+                                        <select name="switch_id" class="form-select form-select-sm">
+                                            <option value="" selected>None (Standalone)</option>
+                                            {% for s in switches %}
+                                            <option value="{{ s.id }}">{{ s.name }}</option>
+                                            {% endfor %}
+                                        </select>
+                                    </div>
+                                    <div class="col-md-3"><input type="text" name="name" class="form-control form-control-sm" placeholder="Cam Name" required></div>
+                                    <div class="col-md-3"><input type="text" name="ip" class="form-control form-control-sm" placeholder="IP / Hostname" required></div>
+                                    <div class="col-md-3">
+                                        <select name="manufacturer" class="form-select form-select-sm" required>
+                                            <option value="Other">Other (FFmpeg RTSP)</option>
+                                            <option value="Hanwha">Hanwha / Wisenet</option>
+                                            <option value="Hikvision">Hikvision</option>
+                                            <option value="Dahua">Dahua</option>
+                                            <option value="Amcrest">Amcrest</option>
+                                            <option value="Axis">Axis</option>
+                                            <option value="Foscam">Foscam</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="row gx-2">
+                                    <div class="col-md-3"><input type="text" name="username" class="form-control form-control-sm" placeholder="Camera User"></div>
+                                    <div class="col-md-3"><input type="password" name="password" class="form-control form-control-sm" placeholder="Camera Pass"></div>
+                                    <div class="col-md-5"><input type="text" name="stream_url" class="form-control form-control-sm" placeholder="RTSP URL (Fallback/Monitor)" required></div>
+                                    <div class="col-md-1"><button type="submit" class="btn btn-primary btn-sm w-100">+</button></div>
+                                </div>
+                            </form>
+                            {% endif %}
                         </div>
                     </div>
 
-                    <form action="/add_camera" method="POST">
-                        <div class="row gx-2 mb-2">
-                            <div class="col-md-3">
-                                <select name="switch_id" class="form-select form-select-sm">
-                                    <option value="" selected>None (Standalone)</option>
-                                    {% for s in switches %}
-                                    <option value="{{ s.id }}">{{ s.name }}</option>
-                                    {% endfor %}
-                                </select>
-                            </div>
-                            <div class="col-md-3"><input type="text" name="name" class="form-control form-control-sm" placeholder="Cam Name" required></div>
-                            <div class="col-md-3"><input type="text" name="ip" class="form-control form-control-sm" placeholder="IP / Hostname" required></div>
-                            <div class="col-md-3">
-                                <select name="manufacturer" class="form-select form-select-sm" required>
-                                    <option value="Other">Other (FFmpeg RTSP)</option>
-                                    <option value="Hanwha">Hanwha / Wisenet</option>
-                                    <option value="Hikvision">Hikvision</option>
-                                    <option value="Dahua">Dahua</option>
-                                    <option value="Amcrest">Amcrest</option>
-                                    <option value="Axis">Axis</option>
-                                    <option value="Foscam">Foscam</option>
-                                </select>
-                            </div>
-                        </div>
-                        <div class="row gx-2">
-                            <div class="col-md-3"><input type="text" name="username" class="form-control form-control-sm" placeholder="Camera User"></div>
-                            <div class="col-md-3"><input type="password" name="password" class="form-control form-control-sm" placeholder="Camera Pass"></div>
-                            <div class="col-md-5"><input type="text" name="stream_url" class="form-control form-control-sm" placeholder="RTSP URL (Fallback/Monitor)" required></div>
-                            <div class="col-md-1"><button type="submit" class="btn btn-primary btn-sm w-100">+</button></div>
-                        </div>
-                    </form>
-                    {% endif %}
                 </div>
             </div>
         </div>
+
+        {% if current_user.role in ['admin', 'operator'] %}
+        <div class="tab-pane fade" id="tab-diagnostics" role="tabpanel">
+            <div class="row">
+                <div class="col-lg-6 mb-4">
+                    <div class="card h-100 shadow-sm border-info">
+                        <div class="card-header border-info text-info"><h5 class="mb-0">Manual Diagnostic Tool</h5></div>
+                        <div class="card-body">
+                            <div class="input-group mb-3">
+                                <input type="text" id="diagIp" class="form-control" placeholder="IP or Hostname (e.g. 192.168.1.5)">
+                                <button class="btn btn-outline-info" type="button" id="pingBtn" onclick="runPing()">Ping</button>
+                                <button class="btn btn-outline-warning" type="button" id="traceBtn" onclick="runTrace()">Trace</button>
+                            </div>
+                            
+                            <div id="diagSpinner" class="text-center d-none mb-2">
+                                <div class="spinner-border spinner-border-sm text-info" role="status"></div>
+                                <span id="diagSpinnerText" class="ms-2 small text-muted">Running diagnostic...</span>
+                            </div>
+                            
+                            <pre id="diagOutput" class="bg-black text-light p-3 rounded small d-none" style="max-height: 300px; overflow-y: auto; font-family: monospace;"></pre>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="col-lg-6 mb-4">
+                    <div class="card h-100 shadow-sm border-warning">
+                        <div class="card-header border-warning text-warning"><h5 class="mb-0">WAN Speed Test</h5></div>
+                        <div class="card-body">
+                            <p class="small text-muted mb-4">Test the external internet connection speed of the gateway system.</p>
+                            
+                            <div id="speedtestDisplay" class="row text-center mb-4 d-none">
+                                <div class="col-4 border-end"><small class="text-muted d-block text-uppercase mb-1">Ping</small><h4 id="st-ping" class="text-info mb-0">-</h4></div>
+                                <div class="col-4 border-end"><small class="text-muted d-block text-uppercase mb-1">Download</small><h4 id="st-download" class="text-success mb-0">-</h4></div>
+                                <div class="col-4"><small class="text-muted d-block text-uppercase mb-1">Upload</small><h4 id="st-upload" class="text-warning mb-0">-</h4></div>
+                                <div class="col-12 mt-3"><small class="text-muted">Target Server: <span id="st-isp" class="fw-bold text-light">-</span></small></div>
+                            </div>
+                            
+                            <div id="speedtestSpinner" class="text-center d-none mb-4">
+                                <div class="spinner-border text-warning" role="status"></div>
+                                <div class="mt-2 small text-muted">Running network benchmarks (takes ~30s)...</div>
+                            </div>
+                            
+                            <button class="btn btn-warning w-100 fw-bold" type="button" id="speedtestBtn" onclick="runSpeedTest()">Initiate Speed Test</button>
+                            <div id="speedtestError" class="alert alert-danger py-2 small mt-3 d-none"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+
+        {% if current_user.role == 'admin' %}
+        <div class="tab-pane fade" id="tab-admin" role="tabpanel">
+            <div class="row">
+                <div class="col-lg-6 mb-4">
+                    <div class="card h-100 shadow-sm">
+                        <div class="card-header"><h5 class="mb-0">Global Configuration</h5></div>
+                        <div class="card-body bg-body-tertiary">
+                            <form action="/update_settings" method="POST">
+                                <div class="mb-3">
+                                    <label class="form-label small text-muted fw-bold mb-1">MQTT Broker IP</label>
+                                    <input type="text" name="mqtt_broker" class="form-control" value="{{ settings.mqtt_broker }}" required>
+                                </div>
+                                <div class="row mb-3">
+                                    <div class="col-6">
+                                        <label class="form-label small text-muted fw-bold mb-1">MQTT Port</label>
+                                        <input type="number" name="mqtt_port" class="form-control" value="{{ settings.mqtt_port }}" required>
+                                    </div>
+                                    <div class="col-6">
+                                        <label class="form-label small text-muted fw-bold mb-1">Check Interval (Sec)</label>
+                                        <input type="number" name="check_interval" class="form-control" value="{{ settings.check_interval }}" required>
+                                    </div>
+                                </div>
+                                <div class="mb-4">
+                                    <label class="form-label small text-muted fw-bold mb-1">MQTT Topic Prefix</label>
+                                    <input type="text" name="mqtt_prefix" class="form-control" value="{{ settings.mqtt_prefix }}" required>
+                                </div>
+                                <button type="submit" class="btn btn-primary w-100">Save Network Settings</button>
+                            </form>
+                            
+                            <hr class="my-4 border-secondary">
+                            
+                            <h6 class="mb-3">Configuration Backup & Restore</h6>
+                            <div class="d-flex gap-2 mb-4">
+                                <a href="/export_config" class="btn btn-outline-success w-50">Export System</a>
+                                <button type="button" class="btn btn-outline-info w-50" data-bs-toggle="modal" data-bs-target="#importModal">Import System</button>
+                            </div>
+
+                            <hr class="my-4 border-secondary">
+                            <form action="/test_alert" method="POST">
+                                <button type="submit" class="btn btn-outline-warning btn-sm w-100">Simulate Zabbix MQTT Alert</button>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="col-lg-6 mb-4">
+                    <div class="card h-100 shadow-sm">
+                        <div class="card-header"><h5 class="mb-0">Access Management</h5></div>
+                        <div class="card-body">
+                            <div class="table-responsive mb-3">
+                                <table class="table table-hover align-middle text-nowrap">
+                                    <thead class="table-dark"><tr><th>Username</th><th>Role</th><th></th></tr></thead>
+                                    <tbody>
+                                        {% for u in users %}
+                                        <tr>
+                                            <td class="fw-bold">{{ u.username }}</td>
+                                            <td><span class="badge bg-secondary">{{ u.role }}</span></td>
+                                            <td class="text-end">
+                                                {% if u.id != current_user.id %}
+                                                <a href="/delete_user/{{ u.id }}" class="btn btn-outline-danger btn-sm">Delete</a>
+                                                {% endif %}
+                                            </td>
+                                        </tr>
+                                        {% endfor %}
+                                    </tbody>
+                                </table>
+                            </div>
+                            
+                            <div class="p-3 bg-dark rounded border border-secondary">
+                                <h6 class="mb-3">Provision Local Account</h6>
+                                <form action="/add_user" method="POST">
+                                    <div class="mb-2"><input type="text" name="username" class="form-control" placeholder="Username" required></div>
+                                    <div class="mb-2"><input type="password" name="password" class="form-control" placeholder="Secure Password" required></div>
+                                    <div class="mb-3">
+                                        <select name="role" class="form-select" required>
+                                            <option value="user">Viewer Only (Read-Only)</option>
+                                            <option value="operator">Operator (Diagnostics + Silence)</option>
+                                            <option value="admin">Administrator (Full Config)</option>
+                                        </select>
+                                    </div>
+                                    <button type="submit" class="btn btn-secondary w-100">Create Account</button>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+
     </div>
 
     <div class="modal fade" id="previewModal" tabindex="-1" aria-hidden="true">
@@ -453,6 +506,7 @@
                 }
             });
         }
+        
         // Snapshot Preview Script
         let modalInstance;
         let previewInterval;
@@ -710,7 +764,7 @@
             }
         });
 
-socket.on('speedtest_result', function(data) {
+        socket.on('speedtest_result', function(data) {
             const btn = document.getElementById('speedtestBtn');
             const spinner = document.getElementById('speedtestSpinner');
             const display = document.getElementById('speedtestDisplay');

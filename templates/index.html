@@ -438,11 +438,23 @@
         function toggleSilence(type, id, hours) {
             const formData = new FormData();
             formData.append('hours', hours);
+
+            // 1. Give instant feedback to the user
+            const badge = document.getElementById(`status-${type}-${id}`);
+            badge.innerText = 'Updating...';
+            badge.className = 'badge bg-secondary';
+
             fetch('/toggle_silence/' + type + '/' + id, { method: 'POST', body: formData })
             .then(res => res.json())
-            .then(data => { if (data.success) { location.reload(); } });
+            .then(data => { 
+                if (data.success) { 
+                    // 2. We can either reload or let the WebSocket handle the final state
+                    location.reload(); 
+                } else {
+                    alert("Failed to silence device.");
+                }
+            });
         }
-
         // Snapshot Preview Script
         let modalInstance;
         let previewInterval;

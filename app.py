@@ -513,9 +513,16 @@ def monitor_loop():
                                     img = Image.open(io.BytesIO(snap_bytes))
                                     current_hash = imagehash.average_hash(img)
                                     last_hash = previous_hashes.get(cam_id)
-                                    if last_hash is not None and (current_hash - last_hash) <= 2: is_frozen = True
+                                    
+                                    # Fix: Only check for freezing if the camera was previously UP
+                                    if last_hash is not None and cam['status'] == 'UP' and (current_hash - last_hash) <= 2: 
+                                        is_frozen = True
+                                        
                                     previous_hashes[cam_id] = current_hash
                                 except Exception: pass
+                            else:
+                                # Clear the hash cache if the stream drops so it doesn't lock up upon recovery
+                                previous_hashes.pop(cam_id, None)
                             
                             if cam_silenced:
                                 client.publish(f"{prefix}/{cam_name}/ping", "MAINTENANCE", retain=True)
@@ -593,9 +600,16 @@ def monitor_loop():
                             img = Image.open(io.BytesIO(snap_bytes))
                             current_hash = imagehash.average_hash(img)
                             last_hash = previous_hashes.get(cam_id)
-                            if last_hash is not None and (current_hash - last_hash) <= 2: is_frozen = True
+                            
+                            # Fix: Only check for freezing if the camera was previously UP
+                            if last_hash is not None and cam['status'] == 'UP' and (current_hash - last_hash) <= 2: 
+                                is_frozen = True
+                                
                             previous_hashes[cam_id] = current_hash
                         except Exception: pass
+                    else:
+                        # Clear the hash cache if the stream drops
+                        previous_hashes.pop(cam_id, None)
                             
                     if cam_silenced:
                         client.publish(f"{prefix}/{cam_name}/ping", "MAINTENANCE", retain=True)

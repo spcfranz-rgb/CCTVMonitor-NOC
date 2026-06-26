@@ -1,36 +1,40 @@
 # Use a lightweight Python base image
 FROM python:3.9-slim
 
-# Install system dependencies, fetch the Ookla repository, install speedtest, and clean up
+# Install system dependencies, determine CPU architecture, fetch Ookla native binary, and clean up
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         iputils-ping \
+        traceroute \
         ffmpeg \
         sqlite3 \
         curl \
-        gnupg2 \
+        wget \
+        tar \
         ca-certificates && \
-    curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash && \
-    apt-get install -y --no-install-recommends speedtest && \
+    ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "arm64" ]; then \
+        wget -qO- https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz | tar xvz -C /usr/local/bin speedtest; \
+    elif [ "$ARCH" = "amd64" ]; then \
+        wget -qO- https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz | tar xvz -C /usr/local/bin speedtest; \
+    else \
+        echo "Unsupported architecture" && exit 1; \
+    fi && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Set the working directory inside the container
 WORKDIR /app
 
-# Copy the requirements file and install dependencies
-# We append Gunicorn here so you don't have to manually edit requirements.txt
+# Copy requirements and install dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt gunicorn==21.2.0
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of your application code into the container
+# Copy the application code into the container
 COPY . .
-
-# Sanitize the startup script (removes Windows line-endings if copy-pasted) and make it executable
-RUN sed -i 's/\r$//' start.sh && chmod +x start.sh
 
 # Expose the port the web GUI will run on
 EXPOSE 5000
 
-# Boot the container using our custom startup script
-CMD ["./start.sh"]
+# Boot the container using Gunicorn with Eventlet async workers
+CMD ["gunicorn", "--worker-class", "eventlet", "-w", "1", "-b", "0.0.0.0:5000", "app:app"]

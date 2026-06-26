@@ -1,26 +1,52 @@
 services:
-  cctv-dashboard:
-    # This tells Docker to pull and build directly from your GitHub repo!
-    # The '#main' at the end specifies which branch to build from.
-    build: https://github.com/spcfranz-rgb/CCTVMonitor-NOC.git#main
-    
-    container_name: cctv-dashboard
+  mqtt-broker:
+    image: eclipse-mosquitto:latest
+    container_name: cctv-mqtt
     restart: unless-stopped
     ports:
-      - "5000:5000"
-    
-    # Using environment variable interpolation here means Docker will 
-    # automatically look for a .env file sitting next to this docker-compose.yml
+      - "1883:1883"
+    volumes:
+      # CONFIG: Relative mount (Pulled fresh from GitHub every deployment)
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
+      
+      # DATA: Absolute mounts (Survives repo wipes)
+      - /opt/cctv-data/mosquitto/data:/mosquitto/data
+      - /opt/cctv-data/mosquitto/log:/mosquitto/log
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+        compress: "true"
+
+  cctv-dashboard:
+    build: .
+    container_name: lighthouse-dashboard
+    restart: unless-stopped
+    network_mode: "host" 
+    user: root
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
     environment:
       - SECRET_KEY=${SECRET_KEY}
       - COMPANY_LOGO_URL=${COMPANY_LOGO_URL}
       - CUSTOMER_LOGO_URL=${CUSTOMER_LOGO_URL}
-      
-      # Uncomment these in your .env file to enable SSO
-      # - AUTHENTIK_URL=${AUTHENTIK_URL}
-      # - AUTHENTIK_CLIENT_ID=${AUTHENTIK_CLIENT_ID}
-      # - AUTHENTIK_CLIENT_SECRET=${AUTHENTIK_CLIENT_SECRET}
-      
+      - DEFAULT_MQTT_BROKER=127.0.0.1 
+      - DEFAULT_MQTT_PORT=1883
+      - AUTHENTIK_URL=${AUTHENTIK_URL}
+      - AUTHENTIK_CLIENT_ID=${AUTHENTIK_CLIENT_ID}
+      - AUTHENTIK_CLIENT_SECRET=${AUTHENTIK_CLIENT_SECRET}
     volumes:
-      # This binds the persistent database and logos to the host machine
-      - ./data:/app/data
+      # DATA: Absolute mount for the Python backend database (Survives repo wipes)
+      - /opt/cctv-data/dashboard:/app/data
+    tmpfs:
+      - /app/data_ram
+    depends_on:
+      - mqtt-broker
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+        compress: "true"

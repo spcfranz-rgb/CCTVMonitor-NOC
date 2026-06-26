@@ -32,7 +32,8 @@ from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 from urllib.parse import urlparse
 from functools import wraps
 
-from flask import Flask, render_template, request, redirect, url_for, abort, flash, Response, jsonify, send_from_directory
+# FIX: Added 'session' to the imports for idle timeout tracking
+from flask import Flask, render_template, request, redirect, url_for, abort, flash, Response, jsonify, send_from_directory, session
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from flask_wtf.csrf import CSRFProtect
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -117,15 +118,38 @@ if AUTHENTIK_URL:
     )
 
 # ==========================================
+# DATABASE & LOGGING HELPERS
+# ==========================================
+DB_PATH_DISK = '/app/data/cctv.db'        
+DB_PATH_RAM = '/app/data_ram/cctv.db'     
+force_check_event = Event()
+
+def get_db():
+    os.makedirs(os.path.dirname(DB_PATH_RAM), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH_RAM, check_same_thread=False, timeout=30)
+    try: conn.execute("PRAGMA journal_mode=WAL;")
+    except sqlite3.OperationalError: pass
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# NEW: Unified Audit Logging Function
+def log_audit(device_type, device_name, status):
+    """Securely inserts user actions into the event log database."""
+    try:
+        conn = get_db()
+        conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)",
+                     (time.time(), device_type, device_name, status))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Failed to log audit event: {e}")
+
+# ==========================================
 # AUTHENTICATION & GLOBALS
 # ==========================================
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = 'login'
-
-DB_PATH_DISK = '/app/data/cctv.db'        
-DB_PATH_RAM = '/app/data_ram/cctv.db'     
-force_check_event = Event()
 
 class User(UserMixin):
     def __init__(self, id, username, role):
@@ -161,6 +185,32 @@ def trigger_monitor_check():
     if not force_check_event.ready():
         force_check_event.send(True)
 
+# NEW: Backend Idle Timeout Enforcement
+@app.before_request
+def manage_idle_timeout():
+    # Skip tracking for static assets and tunneled proxies to prevent false timeouts
+    if request.endpoint in ['static', 'serve_local_logo'] or request.path.startswith('/tunnel/'):
+        return 
+        
+    if current_user.is_authenticated:
+        now = time.time()
+        last_active = session.get('last_active', now)
+        
+        conn = get_db()
+        idle_row = conn.execute("SELECT value FROM settings WHERE key = 'idle_timeout'").fetchone()
+        conn.close()
+        
+        idle_mins = int(idle_row['value']) if idle_row else 20
+        
+        if (now - last_active) > (idle_mins * 60):
+            log_audit('System', current_user.username, 'Auto-logged out (Idle Timeout)')
+            logout_user()
+            session.pop('last_active', None)
+            flash('You have been automatically logged out due to inactivity.', 'warning')
+            return redirect(url_for('login'))
+            
+        session['last_active'] = now
+
 # ==========================================
 # DATABASE INITIALIZATION & RAM SYNC
 # ==========================================
@@ -178,14 +228,6 @@ def init_ram_db():
         except Exception as e:
             print(f"Boot restoration failed: {e}")
 
-def get_db():
-    os.makedirs(os.path.dirname(DB_PATH_RAM), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH_RAM, check_same_thread=False, timeout=30)
-    try: conn.execute("PRAGMA journal_mode=WAL;")
-    except sqlite3.OperationalError: pass
-    conn.row_factory = sqlite3.Row
-    return conn
-
 def init_db():
     init_ram_db() 
     conn = get_db()
@@ -194,19 +236,22 @@ def init_db():
     cursor.execute("CREATE TABLE IF NOT EXISTS switches (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, ip TEXT, status TEXT DEFAULT 'UNKNOWN')")
     cursor.execute("CREATE TABLE IF NOT EXISTS cameras (id INTEGER PRIMARY KEY AUTOINCREMENT, switch_id INTEGER, name TEXT UNIQUE, ip TEXT, stream_url TEXT, status TEXT DEFAULT 'UNKNOWN', FOREIGN KEY(switch_id) REFERENCES switches(id))")
     cursor.execute("CREATE TABLE IF NOT EXISTS event_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, device_type TEXT, device_name TEXT, status TEXT)")
-    try:
-        cursor.execute("ALTER TABLE cameras ADD COLUMN manufacturer TEXT DEFAULT 'Other'")
-        cursor.execute("ALTER TABLE cameras ADD COLUMN username TEXT DEFAULT ''")
-        cursor.execute("ALTER TABLE cameras ADD COLUMN password TEXT DEFAULT ''")
+    
+    try: cursor.execute("ALTER TABLE cameras ADD COLUMN manufacturer TEXT DEFAULT 'Other'")
     except sqlite3.OperationalError: pass
-    try:
-        cursor.execute("ALTER TABLE switches ADD COLUMN silenced_until REAL DEFAULT 0")
-        cursor.execute("ALTER TABLE cameras ADD COLUMN silenced_until REAL DEFAULT 0")
+    try: cursor.execute("ALTER TABLE cameras ADD COLUMN username TEXT DEFAULT ''")
     except sqlite3.OperationalError: pass
-    try:
-        cursor.execute("ALTER TABLE switches ADD COLUMN mac_address TEXT DEFAULT ''")
-        cursor.execute("ALTER TABLE cameras ADD COLUMN mac_address TEXT DEFAULT ''")
+    try: cursor.execute("ALTER TABLE cameras ADD COLUMN password TEXT DEFAULT ''")
     except sqlite3.OperationalError: pass
+    try: cursor.execute("ALTER TABLE switches ADD COLUMN silenced_until REAL DEFAULT 0")
+    except sqlite3.OperationalError: pass
+    try: cursor.execute("ALTER TABLE cameras ADD COLUMN silenced_until REAL DEFAULT 0")
+    except sqlite3.OperationalError: pass
+    try: cursor.execute("ALTER TABLE switches ADD COLUMN mac_address TEXT DEFAULT ''")
+    except sqlite3.OperationalError: pass
+    try: cursor.execute("ALTER TABLE cameras ADD COLUMN mac_address TEXT DEFAULT ''")
+    except sqlite3.OperationalError: pass
+    
     cursor.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT, role TEXT)")
     
     cursor.execute("SELECT count(*) FROM settings")
@@ -215,9 +260,14 @@ def init_db():
             ('mqtt_broker', os.environ.get('DEFAULT_MQTT_BROKER', '127.0.0.1')),
             ('mqtt_port', os.environ.get('DEFAULT_MQTT_PORT', '1883')),
             ('mqtt_prefix', os.environ.get('DEFAULT_MQTT_PREFIX', 'zabbix/cctv')),
-            ('check_interval', os.environ.get('DEFAULT_CHECK_INTERVAL', '60'))
+            ('check_interval', os.environ.get('DEFAULT_CHECK_INTERVAL', '60')),
+            ('idle_timeout', '20') # NEW
         ]
         cursor.executemany("INSERT INTO settings (key, value) VALUES (?, ?)", settings)
+    else:
+        # Gracefully inject the new config key into an existing database
+        try: cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('idle_timeout', '20')")
+        except sqlite3.OperationalError: pass
         
     cursor.execute("SELECT count(*) FROM users")
     if cursor.fetchone()[0] == 0:
@@ -373,10 +423,8 @@ def threaded_camera_check(cam):
             new_mac = get_mac_address(cam['ip'])
             if new_mac: fetched_mac = new_mac.upper()
 
-        # FIX: Safely construct an authenticated URL if credentials exist in the DB
         auth_url = cam['stream_url']
         if cam.get('username') and cam.get('password') and '@' not in auth_url and auth_url.startswith('rtsp://'):
-            # Formats as rtsp://user:pass@ip:port/stream
             auth_url = f"rtsp://{cam['username']}:{cam['password']}@{auth_url[7:]}"
 
         stream_ok = is_stream_active(auth_url)
@@ -601,6 +649,7 @@ def login():
         
         if user and check_password_hash(user['password'], password):
             login_user(User(user['id'], user['username'], user['role']))
+            log_audit('System', username, 'User Logged In (Local)') # LOG EVENT
             return redirect(url_for('index'))
         else:
             flash('Invalid local username or password', 'danger')
@@ -640,13 +689,17 @@ def auth_callback():
         
     conn.commit()
     conn.close()
+    
     login_user(User(user_id, username, role))
+    log_audit('System', username, 'User Logged In (SSO)') # LOG EVENT
     return redirect(url_for('index'))
 
 @app.route('/logout')
 @login_required
 def logout():
+    log_audit('System', current_user.username, 'User Logged Out') # LOG EVENT
     logout_user()
+    session.pop('last_active', None)
     return redirect(url_for('login'))
 
 @app.route('/')
@@ -696,6 +749,8 @@ def export_logs():
     for log in logs:
         dt_string = datetime.utcfromtimestamp(log['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
         cw.writerow([dt_string, log['device_type'], log['device_name'], log['status']])
+    
+    log_audit('User', current_user.username, 'Exported Event Logs CSV') # LOG EVENT
     return Response(si.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment;filename=cctv_event_logs.csv"})
 
 @app.route('/export_config')
@@ -719,6 +774,7 @@ def export_config():
         cw.writerow(['Camera', parent, c['name'], c['ip'], c['stream_url'], c['manufacturer'], c['username'], decrypt_pwd(c['password'])])
         
     conn.close()
+    log_audit('User', current_user.username, 'Exported System Configuration CSV') # LOG EVENT
     return Response(si.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment;filename=cctv_config.csv"})
 
 @app.route('/download_template')
@@ -792,6 +848,7 @@ def import_config():
         conn.commit()
         conn.close()
         trigger_monitor_check()
+        log_audit('User', current_user.username, 'Imported configuration via CSV') # LOG EVENT
         flash('CSV Configuration imported successfully.', 'success')
     except Exception as e: flash(f'Error importing CSV: {str(e)}', 'danger')
     return redirect(url_for('index'))
@@ -800,6 +857,7 @@ def import_config():
 @login_required
 @operator_required
 def fetch_arp_table():
+    log_audit('User', current_user.username, 'Initiated native L2 ARP scan') # LOG EVENT
     try:
         devices = get_camlan_arp_table()
         return jsonify({"status": "success", "count": len(devices), "interface_scanned": "All Interfaces", "devices": devices}), 200
@@ -816,6 +874,8 @@ def scan_network():
 
     hosts = [str(ip) for ip in network.hosts()]
     if len(hosts) > 1024: return jsonify({'success': False, 'error': 'Subnet too large. Please scan a /22 or smaller.'})
+
+    log_audit('User', current_user.username, f'Initiated network subnet scan on {subnet}') # LOG EVENT
 
     def check_rtsp_port(ip):
         try:
@@ -857,6 +917,7 @@ def add_cameras_bulk():
     conn.commit()
     conn.close()
     trigger_monitor_check()
+    log_audit('User', current_user.username, f'Bulk added {added_count} cameras') # LOG EVENT
     return jsonify({'success': True, 'added': added_count, 'errors': errors})
 
 @app.route('/toggle_silence/<device_type>/<int:id>', methods=['POST'])
@@ -866,11 +927,24 @@ def toggle_silence(device_type, id):
     hours = float(request.form.get('hours', 0))
     silence_until = time.time() + (hours * 3600) if hours > 0 else 0
     conn = get_db()
-    if device_type == 'switch': conn.execute("UPDATE switches SET silenced_until = ? WHERE id = ?", (silence_until, id))
-    elif device_type == 'camera': conn.execute("UPDATE cameras SET silenced_until = ? WHERE id = ?", (silence_until, id))
+    
+    device_name = "Unknown"
+    if device_type == 'switch':
+        conn.execute("UPDATE switches SET silenced_until = ? WHERE id = ?", (silence_until, id))
+        row = conn.execute("SELECT name FROM switches WHERE id = ?", (id,)).fetchone()
+        if row: device_name = row['name']
+    elif device_type == 'camera':
+        conn.execute("UPDATE cameras SET silenced_until = ? WHERE id = ?", (silence_until, id))
+        row = conn.execute("SELECT name FROM cameras WHERE id = ?", (id,)).fetchone()
+        if row: device_name = row['name']
+        
     conn.commit()
     conn.close()
+    
+    action_text = f"Silenced {device_type} '{device_name}' for {hours}h" if hours > 0 else f"Removed silence from {device_type} '{device_name}'"
+    log_audit('User', current_user.username, action_text) # LOG EVENT
     trigger_monitor_check()
+    
     return jsonify({'success': True})
 
 @app.route('/api/ping', methods=['POST'])
@@ -908,6 +982,7 @@ def run_traceroute():
 @login_required
 @operator_required
 def run_speedtest():
+    log_audit('User', current_user.username, 'Initiated WAN Speedtest') # LOG EVENT
     def execute_test():
         try:
             cmd = ['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json']
@@ -953,8 +1028,10 @@ def update_settings():
     conn.execute("UPDATE settings SET value = ? WHERE key = 'mqtt_port'", (request.form['mqtt_port'],))
     conn.execute("UPDATE settings SET value = ? WHERE key = 'mqtt_prefix'", (request.form['mqtt_prefix'],))
     conn.execute("UPDATE settings SET value = ? WHERE key = 'check_interval'", (request.form['check_interval'],))
+    conn.execute("UPDATE settings SET value = ? WHERE key = 'idle_timeout'", (request.form.get('idle_timeout', 20),))
     conn.commit()
     conn.close()
+    log_audit('User', current_user.username, 'Updated Global Gateway Settings') # LOG EVENT
     trigger_monitor_check()
     flash('Settings updated.', 'success')
     return redirect(url_for('index'))
@@ -971,6 +1048,7 @@ def test_alert():
         client.connect(settings_dict.get('mqtt_broker', '127.0.0.1'), int(settings_dict.get('mqtt_port', 1883)), 5)
         client.publish(f"{settings_dict.get('mqtt_prefix', 'zabbix/cctv')}/test_device/ping", "TEST_PING", retain=False)
         client.disconnect()
+        log_audit('User', current_user.username, 'Triggered test MQTT alert') # LOG EVENT
         flash(f'Test alert sent.', 'success')
     except Exception as e: flash(f'MQTT Error: {str(e)}', 'danger')
     return redirect(url_for('index'))
@@ -980,9 +1058,11 @@ def test_alert():
 @admin_required
 def add_switch():
     conn = get_db()
+    name = request.form['name']
     try:
-        conn.execute("INSERT INTO switches (name, ip) VALUES (?, ?)", (request.form['name'], request.form['ip']))
+        conn.execute("INSERT INTO switches (name, ip) VALUES (?, ?)", (name, request.form['ip']))
         conn.commit()
+        log_audit('User', current_user.username, f'Added new switch: {name}') # LOG EVENT
         trigger_monitor_check()
         flash('Switch added.', 'success')
     except sqlite3.IntegrityError: flash('Switch name already exists.', 'danger')
@@ -995,9 +1075,11 @@ def add_switch():
 def edit_switch(id):
     conn = get_db()
     if request.method == 'POST':
+        name = request.form['name']
         try:
-            conn.execute("UPDATE switches SET name = ?, ip = ? WHERE id = ?", (request.form['name'], request.form['ip'], id))
+            conn.execute("UPDATE switches SET name = ?, ip = ? WHERE id = ?", (name, request.form['ip'], id))
             conn.commit()
+            log_audit('User', current_user.username, f'Edited switch config: {name}') # LOG EVENT
             trigger_monitor_check()
             flash('Switch updated.', 'success')
             conn.close()
@@ -1012,10 +1094,13 @@ def edit_switch(id):
 @admin_required
 def delete_switch(id):
     conn = get_db()
+    row = conn.execute("SELECT name FROM switches WHERE id = ?", (id,)).fetchone()
+    name = row['name'] if row else "Unknown"
     conn.execute("DELETE FROM cameras WHERE switch_id = ?", (id,))
     conn.execute("DELETE FROM switches WHERE id = ?", (id,))
     conn.commit()
     conn.close()
+    log_audit('User', current_user.username, f'Deleted switch: {name}') # LOG EVENT
     trigger_monitor_check()
     flash('Switch deleted.', 'success')
     return redirect(url_for('index'))
@@ -1025,11 +1110,13 @@ def delete_switch(id):
 @admin_required
 def add_camera():
     switch_id = request.form.get('switch_id') or None
+    name = request.form['name']
     conn = get_db()
     try:
         conn.execute("""INSERT INTO cameras (switch_id, name, ip, stream_url, manufacturer, username, password) VALUES (?, ?, ?, ?, ?, ?, ?)""", 
-                     (switch_id, request.form['name'], request.form['ip'], request.form['stream_url'], request.form.get('manufacturer', 'Other'), request.form.get('username', ''), encrypt_pwd(request.form.get('password', ''))))
+                     (switch_id, name, request.form['ip'], request.form['stream_url'], request.form.get('manufacturer', 'Other'), request.form.get('username', ''), encrypt_pwd(request.form.get('password', ''))))
         conn.commit()
+        log_audit('User', current_user.username, f'Added new camera: {name}') # LOG EVENT
         trigger_monitor_check()
         flash('Camera added.', 'success')
     except sqlite3.IntegrityError: flash('Camera name already exists.', 'danger')
@@ -1043,10 +1130,12 @@ def edit_camera(id):
     conn = get_db()
     if request.method == 'POST':
         switch_id = request.form.get('switch_id') or None 
+        name = request.form['name']
         try:
             conn.execute("""UPDATE cameras SET switch_id = ?, name = ?, ip = ?, stream_url = ?, manufacturer = ?, username = ?, password = ? WHERE id = ?""", 
-                         (switch_id, request.form['name'], request.form['ip'], request.form['stream_url'], request.form.get('manufacturer', 'Other'), request.form.get('username', ''), encrypt_pwd(request.form.get('password', '')), id))
+                         (switch_id, name, request.form['ip'], request.form['stream_url'], request.form.get('manufacturer', 'Other'), request.form.get('username', ''), encrypt_pwd(request.form.get('password', '')), id))
             conn.commit()
+            log_audit('User', current_user.username, f'Edited camera config: {name}') # LOG EVENT
             trigger_monitor_check()
             flash('Camera updated.', 'success')
             conn.close()
@@ -1066,9 +1155,12 @@ def edit_camera(id):
 @admin_required
 def delete_camera(id):
     conn = get_db()
+    row = conn.execute("SELECT name FROM cameras WHERE id = ?", (id,)).fetchone()
+    name = row['name'] if row else "Unknown"
     conn.execute("DELETE FROM cameras WHERE id = ?", (id,))
     conn.commit()
     conn.close()
+    log_audit('User', current_user.username, f'Deleted camera: {name}') # LOG EVENT
     trigger_monitor_check()
     flash('Camera deleted.', 'success')
     return redirect(url_for('index'))
@@ -1084,6 +1176,7 @@ def add_user():
     try:
         conn.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", (username, password, role))
         conn.commit()
+        log_audit('User', current_user.username, f'Provisioned new account for: {username}') # LOG EVENT
         flash('User added.', 'success')
     except sqlite3.IntegrityError: flash('Username already exists.', 'danger')
     conn.close()
@@ -1097,9 +1190,12 @@ def delete_user(id):
         flash('You cannot delete yourself.', 'danger')
         return redirect(url_for('index'))
     conn = get_db()
+    row = conn.execute("SELECT username FROM users WHERE id = ?", (id,)).fetchone()
+    uname = row['username'] if row else "Unknown"
     conn.execute("DELETE FROM users WHERE id = ?", (id,))
     conn.commit()
     conn.close()
+    log_audit('User', current_user.username, f'Deleted account: {uname}') # LOG EVENT
     flash('User deleted.', 'success')
     return redirect(url_for('index'))
 

@@ -1049,19 +1049,26 @@ def run_speedtest():
     
     def execute_test():
         try:
-            cmd = ['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json']
-            process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+            # FIX 1: Provide a guaranteed writable HOME directory so Ookla can save its license file
+            env = os.environ.copy()
+            env['HOME'] = '/tmp'
             
-            if process.returncode == 0:
-                output_text = process.stdout
-                
-                # Safely parse JSON from the Speedtest CLI
-                json_start = output_text.find('{')
-                json_end = output_text.rfind('}') + 1
-                if json_start != -1 and json_end != 0:
-                    output_text = output_text[json_start:json_end]
-
-                data = json.loads(output_text)
+            cmd = ['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json']
+            process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60, env=env)
+            
+            # FIX 2: Bulletproof bottom-up JSON extraction. 
+            # This ignores ALL plain text warnings printed above the payload.
+            data = None
+            for line in reversed(process.stdout.splitlines()):
+                line = line.strip()
+                if line.startswith('{') and line.endswith('}'):
+                    try:
+                        data = json.loads(line)
+                        break
+                    except Exception: continue
+            
+            # Ensure the process succeeded AND the JSON contains actual test results
+            if process.returncode == 0 and data and 'download' in data:
                 download = round((data['download']['bandwidth'] * 8) / 1000000, 2)
                 upload = round((data['upload']['bandwidth'] * 8) / 1000000, 2)
                 ping = round(data['ping']['latency'], 1)
@@ -1080,18 +1087,25 @@ def run_speedtest():
 
                 socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now}, to=sid)
             else: 
-                err_msg = process.stderr.strip() or "Unknown execution error."
+                # Fallback: Extract the error message cleanly
+                err_msg = "Unknown execution error."
+                if data and 'error' in data: err_msg = data['error']
+                elif process.stderr: err_msg = process.stderr.strip()
+                
                 try:
-                    fallback = subprocess.run(['speedtest', '--accept-license', '--accept-gdpr', '-L', '-f', 'json'], capture_output=True, text=True, timeout=10)
-                    fallback_text = fallback.stdout
-                    f_start = fallback_text.find('{')
-                    f_end = fallback_text.rfind('}') + 1
-                    if f_start != -1 and f_end != 0:
-                        fallback_text = fallback_text[f_start:f_end]
-                        
-                    servers = json.loads(fallback_text).get('servers', [])
+                    # Run the fallback command with the same environment variables
+                    fallback = subprocess.run(['speedtest', '--accept-license', '--accept-gdpr', '-L', '-f', 'json'], capture_output=True, text=True, timeout=10, env=env)
+                    fb_data = None
+                    for line in reversed(fallback.stdout.splitlines()):
+                        line = line.strip()
+                        if line.startswith('{') and line.endswith('}'):
+                            try: fb_data = json.loads(line); break
+                            except Exception: continue
+                            
+                    servers = fb_data.get('servers', []) if fb_data else []
                     if servers: err_msg += " | Available Nearby Servers: " + ", ".join([f"{s['name']} ({s['location']})" for s in servers[:3]])
                 except Exception: pass
+                
                 socketio.emit('speedtest_result', {'success': False, 'error': err_msg}, to=sid)
         except Exception as e: 
             socketio.emit('speedtest_result', {'success': False, 'error': str(e)}, to=sid)

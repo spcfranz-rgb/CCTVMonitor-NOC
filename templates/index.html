@@ -732,6 +732,7 @@
         function runTrace() {
             const ip = diagIpInput.value.trim();
             if (!ip || !/^[\w.-]+$/.test(ip)) { showToast('Please enter a valid IP address or Hostname.', 'warning'); return; }
+            if (!socket.id) { showToast('WebSocket not connected. Please wait a moment and try again.', 'warning'); return; }
 
             pingBtn.disabled = true; traceBtn.disabled = true; diagIpInput.disabled = true;
             diagSpinnerText.innerText = 'Tracing route (may take up to 60s)...';
@@ -749,6 +750,7 @@
             const formData = new FormData(); 
             formData.append('target', ip);
             formData.append('csrf_token', csrfToken);
+            formData.append('sid', socket.id); // Send the session ID
 
             fetch('/api/traceroute', { method: 'POST', body: formData })
             .then(res => res.json())
@@ -779,11 +781,15 @@
             const spinner = document.getElementById('speedtestSpinner');
             const display = document.getElementById('speedtestDisplay');
             const errDiv = document.getElementById('speedtestError');
+            
+            if (!socket.id) { showToast('WebSocket not connected. Please wait a moment and try again.', 'warning'); return; }
 
             btn.disabled = true; spinner.classList.remove('d-none');
             errDiv.classList.add('d-none'); display.classList.add('d-none');
 
-            const formData = new FormData(); formData.append('csrf_token', csrfToken);
+            const formData = new FormData(); 
+            formData.append('csrf_token', csrfToken);
+            formData.append('sid', socket.id); // Send the session ID
 
             fetch('/api/speedtest', { method: 'POST', body: formData })
             .then(res => res.json())

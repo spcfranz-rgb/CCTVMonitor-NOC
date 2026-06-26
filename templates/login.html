@@ -29,7 +29,9 @@
 
                 {% if sso_configured and not fallback %}
                     <p class="text-muted small mb-4">Single Sign-On is managed securely by Authentik.</p>
-                    <a href="/login" class="btn btn-primary w-100 py-2 mb-3">Login via SSO</a>
+                    
+                    <a href="/login/sso" class="btn btn-primary w-100 py-2 mb-3 fw-bold">Login via SSO</a>
+                    
                     <a href="?fallback=true" class="text-muted small text-decoration-none">Emergency Local Access</a>
                 {% else %}
                     <form action="/login" method="POST">

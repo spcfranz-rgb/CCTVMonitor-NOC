@@ -111,16 +111,64 @@ def decrypt_pwd(pwd):
             return '' 
         return pwd
 
-# --- AUTHENTIK OIDC SETUP ---
+# ==========================================
+# OPENID CONNECT (OIDC) / MULTI-TENANT SSO
+# ==========================================
 oauth = OAuth(app)
-AUTHENTIK_URL = os.environ.get('AUTHENTIK_URL')
 
+# 1. Authentik
+AUTHENTIK_URL = os.environ.get('AUTHENTIK_URL')
 if AUTHENTIK_URL:
     oauth.register(
         name='authentik',
         client_id=os.environ.get('AUTHENTIK_CLIENT_ID'),
         client_secret=os.environ.get('AUTHENTIK_CLIENT_SECRET'),
         server_metadata_url=f"{AUTHENTIK_URL.rstrip('/')}/application/o/cctv-dashboard/.well-known/openid-configuration",
+        client_kwargs={'scope': 'openid profile email'}
+    )
+
+# 2. Microsoft 365 / Entra ID
+AZURE_TENANT_ID = os.environ.get('AZURE_TENANT_ID')
+if AZURE_TENANT_ID:
+    oauth.register(
+        name='microsoft',
+        client_id=os.environ.get('AZURE_CLIENT_ID'),
+        client_secret=os.environ.get('AZURE_CLIENT_SECRET'),
+        server_metadata_url=f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/v2.0/.well-known/openid-configuration",
+        client_kwargs={'scope': 'openid profile email'}
+    )
+
+# 3. Google Workspace
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
+if GOOGLE_CLIENT_ID:
+    oauth.register(
+        name='google',
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=os.environ.get('GOOGLE_CLIENT_SECRET'),
+        server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+        client_kwargs={'scope': 'openid profile email'}
+    )
+
+# 4. Okta
+OKTA_DOMAIN = os.environ.get('OKTA_DOMAIN')
+if OKTA_DOMAIN:
+    oauth.register(
+        name='okta',
+        client_id=os.environ.get('OKTA_CLIENT_ID'),
+        client_secret=os.environ.get('OKTA_CLIENT_SECRET'),
+        server_metadata_url=f"https://{OKTA_DOMAIN.rstrip('/')}/.well-known/openid-configuration",
+        client_kwargs={'scope': 'openid profile email groups'}
+    )
+
+# 5. Keycloak
+KEYCLOAK_URL = os.environ.get('KEYCLOAK_URL')
+KEYCLOAK_REALM = os.environ.get('KEYCLOAK_REALM')
+if KEYCLOAK_URL and KEYCLOAK_REALM:
+    oauth.register(
+        name='keycloak',
+        client_id=os.environ.get('KEYCLOAK_CLIENT_ID'),
+        client_secret=os.environ.get('KEYCLOAK_CLIENT_SECRET'),
+        server_metadata_url=f"{KEYCLOAK_URL.rstrip('/')}/realms/{KEYCLOAK_REALM}/.well-known/openid-configuration",
         client_kwargs={'scope': 'openid profile email'}
     )
 
@@ -827,37 +875,77 @@ def login():
             return redirect(url_for('login', fallback='true'))
 
     fallback = request.args.get('fallback') == 'true'
-    return render_template('login.html', fallback=fallback, sso_configured=bool(AUTHENTIK_URL))
+    return render_template('login.html', 
+                           fallback=fallback, 
+                           authentik_active=bool(AUTHENTIK_URL),
+                           microsoft_active=bool(AZURE_TENANT_ID),
+                           google_active=bool(GOOGLE_CLIENT_ID),
+                           okta_active=bool(OKTA_DOMAIN),
+                           keycloak_active=bool(KEYCLOAK_URL))
 
-@app.route('/login/sso')
-def login_sso():
-    if not AUTHENTIK_URL:
-        return redirect(url_for('login'))
+# --- DYNAMIC SSO ROUTING ---
+@app.route('/login/sso/<provider>')
+def login_sso(provider):
+    client = oauth.create_client(provider)
+    if not client:
+        flash(f'{provider.capitalize()} SSO is not configured on this gateway.', 'warning')
+        return redirect(url_for('login', fallback='true'))
+        
+    return client.authorize_redirect(url_for('auth_callback', provider=provider, _external=True))
+
+@app.route('/auth/callback/<provider>')
+def auth_callback(provider):
+    client = oauth.create_client(provider)
+    if not client:
+        flash(f'Invalid SSO provider: {provider}', 'danger')
+        return redirect(url_for('login', fallback='true'))
         
     try:
-        requests.get(f"{AUTHENTIK_URL.rstrip('/')}/-/health/ready/", timeout=1.5)
-        return oauth.authentik.authorize_redirect(url_for('auth_callback', _external=True))
-    except requests.RequestException:
-        flash('Authentik SSO server is unreachable. Please use local access.', 'warning')
-        return redirect(url_for('login', fallback='true'))
-
-@app.route('/auth/callback')
-def auth_callback():
-    try:
-        token = oauth.authentik.authorize_access_token()
-        user_info = oauth.authentik.parse_id_token(token)
+        token = client.authorize_access_token()
+        user_info = client.parse_id_token(token)
     except Exception as e:
         flash(f'SSO Login Failed: {str(e)}', 'danger')
         return redirect(url_for('login', fallback='true'))
     
-    username = user_info.get('preferred_username') or user_info.get('name') or user_info.get('email')
-    groups = user_info.get('groups', [])
-    role = 'admin' if 'cctv-admins' in groups else ('operator' if 'cctv-operators' in groups else 'user')
+    # 1. Provider-Agnostic Username Extraction
+    username = user_info.get('preferred_username') or user_info.get('upn') or user_info.get('name') or user_info.get('email')
+    
+    # 2. Provider-Specific Role Mapping
+    role = 'user' 
+    
+    if provider == 'authentik':
+        groups = user_info.get('groups', [])
+        if 'cctv-admins' in groups: role = 'admin'
+        elif 'cctv-operators' in groups: role = 'operator'
+    
+    elif provider == 'microsoft':
+        roles = user_info.get('roles', [])
+        if 'Admin' in roles: role = 'admin'
+        elif 'Operator' in roles: role = 'operator'
         
+    elif provider == 'okta':
+        groups = user_info.get('groups', [])
+        if 'cctv-admins' in groups: role = 'admin'
+        elif 'cctv-operators' in groups: role = 'operator'
+        
+    elif provider == 'keycloak':
+        realm_access = user_info.get('realm_access', {})
+        roles = realm_access.get('roles', [])
+        if 'cctv-admin' in roles: role = 'admin'
+        elif 'cctv-operator' in roles: role = 'operator'
+        
+    elif provider == 'google':
+        # Google doesn't natively expose groups in OIDC without custom SAML mapping.
+        # Fallback to email domain validation or manual DB upgrades if needed.
+        if username and username.endswith('@yourcompany.com'):
+            # Extremely basic fallback logic. In production, map a custom claim.
+            role = 'operator' 
+
+    # 3. Local DB Sync
     conn = get_db()
     db_user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
     if not db_user:
-        cursor = conn.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", (username, 'SSO_MANAGED', role))
+        cursor = conn.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", (username, f'SSO_{provider.upper()}', role))
         user_id = cursor.lastrowid
     else:
         user_id = db_user['id']
@@ -867,7 +955,7 @@ def auth_callback():
     conn.close()
     
     login_user(User(user_id, username, role))
-    log_audit('System', username, 'User Logged In (SSO)')
+    log_audit('System', username, f'User Logged In ({provider.capitalize()} SSO)')
     return redirect(url_for('index'))
 
 @app.route('/logout')
@@ -1038,7 +1126,6 @@ def fetch_arp_table():
         subnet = get_local_subnet()
         try:
             bcast = str(ipaddress.IPv4Network(subnet, strict=False).broadcast_address)
-            # CRITICAL: Offload to tpool
             eventlet.tpool.execute(subprocess.run, ['ping', '-c', '2', '-W', '1', '-b', bcast], timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception: pass
         
@@ -1138,7 +1225,6 @@ def manual_ping():
     if not is_valid_target(ip): return jsonify({'success': False, 'output': 'Security Error: Invalid target format.'})
     try:
         cmd = ['ping', '-c', '4', '-W', '2', ip.strip()]
-        # CRITICAL: Offload to tpool
         process = eventlet.tpool.execute(subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
         return jsonify({'success': process.returncode == 0, 'output': process.stdout or process.stderr or 'Ping failed.'})
     except Exception as e: return jsonify({'success': False, 'output': str(e)})
@@ -1154,7 +1240,6 @@ def run_traceroute():
     def execute_trace():
         try:
             cmd = ['traceroute', '-w', '2', '-m', '30', '-q', '1', target.strip()]
-            # CRITICAL: Offload to tpool
             process = eventlet.tpool.execute(subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
             
             if process.returncode == 0: socketio.emit('traceroute_result', {'success': True, 'output': process.stdout}, to=sid)
@@ -1162,7 +1247,6 @@ def run_traceroute():
         except subprocess.TimeoutExpired: socketio.emit('traceroute_result', {'success': False, 'error': 'Traceroute timed out.'}, to=sid)
         except Exception as e: socketio.emit('traceroute_result', {'success': False, 'error': str(e)}, to=sid)
 
-    # CRITICAL: Use eventlet.spawn instead of threading.Thread
     eventlet.spawn(execute_trace)
     return jsonify({'status': 'running'})
 
@@ -1180,7 +1264,6 @@ def run_speedtest():
             
             cmd = ['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json']
             
-            # CRITICAL: Offload to tpool
             process = eventlet.tpool.execute(subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60, env=env)
             
             data = None
@@ -1217,7 +1300,6 @@ def run_speedtest():
                 elif process.stderr: err_msg = process.stderr.strip()
                 
                 try:
-                    # CRITICAL: Offload fallback process to tpool
                     fallback = eventlet.tpool.execute(subprocess.run, ['speedtest', '--accept-license', '--accept-gdpr', '-L', '-f', 'json'], capture_output=True, text=True, timeout=10, env=env)
                     
                     fb_data = None
@@ -1235,7 +1317,6 @@ def run_speedtest():
         except Exception as e: 
             socketio.emit('speedtest_result', {'success': False, 'error': str(e)}, to=sid)
 
-    # CRITICAL: Use eventlet.spawn instead of threading.Thread
     eventlet.spawn(execute_test)
     return jsonify({'status': 'running'})
 
@@ -1483,6 +1564,7 @@ def tunnel(device_type, device_id, req_path):
     full_req_path = f"{req_path}?{query_string}" if query_string else req_path
     
     clean_headers = {k: v for k, v in request.headers if k.lower() not in ['host', 'origin', 'referer', 'accept-encoding']}
+    # Force the strict host header resolution
     clean_headers['Host'] = resolved_ip 
     target_url = f"http://{resolved_ip}/{full_req_path.lstrip('/')}"
     

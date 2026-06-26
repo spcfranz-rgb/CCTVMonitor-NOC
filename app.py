@@ -264,7 +264,11 @@ def init_db():
             ('smtp_port', '587'),  
             ('smtp_user', ''),     
             ('smtp_pass', ''),     
-            ('smtp_target', '')    
+            ('smtp_target', ''),
+            ('st_interval', '0'),  # Automated Speedtest Interval
+            ('st_alert_dl', '0'),  # Speedtest Download Minimum
+            ('st_alert_ul', '0'),  # Speedtest Upload Minimum
+            ('st_alert_ping', '0') # Speedtest Ping Maximum
         ]
         cursor.executemany("INSERT INTO settings (key, value) VALUES (?, ?)", settings)
     else:
@@ -276,6 +280,12 @@ def init_db():
             cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_user', '')")
             cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_pass', '')")
             cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_target', '')")
+        except sqlite3.OperationalError: pass
+        try:
+            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st_interval', '0')")
+            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st_alert_dl', '0')")
+            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st_alert_ul', '0')")
+            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st_alert_ping', '0')")
         except sqlite3.OperationalError: pass
         
     cursor.execute("SELECT count(*) FROM users")
@@ -466,11 +476,77 @@ def send_failover_email(subject, body):
                 server.login(settings['smtp_user'], settings['smtp_pass'])
             server.send_message(msg)
             server.quit()
-            log_audit('System', 'Email Failover', f'Sent emergency email: {subject}')
+            log_audit('System', 'Email Failover', f'Sent email: {subject}')
         except Exception as e:
             log_audit('System', 'Email Failover', f'Failed to send email: {str(e)}')
             
     eventlet.spawn_n(_send)
+
+def automated_speedtest_loop():
+    """Background worker that executes automated speed tests and evaluates thresholds."""
+    time.sleep(30) # Delay initial start to allow bootup to settle
+    last_run = 0   # 0 ensures it triggers on the very first loop if an interval is configured
+    
+    while True:
+        time.sleep(60) # Wake up every 60s to check the config
+        try:
+            conn = get_db()
+            settings_dict = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
+            conn.close()
+            
+            st_interval = float(settings_dict.get('st_interval', 0))
+            
+            if st_interval > 0 and (time.time() - last_run) >= (st_interval * 3600):
+                last_run = time.time()
+                
+                env = os.environ.copy()
+                env['HOME'] = '/tmp'
+                
+                process = subprocess.run(['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json'], capture_output=True, text=True, timeout=60, env=env)
+                
+                if process.returncode == 0:
+                    data = None
+                    for line in reversed(process.stdout.splitlines()):
+                        line = line.strip()
+                        if line.startswith('{') and line.endswith('}'):
+                            try: data = json.loads(line); break
+                            except Exception: continue
+                            
+                    if data and 'download' in data:
+                        download = round((data['download']['bandwidth'] * 8) / 1000000, 2)
+                        upload = round((data['upload']['bandwidth'] * 8) / 1000000, 2)
+                        ping = round(data['ping']['latency'], 1)
+                        server_string = f"{data.get('server', {}).get('name', 'Unknown')} ({data.get('server', {}).get('location', 'Unknown')})"
+                        
+                        now = time.time()
+                        conn = get_db()
+                        log_status = f"DL: {download} Mbps | UL: {upload} Mbps | Ping: {ping} ms"
+                        conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Auto-Speedtest', log_status))
+                        
+                        st_alert_dl = float(settings_dict.get('st_alert_dl', 0))
+                        st_alert_ul = float(settings_dict.get('st_alert_ul', 0))
+                        st_alert_ping = float(settings_dict.get('st_alert_ping', 0))
+                        
+                        # Only the automated worker checks thresholds
+                        alerts = []
+                        if st_alert_dl > 0 and download < st_alert_dl: alerts.append(f"DL {download} < {st_alert_dl} Mbps")
+                        if st_alert_ul > 0 and upload < st_alert_ul: alerts.append(f"UL {upload} < {st_alert_ul} Mbps")
+                        if st_alert_ping > 0 and ping > st_alert_ping: alerts.append(f"Ping {ping} > {st_alert_ping} ms")
+                        
+                        if alerts:
+                            alert_text = "WARNING: " + " | ".join(alerts)
+                            conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Speedtest Alert', alert_text))
+                            send_failover_email("WAN Auto-Speedtest Alert", f"The automated gateway speed test breached configured thresholds:\n\n{alert_text}\n\nTarget Server: {server_string}")
+                            
+                        st_data = json.dumps({'download': download, 'upload': upload, 'ping': ping, 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
+                        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('latest_speedtest', ?)", (st_data,))
+                        conn.commit()
+                        conn.close()
+                        
+                        # Broadcast success to any open UI panels
+                        socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
+        except Exception as e:
+            print(f"Automated speedtest loop error: {e}")
 
 def monitor_loop():
     global force_check_event
@@ -1045,19 +1121,16 @@ def run_traceroute():
 @operator_required
 def run_speedtest():
     sid = request.form.get('sid')
-    log_audit('User', current_user.username, 'Initiated WAN Speedtest')
+    log_audit('User', current_user.username, 'Initiated WAN Speedtest (Manual)')
     
     def execute_test():
         try:
-            # FIX 1: Provide a guaranteed writable HOME directory so Ookla can save its license file
             env = os.environ.copy()
             env['HOME'] = '/tmp'
             
             cmd = ['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json']
             process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60, env=env)
             
-            # FIX 2: Bulletproof bottom-up JSON extraction. 
-            # This ignores ALL plain text warnings printed above the payload.
             data = None
             for line in reversed(process.stdout.splitlines()):
                 line = line.strip()
@@ -1067,7 +1140,6 @@ def run_speedtest():
                         break
                     except Exception: continue
             
-            # Ensure the process succeeded AND the JSON contains actual test results
             if process.returncode == 0 and data and 'download' in data:
                 download = round((data['download']['bandwidth'] * 8) / 1000000, 2)
                 upload = round((data['upload']['bandwidth'] * 8) / 1000000, 2)
@@ -1077,8 +1149,11 @@ def run_speedtest():
                 now = time.time()
                 try:
                     conn = get_db()
+                    
+                    # Log the manual test (DOES NOT EVALUATE ALERT THRESHOLDS)
                     log_status = f"DL: {download} Mbps | UL: {upload} Mbps | Ping: {ping} ms"
-                    conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Speedtest', log_status))
+                    conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Speedtest (Manual)', log_status))
+                    
                     st_data = json.dumps({'download': download, 'upload': upload, 'ping': ping, 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
                     conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('latest_speedtest', ?)", (st_data,))
                     conn.commit()
@@ -1087,13 +1162,11 @@ def run_speedtest():
 
                 socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now}, to=sid)
             else: 
-                # Fallback: Extract the error message cleanly
                 err_msg = "Unknown execution error."
                 if data and 'error' in data: err_msg = data['error']
                 elif process.stderr: err_msg = process.stderr.strip()
                 
                 try:
-                    # Run the fallback command with the same environment variables
                     fallback = subprocess.run(['speedtest', '--accept-license', '--accept-gdpr', '-L', '-f', 'json'], capture_output=True, text=True, timeout=10, env=env)
                     fb_data = None
                     for line in reversed(fallback.stdout.splitlines()):
@@ -1133,9 +1206,15 @@ def update_settings():
     
     conn.execute("UPDATE settings SET value = ? WHERE key = 'smtp_target'", (request.form.get('smtp_target', ''),))
     
+    # Update Speedtest Automation & Alert Settings
+    conn.execute("UPDATE settings SET value = ? WHERE key = 'st_interval'", (request.form.get('st_interval', '0'),))
+    conn.execute("UPDATE settings SET value = ? WHERE key = 'st_alert_dl'", (request.form.get('st_alert_dl', '0'),))
+    conn.execute("UPDATE settings SET value = ? WHERE key = 'st_alert_ul'", (request.form.get('st_alert_ul', '0'),))
+    conn.execute("UPDATE settings SET value = ? WHERE key = 'st_alert_ping'", (request.form.get('st_alert_ping', '0'),))
+    
     conn.commit()
     conn.close()
-    log_audit('User', current_user.username, 'Updated Global Gateway Settings (MQTT/SMTP)') 
+    log_audit('User', current_user.username, 'Updated Global Gateway Settings (MQTT/SMTP/Alerts)') 
     trigger_monitor_check()
     flash('Settings updated.', 'success')
     return redirect(url_for('index'))
@@ -1423,6 +1502,7 @@ try:
     init_logos()
     os.makedirs('/app/data', exist_ok=True)
     socketio.start_background_task(monitor_loop)
+    socketio.start_background_task(automated_speedtest_loop) # NEW BACKGROUND LOOP
     socketio.start_background_task(sync_db_loop)
     socketio.start_background_task(log_prune_loop)
 except Exception as e: print(f"Startup initialization error: {e}")

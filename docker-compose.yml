@@ -6,7 +6,10 @@ services:
     ports:
       - "1883:1883"
     volumes:
+      # CONFIG: Relative mount (Pulled fresh from GitHub every deployment)
       - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
+      
+      # DATA: Absolute mounts (Survives repo wipes)
       - /opt/cctv-data/mosquitto/data:/mosquitto/data
       - /opt/cctv-data/mosquitto/log:/mosquitto/log
     logging:
@@ -22,9 +25,14 @@ services:
     restart: unless-stopped
     network_mode: "host" 
     user: root
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
+    
+    # CRITICAL FIX: Bypass Seccomp filters and allow massive concurrent socket pooling
+    privileged: true 
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+        
     environment:
       - SECRET_KEY=${SECRET_KEY}
       - DB_ENCRYPTION_KEY=${DB_ENCRYPTION_KEY}
@@ -59,6 +67,7 @@ services:
       - KEYCLOAK_CLIENT_SECRET=${KEYCLOAK_CLIENT_SECRET}
       
     volumes:
+      # DATA: Absolute mount for the Python backend database (Survives repo wipes)
       - /opt/cctv-data/dashboard:/app/data
     tmpfs:
       - /app/data_ram

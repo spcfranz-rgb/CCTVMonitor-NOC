@@ -327,6 +327,8 @@
                         <div class="card-body bg-body-tertiary">
                             <form action="/update_settings" method="POST" id="updateSettingsForm">
                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+                                
+                                <h6 class="text-muted border-bottom border-secondary pb-2 mb-3">Zabbix MQTT Pipeline</h6>
                                 <div class="mb-3">
                                     <label for="mqtt_broker" class="form-label small text-muted fw-bold mb-1">MQTT Broker IP</label>
                                     <input type="text" id="mqtt_broker" name="mqtt_broker" class="form-control border-secondary" value="{{ settings.mqtt_broker }}" required>
@@ -349,7 +351,34 @@
                                     <label for="mqtt_prefix" class="form-label small text-muted fw-bold mb-1">MQTT Topic Prefix</label>
                                     <input type="text" id="mqtt_prefix" name="mqtt_prefix" class="form-control border-secondary" value="{{ settings.mqtt_prefix }}" required>
                                 </div>
-                                <button type="submit" class="btn btn-primary w-100 fw-bold">Save Network Settings</button>
+                                
+                                <h6 class="text-muted border-bottom border-secondary pb-2 mb-3 mt-4">SMTP Email Failover</h6>
+                                <div class="row mb-3">
+                                    <div class="col-md-8">
+                                        <label for="smtp_host" class="form-label small text-muted fw-bold mb-1">SMTP Server Host</label>
+                                        <input type="text" id="smtp_host" name="smtp_host" class="form-control border-secondary" placeholder="smtp.gmail.com" value="{{ settings.smtp_host }}">
+                                    </div>
+                                    <div class="col-md-4">
+                                        <label for="smtp_port" class="form-label small text-muted fw-bold mb-1">Port</label>
+                                        <input type="number" id="smtp_port" name="smtp_port" class="form-control border-secondary" placeholder="587" value="{{ settings.smtp_port }}">
+                                    </div>
+                                </div>
+                                <div class="row mb-3">
+                                    <div class="col-md-6">
+                                        <label for="smtp_user" class="form-label small text-muted fw-bold mb-1">SMTP Username</label>
+                                        <input type="text" id="smtp_user" name="smtp_user" class="form-control border-secondary" value="{{ settings.smtp_user }}">
+                                    </div>
+                                    <div class="col-md-6">
+                                        <label for="smtp_pass" class="form-label small text-muted fw-bold mb-1">SMTP Password</label>
+                                        <input type="password" id="smtp_pass" name="smtp_pass" class="form-control border-secondary" placeholder="********">
+                                    </div>
+                                </div>
+                                <div class="mb-4">
+                                    <label for="smtp_target" class="form-label small text-muted fw-bold mb-1">Target Alert Email</label>
+                                    <input type="email" id="smtp_target" name="smtp_target" class="form-control border-secondary" placeholder="noc-alerts@company.com" value="{{ settings.smtp_target }}">
+                                </div>
+
+                                <button type="submit" class="btn btn-primary w-100 fw-bold">Save System Settings</button>
                             </form>
                             
                             <hr class="my-4 border-secondary">
@@ -491,8 +520,6 @@
     <script>
         // --- GLOBAL INITIALIZATION ---
         const socket = io();
-        
-        // Securely fetch CSRF token with a fallback so JS doesn't crash if the meta tag is missing.
         const metaCsrf = document.querySelector('meta[name="csrf-token"]');
         const csrfToken = metaCsrf ? metaCsrf.getAttribute('content') : '';
         
@@ -505,24 +532,19 @@
         const diagOutput = document.getElementById('diagOutput');
         
         // --- JAVASCRIPT IDLE LOGOUT TIMER ---
-        // Dynamically injected timeout parameter from settings database (Defaults to 20 mins)
         const IDLE_TIMEOUT_MS = {{ settings.idle_timeout|default(20) }} * 60 * 1000;
         let frontendIdleTimer;
         
         function resetFrontendIdleTimer() {
             clearTimeout(frontendIdleTimer);
             frontendIdleTimer = setTimeout(() => {
-                // If user doesn't touch the mouse/keyboard, gently redirect them to /logout
                 window.location.href = '/logout';
             }, IDLE_TIMEOUT_MS);
         }
         
-        // Monitor UI interactions to keep the session alive
         ['mousemove', 'keydown', 'mousedown', 'touchstart', 'scroll'].forEach(evt => {
             window.addEventListener(evt, resetFrontendIdleTimer, { passive: true });
         });
-        
-        // Initialize timer on load
         resetFrontendIdleTimer();
 
         // --- UI HELPERS ---
@@ -556,7 +578,6 @@
             }
         }
 
-        // Prevent Form Double-Submission
         document.querySelectorAll('form').forEach(form => {
             form.addEventListener('submit', (e) => {
                 const btn = e.target.querySelector('button[type="submit"]');
@@ -580,15 +601,12 @@
                     tbody.innerHTML = '';
                     data.devices.forEach(d => {
                         const tr = document.createElement('tr');
-                        
                         const tdIp = document.createElement('td');
                         tdIp.className = "text-info font-monospace ps-3";
                         tdIp.textContent = d.ip;
-                        
                         const tdMac = document.createElement('td');
                         tdMac.className = "font-monospace text-light";
                         tdMac.textContent = d.mac;
-                        
                         const tdInt = document.createElement('td');
                         tdInt.innerHTML = `<span class="badge bg-secondary"></span>`;
                         tdInt.querySelector('span').textContent = d.interface;
@@ -750,7 +768,7 @@
             const formData = new FormData(); 
             formData.append('target', ip);
             formData.append('csrf_token', csrfToken);
-            formData.append('sid', socket.id); // Send the session ID
+            formData.append('sid', socket.id);
 
             fetch('/api/traceroute', { method: 'POST', body: formData })
             .then(res => res.json())
@@ -789,7 +807,7 @@
 
             const formData = new FormData(); 
             formData.append('csrf_token', csrfToken);
-            formData.append('sid', socket.id); // Send the session ID
+            formData.append('sid', socket.id);
 
             fetch('/api/speedtest', { method: 'POST', body: formData })
             .then(res => res.json())
@@ -830,7 +848,6 @@
                 }
 
                 const wrapper = document.createElement('div');
-                
                 const header = document.createElement('div');
                 header.className = "alert alert-success py-1 mb-2 px-2 text-center";
                 header.textContent = `Found ${data.discovered.length} new devices!`;

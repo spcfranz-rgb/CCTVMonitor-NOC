@@ -50,15 +50,8 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
 
 # --- SECURITY: CSRF PROTECTION & SESSIONS ---
-app.secret_key = os.environ.get('SECRET_KEY')
-if not app.secret_key:
-    print("WARNING: SECRET_KEY environment variable is missing. Using insecure development key.")
-    app.secret_key = 'cctv-super-secret-key-change-me'
-
-db_key_env = os.environ.get('DB_ENCRYPTION_KEY')
-if not db_key_env:
-    print("WARNING: DB_ENCRYPTION_KEY missing. Falling back to SECRET_KEY for DB encryption (Not recommended).")
-    db_key_env = app.secret_key
+app.secret_key = os.environ.get('SECRET_KEY', 'cctv-super-secret-key-change-me')
+db_key_env = os.environ.get('DB_ENCRYPTION_KEY', app.secret_key)
 
 csrf = CSRFProtect(app)
 app.config['SESSION_COOKIE_HTTPONLY'] = True 
@@ -116,7 +109,6 @@ def decrypt_pwd(pwd):
 # ==========================================
 oauth = OAuth(app)
 
-# 1. Authentik
 AUTHENTIK_URL = os.environ.get('AUTHENTIK_URL')
 if AUTHENTIK_URL:
     oauth.register(
@@ -127,7 +119,6 @@ if AUTHENTIK_URL:
         client_kwargs={'scope': 'openid profile email'}
     )
 
-# 2. Microsoft 365 / Entra ID
 AZURE_TENANT_ID = os.environ.get('AZURE_TENANT_ID')
 if AZURE_TENANT_ID:
     oauth.register(
@@ -138,7 +129,6 @@ if AZURE_TENANT_ID:
         client_kwargs={'scope': 'openid profile email'}
     )
 
-# 3. Google Workspace
 GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
 if GOOGLE_CLIENT_ID:
     oauth.register(
@@ -149,7 +139,6 @@ if GOOGLE_CLIENT_ID:
         client_kwargs={'scope': 'openid profile email'}
     )
 
-# 4. Okta
 OKTA_DOMAIN = os.environ.get('OKTA_DOMAIN')
 if OKTA_DOMAIN:
     oauth.register(
@@ -160,7 +149,6 @@ if OKTA_DOMAIN:
         client_kwargs={'scope': 'openid profile email groups'}
     )
 
-# 5. Keycloak
 KEYCLOAK_URL = os.environ.get('KEYCLOAK_URL')
 KEYCLOAK_REALM = os.environ.get('KEYCLOAK_REALM')
 if KEYCLOAK_URL and KEYCLOAK_REALM:
@@ -188,15 +176,13 @@ def get_db():
     return conn
 
 def log_audit(device_type, device_name, status):
-    """Securely inserts user actions into the event log database."""
     try:
         conn = get_db()
         conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)",
                      (time.time(), device_type, device_name, status))
         conn.commit()
         conn.close()
-    except Exception as e:
-        print(f"Failed to log audit event: {e}")
+    except Exception: pass
 
 # ==========================================
 # AUTHENTICATION & GLOBALS
@@ -216,8 +202,7 @@ def load_user(user_id):
     conn = get_db()
     user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     conn.close()
-    if user:
-        return User(user['id'], user['username'], user['role'])
+    if user: return User(user['id'], user['username'], user['role'])
     return None
 
 def admin_required(f):
@@ -273,12 +258,10 @@ def init_ram_db():
         try:
             disk_conn = sqlite3.connect(DB_PATH_DISK)
             ram_conn = sqlite3.connect(DB_PATH_RAM)
-            with ram_conn:
-                disk_conn.backup(ram_conn)
+            with ram_conn: disk_conn.backup(ram_conn)
             disk_conn.close()
             ram_conn.close()
-        except Exception as e:
-            print(f"Boot restoration failed: {e}")
+        except Exception as e: print(f"Boot restoration failed: {e}")
 
 def init_db():
     init_ram_db() 
@@ -319,10 +302,10 @@ def init_db():
             ('smtp_user', ''),     
             ('smtp_pass', ''),     
             ('smtp_target', ''),
-            ('st_interval', '0'),  
-            ('st_alert_dl', '0'),  
-            ('st_alert_ul', '0'),  
-            ('st_alert_ping', '0') 
+            ('st_interval', '0'),
+            ('st_alert_dl', '0'),
+            ('st_alert_ul', '0'),
+            ('st_alert_ping', '0')
         ]
         cursor.executemany("INSERT INTO settings (key, value) VALUES (?, ?)", settings)
     else:
@@ -394,7 +377,6 @@ def log_prune_loop():
 # BACKGROUND MONITORING & NETWORK TASKS
 # ==========================================
 SNAPSHOT_SEMAPHORE = eventlet.semaphore.Semaphore(4)
-
 mqtt_client = None
 mqtt_prefix_global = 'zabbix/cctv'
 
@@ -564,7 +546,6 @@ def automated_speedtest_loop():
                 env = os.environ.copy()
                 env['HOME'] = '/tmp'
                 
-                # CRITICAL: Offload blocking process to native OS thread pool
                 process = eventlet.tpool.execute(
                     subprocess.run, ['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json'], capture_output=True, text=True, timeout=60, env=env
                 )
@@ -660,6 +641,10 @@ def monitor_loop():
         
     while True:
         try:
+            # Inject Gateway Status Telemetry to the UI
+            is_mqtt_up = mqtt_client.is_connected() if mqtt_client else False
+            socketio.emit('gateway_status', {'mqtt': is_mqtt_up, 'ui': True})
+
             conn = get_db()
             cursor = conn.cursor()
             cursor.execute("SELECT key, value FROM settings")
@@ -778,15 +763,6 @@ def monitor_loop():
                             new_c_stat = 'UNREACHABLE (Switch Down)'
                         queue_status('cameras', cam['id'], cam['name'], 'Camera', cam['status'], new_c_stat)
 
-            # --- STANDALONE CAMERAS ---
-            standalone_dicts_for_pool = [dict(c, password=decrypt_pwd(c['password'])) for c in standalone_cameras]
-            standalone_results = {}
-            standalone_pool = eventlet.greenpool.GreenPool(size=20)
-            
-            for c_id, cam_up, stream_ok, snap_bytes, fetched_mac in standalone_pool.imap(threaded_camera_check, standalone_dicts_for_pool):
-                standalone_results[c_id] = (cam_up, stream_ok, snap_bytes)
-                if fetched_mac: pending_mac_updates.append(('cameras', fetched_mac.upper(), c_id))
-                    
             for cam in standalone_cameras:
                 c_until = cam['silenced_until'] or 0
                 cam_id, cam_name, cam_silenced = cam['id'], cam['name'], (c_until > now)
@@ -883,7 +859,6 @@ def login():
                            okta_active=bool(OKTA_DOMAIN),
                            keycloak_active=bool(KEYCLOAK_URL))
 
-# --- DYNAMIC SSO ROUTING ---
 @app.route('/login/sso/<provider>')
 def login_sso(provider):
     client = oauth.create_client(provider)
@@ -892,8 +867,6 @@ def login_sso(provider):
         return redirect(url_for('login', fallback='true'))
         
     try:
-        # Authlib fetches the OIDC discovery document here. 
-        # If the SSO server is offline/unreachable, it throws an exception.
         return client.authorize_redirect(url_for('auth_callback', provider=provider, _external=True))
     except Exception as e:
         print(f"SSO Route Error ({provider}): {str(e)}")
@@ -915,10 +888,7 @@ def auth_callback(provider):
         flash(f'SSO Login Failed: {str(e)}', 'danger')
         return redirect(url_for('login', fallback='true'))
     
-    # 1. Provider-Agnostic Username Extraction
     username = user_info.get('preferred_username') or user_info.get('upn') or user_info.get('name') or user_info.get('email')
-    
-    # 2. Provider-Specific Role Mapping
     role = 'user' 
     
     if provider == 'authentik':
@@ -943,13 +913,9 @@ def auth_callback(provider):
         elif 'cctv-operator' in roles: role = 'operator'
         
     elif provider == 'google':
-        # Google doesn't natively expose groups in OIDC without custom SAML mapping.
-        # Fallback to email domain validation or manual DB upgrades if needed.
         if username and username.endswith('@yourcompany.com'):
-            # Extremely basic fallback logic. In production, map a custom claim.
             role = 'operator' 
 
-    # 3. Local DB Sync
     conn = get_db()
     db_user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
     if not db_user:

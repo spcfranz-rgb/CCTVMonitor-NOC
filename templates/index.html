@@ -286,13 +286,25 @@
                         <div class="card-header bg-dark border-warning text-warning"><h5 class="mb-0">WAN Speed Test</h5></div>
                         <div class="card-body">
                             <p class="small text-muted mb-4">Test the external internet connection speed of the gateway system.</p>
+                            
                             <div id="speedtestDisplay" class="row text-center mb-4 {% if not latest_speedtest %}d-none{% endif %}">
                                 <div class="col-4 border-end border-secondary"><small class="text-muted d-block text-uppercase mb-1">Ping</small><h4 id="st-ping" class="text-info mb-0">{{ latest_speedtest.ping ~ ' ms' if latest_speedtest else '-' }}</h4></div>
                                 <div class="col-4 border-end border-secondary"><small class="text-muted d-block text-uppercase mb-1">Download</small><h4 id="st-download" class="text-success mb-0">{{ latest_speedtest.download ~ ' Mbps' if latest_speedtest else '-' }}</h4></div>
                                 <div class="col-4"><small class="text-muted d-block text-uppercase mb-1">Upload</small><h4 id="st-upload" class="text-warning mb-0">{{ latest_speedtest.upload ~ ' Mbps' if latest_speedtest else '-' }}</h4></div>
                                 <div class="col-12 mt-3"><small class="text-muted">Target Server: <span id="st-isp" class="fw-bold text-light">{{ latest_speedtest.isp ~ ' | Server: ' ~ latest_speedtest.server if latest_speedtest else '-' }}</span></small></div>
-                                <div class="col-12 mt-1"><small class="text-muted" style="font-size: 0.75rem;">Last Tested: <span id="st-time" class="{% if latest_speedtest %}log-time{% endif %} text-info" data-ts="{{ latest_speedtest.timestamp if latest_speedtest else '' }}">-</span></small></div>
+                                <div class="col-12 mt-1">
+                                    <small class="text-muted" style="font-size: 0.75rem;">Last Tested: 
+                                        <span id="st-time" class="text-info">
+                                            {% if latest_speedtest %}
+                                                <script>document.write(new Date({{ latest_speedtest.timestamp }} * 1000).toLocaleString());</script>
+                                            {% else %}
+                                                -
+                                            {% endif %}
+                                        </span>
+                                    </small>
+                                </div>
                             </div>
+                            
                             <div id="speedtestSpinner" class="text-center d-none mb-4">
                                 <div class="spinner-border text-warning" role="status"></div>
                                 <div class="mt-2 small text-muted">Running network benchmarks (takes ~30s)...</div>
@@ -920,7 +932,6 @@
                     document.getElementById('st-upload').textContent = data.upload;
                     document.getElementById('st-isp').textContent = data.isp + ' | Server: ' + data.server;
                     
-                    // Parse the new timestamp dynamically
                     const date = new Date(data.timestamp * 1000);
                     document.getElementById('st-time').textContent = date.toLocaleString();
                     

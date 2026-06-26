@@ -1,6 +1,7 @@
 # CRITICAL: Monkey patching must occur before ANY other imports
 import eventlet
 eventlet.monkey_patch()
+import eventlet.tpool
 
 import os
 import time
@@ -270,10 +271,10 @@ def init_db():
             ('smtp_user', ''),     
             ('smtp_pass', ''),     
             ('smtp_target', ''),
-            ('st_interval', '0'),  # Automated Speedtest Interval
-            ('st_alert_dl', '0'),  # Speedtest Download Minimum
-            ('st_alert_ul', '0'),  # Speedtest Upload Minimum
-            ('st_alert_ping', '0') # Speedtest Ping Maximum
+            ('st_interval', '0'),  
+            ('st_alert_dl', '0'),  
+            ('st_alert_ul', '0'),  
+            ('st_alert_ping', '0') 
         ]
         cursor.executemany("INSERT INTO settings (key, value) VALUES (?, ?)", settings)
     else:
@@ -345,6 +346,9 @@ def log_prune_loop():
 # BACKGROUND MONITORING & NETWORK TASKS
 # ==========================================
 SNAPSHOT_SEMAPHORE = eventlet.semaphore.Semaphore(4)
+
+mqtt_client = None
+mqtt_prefix_global = 'zabbix/cctv'
 
 def get_local_subnet():
     try:
@@ -432,7 +436,6 @@ def get_snapshot_bytes(ip, mfg, user, pwd, stream_url):
                 
     try:
         cmd = ['ffmpeg', '-y', '-rtsp_transport', 'tcp', '-i', stream_url, '-vframes', '1', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-']
-        # Enforce strict kill to prevent zombie processes lingering on timeout
         with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
             try:
                 stdout, _ = proc.communicate(timeout=5)
@@ -440,7 +443,7 @@ def get_snapshot_bytes(ip, mfg, user, pwd, stream_url):
                     return stdout
             except subprocess.TimeoutExpired:
                 proc.kill()
-                proc.communicate() # Flush buffers safely
+                proc.communicate()
     except Exception: pass
     return None
 
@@ -466,7 +469,6 @@ def threaded_camera_check(cam):
     return cam['id'], cam_up, stream_ok, snap_bytes, fetched_mac
 
 def send_failover_email(subject, body):
-    """Fires an email in a non-blocking background thread. Prefetches config to prevent stalling."""
     conn = get_db()
     settings = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
     conn.close()
@@ -495,12 +497,12 @@ def send_failover_email(subject, body):
     eventlet.spawn_n(_send, settings)
 
 def automated_speedtest_loop():
-    """Background worker that executes automated speed tests and evaluates thresholds."""
-    time.sleep(30) # Delay initial start to allow bootup to settle
-    last_run = 0   # 0 ensures it triggers on the very first loop if an interval is configured
+    global mqtt_client, mqtt_prefix_global
+    time.sleep(30)
+    last_run = 0
     
     while True:
-        time.sleep(60) # Wake up every 60s to check the config
+        time.sleep(60)
         try:
             conn = get_db()
             settings_dict = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
@@ -514,7 +516,10 @@ def automated_speedtest_loop():
                 env = os.environ.copy()
                 env['HOME'] = '/tmp'
                 
-                process = subprocess.run(['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json'], capture_output=True, text=True, timeout=60, env=env)
+                # CRITICAL: Offload blocking process to native OS thread pool
+                process = eventlet.tpool.execute(
+                    subprocess.run, ['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json'], capture_output=True, text=True, timeout=60, env=env
+                )
                 
                 if process.returncode == 0:
                     data = None
@@ -531,6 +536,14 @@ def automated_speedtest_loop():
                         server_string = f"{data.get('server', {}).get('name', 'Unknown')} ({data.get('server', {}).get('location', 'Unknown')})"
                         
                         now = time.time()
+                        
+                        if mqtt_client and mqtt_client.is_connected():
+                            try:
+                                mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_download", str(download), retain=True)
+                                mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_upload", str(upload), retain=True)
+                                mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_ping", str(ping), retain=True)
+                            except Exception: pass
+                        
                         conn = get_db()
                         log_status = f"DL: {download} Mbps | UL: {upload} Mbps | Ping: {ping} ms"
                         conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Auto-Speedtest', log_status))
@@ -539,7 +552,6 @@ def automated_speedtest_loop():
                         st_alert_ul = float(settings_dict.get('st_alert_ul', 0))
                         st_alert_ping = float(settings_dict.get('st_alert_ping', 0))
                         
-                        # Only the automated worker checks thresholds
                         alerts = []
                         if st_alert_dl > 0 and download < st_alert_dl: alerts.append(f"DL {download} < {st_alert_dl} Mbps")
                         if st_alert_ul > 0 and upload < st_alert_ul: alerts.append(f"UL {upload} < {st_alert_ul} Mbps")
@@ -548,20 +560,26 @@ def automated_speedtest_loop():
                         if alerts:
                             alert_text = "WARNING: " + " | ".join(alerts)
                             conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Speedtest Alert', alert_text))
-                            send_failover_email("WAN Auto-Speedtest Alert", f"The automated gateway speed test breached configured thresholds:\n\n{alert_text}\n\nTarget Server: {server_string}")
+                            
+                            if mqtt_client and mqtt_client.is_connected():
+                                mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_alert", alert_text, retain=True)
+                            else:
+                                send_failover_email("WAN Auto-Speedtest Alert", f"The automated gateway speed test breached configured thresholds:\n\n{alert_text}\n\nTarget Server: {server_string}")
+                        else:
+                            if mqtt_client and mqtt_client.is_connected():
+                                mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_alert", "OK", retain=True)
                             
                         st_data = json.dumps({'download': download, 'upload': upload, 'ping': ping, 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
                         conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('latest_speedtest', ?)", (st_data,))
                         conn.commit()
                         conn.close()
                         
-                        # Broadcast success to any open UI panels
                         socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
         except Exception as e:
             print(f"Automated speedtest loop error: {e}")
 
 def monitor_loop():
-    global force_check_event
+    global force_check_event, mqtt_client, mqtt_prefix_global
     previous_hashes = {} 
     
     conn = get_db()
@@ -569,9 +587,9 @@ def monitor_loop():
     conn.close()
     broker = settings_dict.get('mqtt_broker', '127.0.0.1')
     port = int(settings_dict.get('mqtt_port', 1883))
-    prefix = settings_dict.get('mqtt_prefix', 'zabbix/cctv')
+    mqtt_prefix_global = settings_dict.get('mqtt_prefix', 'zabbix/cctv')
     
-    client = mqtt.Client("camera_monitor_service")
+    mqtt_client = mqtt.Client("camera_monitor_service")
     
     def on_connect(client, userdata, flags, rc):
         if rc == 0: log_audit('System', 'MQTT Broker', 'UP (Connected)')
@@ -582,19 +600,18 @@ def monitor_loop():
             log_audit('System', 'MQTT Broker', 'DOWN (Unexpected Disconnect)')
             send_failover_email("CRITICAL: Lighthouse MQTT Disconnected", "The edge gateway has lost its connection to the Zabbix MQTT broker. Camera failover alerts will now route via email.")
 
-    client.on_connect = on_connect
-    client.on_disconnect = on_disconnect
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_disconnect = on_disconnect
 
     try:
-        client.connect(broker, port, 60)
-        client.loop_start()
+        mqtt_client.connect(broker, port, 60)
+        mqtt_client.loop_start()
     except Exception as e: 
         log_audit('System', 'MQTT Broker', f'DOWN (Initial Connection Failed)')
         send_failover_email("CRITICAL: Lighthouse MQTT Offline", "The edge gateway failed to connect to the Zabbix broker on boot. Email failover engaged.")
         
     while True:
         try:
-            # Phase 1: Retrieve configuration instantly.
             conn = get_db()
             cursor = conn.cursor()
             cursor.execute("SELECT key, value FROM settings")
@@ -621,7 +638,7 @@ def monitor_loop():
                     })
                     
                     if 'DOWN' in new_status or 'UNREACHABLE' in new_status or 'ERR' in new_status:
-                        if not client.is_connected():
+                        if not mqtt_client.is_connected():
                             send_failover_email(f"FAILOVER ALERT: {item_name} is {new_status}", f"The {dev_type} '{item_name}' transitioned to a critical state ({new_status}).\n\nThis alert was routed via SMTP because the primary MQTT connection to Zabbix is currently offline.")
 
             cameras_by_switch = {}
@@ -630,7 +647,6 @@ def monitor_loop():
                 if c['switch_id']: cameras_by_switch.setdefault(c['switch_id'], []).append(c)
                 else: standalone_cameras.append(c)
 
-            # Phase 2: Execute Non-Blocking Network Operations
             for switch in switches:
                 switch_id, switch_name, switch_ip = switch['id'], switch['name'], switch['ip']
                 s_until, mac = switch['silenced_until'] or 0, switch['mac_address'] or ''
@@ -638,7 +654,7 @@ def monitor_loop():
                 is_up = is_pingable(switch_ip) or is_port_open(switch_ip, 80) or is_port_open(switch_ip, 443)
                 
                 switch_payload = "MAINTENANCE" if silenced else ("UP" if is_up else "OFFLINE")
-                client.publish(f"{prefix}/{switch_name}/ping", switch_payload, retain=True)
+                mqtt_client.publish(f"{mqtt_prefix_global}/{switch_name}/ping", switch_payload, retain=True)
                 
                 if is_up:
                     if not mac:
@@ -677,26 +693,26 @@ def monitor_loop():
                             else: previous_hashes.pop(cam_id, None)
                             
                             if cam_silenced:
-                                client.publish(f"{prefix}/{cam_name}/ping", "MAINTENANCE", retain=True)
-                                client.publish(f"{prefix}/{cam_name}/stream", "MAINTENANCE", retain=True)
+                                mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "MAINTENANCE", retain=True)
+                                mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "MAINTENANCE", retain=True)
                                 if is_frozen: queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'FROZEN (Silenced)')
                                 else: queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'UP (Silenced)' if stream_ok else 'STREAM ERR (Silenced)')
                             else:
-                                client.publish(f"{prefix}/{cam_name}/ping", "UP", retain=True)
+                                mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "UP", retain=True)
                                 if is_frozen:
-                                    client.publish(f"{prefix}/{cam_name}/stream", "FROZEN", retain=True)
+                                    mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "FROZEN", retain=True)
                                     queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'DOWN (Frozen)')
                                 else:
-                                    client.publish(f"{prefix}/{cam_name}/stream", "UP" if stream_ok else "STREAM_ERROR", retain=True)
+                                    mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "UP" if stream_ok else "STREAM_ERROR", retain=True)
                                     queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'UP' if stream_ok else 'DOWN (Stream Error)')
                         else:
                             if cam_silenced:
-                                client.publish(f"{prefix}/{cam_name}/ping", "MAINTENANCE", retain=True)
-                                client.publish(f"{prefix}/{cam_name}/stream", "MAINTENANCE", retain=True)
+                                mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "MAINTENANCE", retain=True)
+                                mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "MAINTENANCE", retain=True)
                                 queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'DOWN (Silenced)')
                             else:
-                                client.publish(f"{prefix}/{cam_name}/ping", "OFFLINE", retain=True)
-                                client.publish(f"{prefix}/{cam_name}/stream", "OFFLINE", retain=True)
+                                mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "OFFLINE", retain=True)
+                                mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "OFFLINE", retain=True)
                                 queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'DOWN (Offline)')
                 else:
                     new_s_stat = 'DOWN' if not silenced else 'DOWN (Silenced)'
@@ -705,12 +721,12 @@ def monitor_loop():
                         c_until = cam['silenced_until'] or 0
                         cam_silenced = (c_until > now) or silenced
                         if cam_silenced:
-                            client.publish(f"{prefix}/{cam['name']}/ping", "MAINTENANCE", retain=True)
-                            client.publish(f"{prefix}/{cam['name']}/stream", "MAINTENANCE", retain=True)
+                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/ping", "MAINTENANCE", retain=True)
+                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/stream", "MAINTENANCE", retain=True)
                             new_c_stat = 'UNREACHABLE (Silenced)'
                         else:
-                            client.publish(f"{prefix}/{cam['name']}/ping", "OFFLINE", retain=True)
-                            client.publish(f"{prefix}/{cam['name']}/stream", "OFFLINE", retain=True)
+                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/ping", "OFFLINE", retain=True)
+                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/stream", "OFFLINE", retain=True)
                             new_c_stat = 'UNREACHABLE (Switch Down)'
                         queue_status('cameras', cam['id'], cam['name'], 'Camera', cam['status'], new_c_stat)
 
@@ -742,29 +758,28 @@ def monitor_loop():
                     else: previous_hashes.pop(cam_id, None)
                             
                     if cam_silenced:
-                        client.publish(f"{prefix}/{cam_name}/ping", "MAINTENANCE", retain=True)
-                        client.publish(f"{prefix}/{cam_name}/stream", "MAINTENANCE", retain=True)
+                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "MAINTENANCE", retain=True)
+                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "MAINTENANCE", retain=True)
                         if is_frozen: queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'FROZEN (Silenced)')
                         else: queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'UP (Silenced)' if stream_ok else 'STREAM ERR (Silenced)')
                     else:
-                        client.publish(f"{prefix}/{cam_name}/ping", "UP", retain=True)
+                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "UP", retain=True)
                         if is_frozen:
-                            client.publish(f"{prefix}/{cam_name}/stream", "FROZEN", retain=True)
+                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "FROZEN", retain=True)
                             queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'DOWN (Frozen)')
                         else:
-                            client.publish(f"{prefix}/{cam_name}/stream", "UP" if stream_ok else "STREAM_ERROR", retain=True)
+                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "UP" if stream_ok else "STREAM_ERROR", retain=True)
                             queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'UP' if stream_ok else 'DOWN (Stream Error)')
                 else:
                     if cam_silenced:
-                        client.publish(f"{prefix}/{cam_name}/ping", "MAINTENANCE", retain=True)
-                        client.publish(f"{prefix}/{cam_name}/stream", "MAINTENANCE", retain=True)
+                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "MAINTENANCE", retain=True)
+                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "MAINTENANCE", retain=True)
                         queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'DOWN (Silenced)')
                     else:
-                        client.publish(f"{prefix}/{cam_name}/ping", "OFFLINE", retain=True)
-                        client.publish(f"{prefix}/{cam_name}/stream", "OFFLINE", retain=True)
+                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "OFFLINE", retain=True)
+                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "OFFLINE", retain=True)
                         queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'DOWN (Offline)')
 
-            # Phase 3: Execute High-Speed Batch Commit
             if pending_db_updates or pending_mac_updates:
                 conn = get_db()
                 with conn:
@@ -1020,11 +1035,11 @@ def import_config():
 def fetch_arp_table():
     log_audit('User', current_user.username, 'Initiated native L2 ARP scan')
     try:
-        # Pre-populate kernel ARP cache with a quick non-blocking subnet broadcast ping
         subnet = get_local_subnet()
         try:
             bcast = str(ipaddress.IPv4Network(subnet, strict=False).broadcast_address)
-            subprocess.run(['ping', '-c', '2', '-W', '1', '-b', bcast], timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # CRITICAL: Offload to tpool
+            eventlet.tpool.execute(subprocess.run, ['ping', '-c', '2', '-W', '1', '-b', bcast], timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception: pass
         
         devices = get_camlan_arp_table()
@@ -1123,7 +1138,8 @@ def manual_ping():
     if not is_valid_target(ip): return jsonify({'success': False, 'output': 'Security Error: Invalid target format.'})
     try:
         cmd = ['ping', '-c', '4', '-W', '2', ip.strip()]
-        process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+        # CRITICAL: Offload to tpool
+        process = eventlet.tpool.execute(subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
         return jsonify({'success': process.returncode == 0, 'output': process.stdout or process.stderr or 'Ping failed.'})
     except Exception as e: return jsonify({'success': False, 'output': str(e)})
 
@@ -1138,13 +1154,16 @@ def run_traceroute():
     def execute_trace():
         try:
             cmd = ['traceroute', '-w', '2', '-m', '30', '-q', '1', target.strip()]
-            process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+            # CRITICAL: Offload to tpool
+            process = eventlet.tpool.execute(subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+            
             if process.returncode == 0: socketio.emit('traceroute_result', {'success': True, 'output': process.stdout}, to=sid)
             else: socketio.emit('traceroute_result', {'success': False, 'error': process.stderr.strip() or process.stdout.strip()}, to=sid)
         except subprocess.TimeoutExpired: socketio.emit('traceroute_result', {'success': False, 'error': 'Traceroute timed out.'}, to=sid)
         except Exception as e: socketio.emit('traceroute_result', {'success': False, 'error': str(e)}, to=sid)
 
-    threading.Thread(target=execute_trace).start()
+    # CRITICAL: Use eventlet.spawn instead of threading.Thread
+    eventlet.spawn(execute_trace)
     return jsonify({'status': 'running'})
 
 @app.route('/api/speedtest', methods=['POST'])
@@ -1160,7 +1179,9 @@ def run_speedtest():
             env['HOME'] = '/tmp'
             
             cmd = ['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json']
-            process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60, env=env)
+            
+            # CRITICAL: Offload to tpool
+            process = eventlet.tpool.execute(subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60, env=env)
             
             data = None
             for line in reversed(process.stdout.splitlines()):
@@ -1180,8 +1201,6 @@ def run_speedtest():
                 now = time.time()
                 try:
                     conn = get_db()
-                    
-                    # Log the manual test (DOES NOT EVALUATE ALERT THRESHOLDS)
                     log_status = f"DL: {download} Mbps | UL: {upload} Mbps | Ping: {ping} ms"
                     conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Speedtest (Manual)', log_status))
                     
@@ -1198,7 +1217,9 @@ def run_speedtest():
                 elif process.stderr: err_msg = process.stderr.strip()
                 
                 try:
-                    fallback = subprocess.run(['speedtest', '--accept-license', '--accept-gdpr', '-L', '-f', 'json'], capture_output=True, text=True, timeout=10, env=env)
+                    # CRITICAL: Offload fallback process to tpool
+                    fallback = eventlet.tpool.execute(subprocess.run, ['speedtest', '--accept-license', '--accept-gdpr', '-L', '-f', 'json'], capture_output=True, text=True, timeout=10, env=env)
+                    
                     fb_data = None
                     for line in reversed(fallback.stdout.splitlines()):
                         line = line.strip()
@@ -1214,7 +1235,8 @@ def run_speedtest():
         except Exception as e: 
             socketio.emit('speedtest_result', {'success': False, 'error': str(e)}, to=sid)
 
-    threading.Thread(target=execute_test).start()
+    # CRITICAL: Use eventlet.spawn instead of threading.Thread
+    eventlet.spawn(execute_test)
     return jsonify({'status': 'running'})
 
 @app.route('/update_settings', methods=['POST'])
@@ -1237,7 +1259,6 @@ def update_settings():
     
     conn.execute("UPDATE settings SET value = ? WHERE key = 'smtp_target'", (request.form.get('smtp_target', ''),))
     
-    # Update Speedtest Automation & Alert Settings
     conn.execute("UPDATE settings SET value = ? WHERE key = 'st_interval'", (request.form.get('st_interval', '0'),))
     conn.execute("UPDATE settings SET value = ? WHERE key = 'st_alert_dl'", (request.form.get('st_alert_dl', '0'),))
     conn.execute("UPDATE settings SET value = ? WHERE key = 'st_alert_ul'", (request.form.get('st_alert_ul', '0'),))
@@ -1254,17 +1275,26 @@ def update_settings():
 @login_required
 @admin_required
 def test_alert():
-    conn = get_db()
-    settings_dict = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
-    conn.close()
-    try:
-        client = mqtt.Client("camera_monitor_test")
-        client.connect(settings_dict.get('mqtt_broker', '127.0.0.1'), int(settings_dict.get('mqtt_port', 1883)), 5)
-        client.publish(f"{settings_dict.get('mqtt_prefix', 'zabbix/cctv')}/test_device/ping", "TEST_PING", retain=False)
-        client.disconnect()
-        log_audit('User', current_user.username, 'Triggered test MQTT alert')
-        flash(f'Test alert sent.', 'success')
-    except Exception as e: flash(f'MQTT Error: {str(e)}', 'danger')
+    global mqtt_client, mqtt_prefix_global
+    if mqtt_client and mqtt_client.is_connected():
+        try:
+            mqtt_client.publish(f"{mqtt_prefix_global}/test_device/ping", "TEST_PING", retain=False)
+            log_audit('User', current_user.username, 'Triggered test MQTT alert')
+            flash(f'Test alert sent via active MQTT connection.', 'success')
+        except Exception as e: 
+            flash(f'MQTT Error: {str(e)}', 'danger')
+    else:
+        conn = get_db()
+        settings_dict = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
+        conn.close()
+        try:
+            client = mqtt.Client("camera_monitor_test")
+            client.connect(settings_dict.get('mqtt_broker', '127.0.0.1'), int(settings_dict.get('mqtt_port', 1883)), 5)
+            client.publish(f"{settings_dict.get('mqtt_prefix', 'zabbix/cctv')}/test_device/ping", "TEST_PING", retain=False)
+            client.disconnect()
+            log_audit('User', current_user.username, 'Triggered test MQTT alert (Fallback Connection)')
+            flash(f'Test alert sent (Local fallback socket).', 'success')
+        except Exception as e: flash(f'MQTT Error: {str(e)}', 'danger')
     return redirect(url_for('index'))
 
 @app.route('/add_switch', methods=['POST'])
@@ -1453,7 +1483,6 @@ def tunnel(device_type, device_id, req_path):
     full_req_path = f"{req_path}?{query_string}" if query_string else req_path
     
     clean_headers = {k: v for k, v in request.headers if k.lower() not in ['host', 'origin', 'referer', 'accept-encoding']}
-    # Force the strict host header resolution
     clean_headers['Host'] = resolved_ip 
     target_url = f"http://{resolved_ip}/{full_req_path.lstrip('/')}"
     

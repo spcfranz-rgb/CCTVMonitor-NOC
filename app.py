@@ -639,6 +639,8 @@ def serve_local_logo(filename):
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    fallback = request.args.get('fallback') == 'true'
+    
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
@@ -1267,6 +1269,7 @@ def tunnel(device_type, device_id, req_path):
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
         resp_headers = [(name, value) for (name, value) in resp.raw.headers.items() if name.lower() not in excluded_headers]
         
+        # 3. HTTP Header Rewrite
         for i, (name, value) in enumerate(resp_headers):
             if name.lower() == 'location':
                 parsed = urlparse(value)

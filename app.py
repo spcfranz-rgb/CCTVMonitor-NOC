@@ -658,16 +658,14 @@ def index():
     cursor = conn.cursor()
     cursor.execute("SELECT key, value FROM settings")
     settings_dict = {row['key']: row['value'] for row in cursor.fetchall()}
+    users = conn.execute("SELECT id, username, role FROM users").fetchall()
+    conn.close()
     
-    # Parse the saved speed test
     latest_speedtest = None
     if 'latest_speedtest' in settings_dict:
         try: latest_speedtest = json.loads(settings_dict['latest_speedtest'])
         except Exception: pass
         
-    users = conn.execute("SELECT id, username, role FROM users").fetchall()
-    conn.close()
-    
     default_subnet = get_local_subnet()
     
     return render_template('index.html', switches=switches, cameras=cameras, settings=settings_dict, users=users, default_subnet=default_subnet, latest_speedtest=latest_speedtest)
@@ -917,33 +915,16 @@ def run_speedtest():
                 
                 now = time.time()
                 try:
-                    # Save results to the database to persist across page reloads
                     conn = get_db()
                     log_status = f"DL: {download} Mbps | UL: {upload} Mbps | Ping: {ping} ms"
                     conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Speedtest', log_status))
-                    
-                    st_data = json.dumps({
-                        'download': download,
-                        'upload': upload,
-                        'ping': ping,
-                        'isp': data.get('isp', 'Unknown'),
-                        'server': server_string,
-                        'timestamp': now
-                    })
+                    st_data = json.dumps({'download': download, 'upload': upload, 'ping': ping, 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
                     conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('latest_speedtest', ?)", (st_data,))
                     conn.commit()
                     conn.close()
                 except Exception as e: print(f"DB Error saving speedtest: {e}")
 
-                socketio.emit('speedtest_result', {
-                    'success': True, 
-                    'download': f"{download} Mbps", 
-                    'upload': f"{upload} Mbps", 
-                    'ping': f"{ping} ms", 
-                    'isp': data.get('isp', 'Unknown'), 
-                    'server': server_string,
-                    'timestamp': now
-                })
+                socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
             else: 
                 err_msg = process.stderr.strip() or "Unknown execution error."
                 try:
@@ -1020,7 +1001,6 @@ def edit_switch(id):
     conn.close()
     return render_template('edit_switch.html', switch=switch)
 
-# SECURED: Converted destructive actions from GET to POST
 @app.route('/delete_switch/<int:id>', methods=['POST'])
 @login_required
 @admin_required
@@ -1075,7 +1055,6 @@ def edit_camera(id):
     conn.close()
     return render_template('edit_camera.html', camera=camera, switches=switches)
 
-# SECURED: Converted destructive actions from GET to POST
 @app.route('/delete_camera/<int:id>', methods=['POST'])
 @login_required
 @admin_required
@@ -1104,7 +1083,6 @@ def add_user():
     conn.close()
     return redirect(url_for('index'))
 
-# SECURED: Converted destructive actions from GET to POST
 @app.route('/delete_user/<int:id>', methods=['POST'])
 @login_required
 @admin_required
@@ -1135,7 +1113,6 @@ def snapshot(id):
 # ==========================================
 # WEB UI TUNNELING (REVERSE PROXY)
 # ==========================================
-# SECURED: Exempt the proxy tunnel from CSRF checks so camera WebUIs don't crash on POST
 @csrf.exempt
 @app.route('/tunnel/<device_type>/<int:device_id>/', defaults={'req_path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE'])
 @app.route('/tunnel/<device_type>/<int:device_id>/<path:req_path>', methods=['GET', 'POST', 'PUT', 'DELETE'])

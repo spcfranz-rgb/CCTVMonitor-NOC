@@ -304,7 +304,7 @@ def is_port_open(target, port, timeout=2):
 
 def is_stream_active(url):
     try:
-        response = subprocess.call(['ffprobe', '-rtsp_transport', '-v', 'error', '-i', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        response = subprocess.call(['ffprobe', '-rtsp_transport', 'tcp', '-v', 'error', '-i', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
         return response == 0
     except subprocess.TimeoutExpired: return False
 
@@ -373,10 +373,16 @@ def threaded_camera_check(cam):
             new_mac = get_mac_address(cam['ip'])
             if new_mac: fetched_mac = new_mac.upper()
 
-        stream_ok = is_stream_active(cam['stream_url'])
+        # FIX: Safely construct an authenticated URL if credentials exist in the DB
+        auth_url = cam['stream_url']
+        if cam.get('username') and cam.get('password') and '@' not in auth_url and auth_url.startswith('rtsp://'):
+            # Formats as rtsp://user:pass@ip:port/stream
+            auth_url = f"rtsp://{cam['username']}:{cam['password']}@{auth_url[7:]}"
+
+        stream_ok = is_stream_active(auth_url)
         if stream_ok:
             with SNAPSHOT_SEMAPHORE:
-                snap_bytes = get_snapshot_bytes(cam['ip'], cam['manufacturer'], cam['username'], cam['password'], cam['stream_url'])
+                snap_bytes = get_snapshot_bytes(cam['ip'], cam['manufacturer'], cam['username'], cam['password'], auth_url)
                 
     return cam['id'], cam_up, stream_ok, snap_bytes, fetched_mac
 

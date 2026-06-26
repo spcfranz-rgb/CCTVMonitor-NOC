@@ -26,6 +26,13 @@
             {% endif %}
             <h1 class="mb-0 h4">CCTV Dashboard</h1>
         </div>
+        
+        <!-- TELEMETRY STATUS BADGES -->
+        <div class="d-flex align-items-center gap-2">
+            <span id="mqttStatus" class="badge bg-secondary" title="Zabbix Broker Connection">MQTT: Checking...</span>
+            <span id="uiStatus" class="badge bg-success" title="WebSocket Hub Connection">UI: Online</span>
+        </div>
+
         <div class="d-flex flex-wrap align-items-center justify-content-center gap-2">
             <button class="btn btn-outline-warning btn-sm" onclick="runArpScan()">L2 ARP Sweep</button>
             <a href="/history" class="btn btn-outline-info btn-sm">View Event Logs</a>
@@ -578,6 +585,8 @@
         const diagSpinner = document.getElementById('diagSpinner');
         const diagSpinnerText = document.getElementById('diagSpinnerText');
         const diagOutput = document.getElementById('diagOutput');
+        const mqttBadge = document.getElementById('mqttStatus');
+        const uiBadge = document.getElementById('uiStatus');
         
         // --- JAVASCRIPT IDLE LOGOUT TIMER ---
         const IDLE_TIMEOUT_MS = {{ settings.idle_timeout|default(20) }} * 60 * 1000;
@@ -987,6 +996,23 @@
         }
         
         // --- SOCKET.IO LISTENERS ---
+        socket.on('connect', () => {
+            uiBadge.textContent = 'UI: Online';
+            uiBadge.className = 'badge bg-success';
+        });
+
+        socket.on('disconnect', () => {
+            uiBadge.textContent = 'UI: Offline';
+            uiBadge.className = 'badge bg-danger';
+            mqttBadge.textContent = 'MQTT: Unknown';
+            mqttBadge.className = 'badge bg-secondary';
+        });
+
+        socket.on('gateway_status', (data) => {
+            mqttBadge.textContent = data.mqtt ? 'MQTT: Online' : 'MQTT: Offline';
+            mqttBadge.className = data.mqtt ? 'badge bg-success' : 'badge bg-danger';
+        });
+
         socket.on('state_change', function(data) {
             const key = (data.type === 'switches' ? 'switch-' : 'camera-') + data.id;
             const badge = document.getElementById('status-' + key);

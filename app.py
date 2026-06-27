@@ -851,6 +851,83 @@ def monitor_loop():
         if force_check_event.ready(): force_check_event = Event()
 
 # ==========================================
+# WEBRTC (MEDIAMTX) INTEGRATION
+# ==========================================
+MEDIAMTX_API = "http://127.0.0.1:9997/v3/config/paths"
+
+def sync_mediamtx_cameras():
+    """Synchronizes the SQLite camera state with the MediaMTX WebRTC relay."""
+    try:
+        conn = get_db()
+        cameras = conn.execute("SELECT id, stream_url, username, password FROM cameras").fetchall()
+        conn.close()
+
+        # Fetch currently configured paths in MediaMTX
+        resp = requests.get(MEDIAMTX_API, timeout=3)
+        if resp.status_code == 200:
+            current_paths = resp.json().get('items', {})
+        else:
+            current_paths = {}
+
+        configured_cam_ids = set()
+
+        for cam in cameras:
+            cam_id = f"cam_{cam['id']}"
+            configured_cam_ids.add(cam_id)
+            
+            auth_url = cam['stream_url']
+            pwd = decrypt_pwd(cam['password'])
+            if cam['username'] and pwd and '@' not in auth_url and auth_url.startswith('rtsp://'):
+                auth_url = f"rtsp://{cam['username']}:{pwd}@{auth_url[7:]}"
+
+            payload = {
+                "source": auth_url,
+                "sourceOnDemand": True, # Only pull the RTSP stream when a user is actively watching
+                "runOnDemandCloseAfter": "10s"
+            }
+
+            # Add or Update the path
+            if cam_id not in current_paths:
+                requests.post(f"{MEDIAMTX_API}/{cam_id}", json=payload, timeout=3)
+            elif current_paths[cam_id].get('source') != auth_url:
+                requests.patch(f"{MEDIAMTX_API}/{cam_id}", json=payload, timeout=3)
+
+        # Prune deleted cameras from MediaMTX
+        for path_name in current_paths:
+            if path_name.startswith("cam_") and path_name not in configured_cam_ids:
+                requests.delete(f"{MEDIAMTX_API}/{path_name}", timeout=3)
+
+    except Exception as e:
+        print(f"MediaMTX Sync Error: {e}")
+
+# Secure WHEP reverse-proxy route
+@app.route('/api/webrtc/<int:cam_id>/whep', methods=['POST'])
+@login_required
+@operator_required
+def webrtc_whep(cam_id):
+    """Securely proxies the WebRTC SDP offer to the local MediaMTX instance."""
+    try:
+        sdp_offer = request.data
+        if not sdp_offer:
+            return "Missing SDP offer", 400
+
+        # Pass the SDP offer to MediaMTX
+        resp = requests.post(
+            f"http://127.0.0.1:8889/cam_{cam_id}/whep", 
+            data=sdp_offer,
+            headers={"Content-Type": "application/sdp"},
+            timeout=5
+        )
+        
+        if resp.status_code == 201:
+            return Response(resp.content, mimetype='application/sdp')
+        else:
+            return f"MediaMTX rejected offer: {resp.text}", 502
+
+    except requests.exceptions.RequestException as e:
+        return f"WebRTC Relay Offline: {str(e)}", 502
+
+# ==========================================
 # FLASK WEB ROUTES
 # ==========================================
 @app.route('/local_logo/<filename>')

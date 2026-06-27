@@ -1279,17 +1279,44 @@ def import_config():
 @login_required
 @operator_required
 def fetch_arp_table():
-    log_audit('User', current_user.username, 'Initiated native L2 ARP scan')
+    log_audit('User', current_user.username, 'Initiated Active L2 ARP sweep')
     try:
         subnet = get_local_subnet()
-        try:
-            bcast = str(ipaddress.IPv4Network(subnet, strict=False).broadcast_address)
-            eventlet.tpool.execute(subprocess.run, ['ping', '-c', '2', '-W', '1', '-b', bcast], timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception: pass
+        network = ipaddress.ip_network(subnet, strict=False)
         
+        # 1. The UDP Kernel-Force Function
+        def force_arp_resolution(ip_str):
+            try:
+                # Send a 1-byte dummy payload to a random closed port.
+                # This forces the host OS to instantly transmit an ARP Request to the physical switch.
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setblocking(False)
+                s.sendto(b'\x00', (ip_str, 53535))
+                s.close()
+            except Exception: pass
+
+        # 2. Blast the subnet concurrently using Eventlet's green threads
+        # This takes mere milliseconds since UDP is connectionless
+        hosts = [str(ip) for ip in network.hosts()]
+        pool = eventlet.greenpool.GreenPool(size=254)
+        for _ in pool.imap(force_arp_resolution, hosts):
+            pass 
+            
+        # 3. Give the kernel 500ms to receive the L2 replies and write them to procfs
+        eventlet.sleep(0.5)
+        
+        # 4. Read the freshly populated physical cache
         devices = get_camlan_arp_table()
-        return jsonify({"status": "success", "count": len(devices), "interface_scanned": "All Interfaces", "devices": devices}), 200
-    except Exception as e: return jsonify({"status": "error", "message": str(e)}), 500
+        
+        return jsonify({
+            "status": "success", 
+            "count": len(devices), 
+            "interface_scanned": "Physical Host Interfaces", 
+            "devices": devices
+        }), 200
+        
+    except Exception as e: 
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/api/scan_network', methods=['POST'])
 @login_required

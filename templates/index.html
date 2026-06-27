@@ -149,7 +149,7 @@
                                         <tr>
                                             <td>
                                                 {{ c.name }}
-                                                <button class="btn btn-sm btn-outline-secondary ms-2 py-0" onclick="showPreview({{ c.id }}, '{{ c.name }}')">Live</button>
+                                                <button class="btn btn-sm btn-outline-secondary ms-2 py-0" onclick="showPreview({{ c.id }}, '{{ c.name }}')">Preview</button>
                                             </td>
                                             <td>
                                                 <div class="fw-bold">{{ c.ip }}</div>
@@ -700,18 +700,32 @@
                 modalInstance = new bootstrap.Modal(document.getElementById('previewModal'));
                 document.getElementById('previewModal').addEventListener('hidden.bs.modal', function () {
                     isModalOpen = false;
+                    
+                    // ARCHITECT FIX: Forcefully stop media tracks to prevent browser memory leaks
+                    if (video.srcObject) {
+                        video.srcObject.getTracks().forEach(track => track.stop());
+                        video.srcObject = null;
+                    }
+
                     if (peerConnection) {
                         peerConnection.close();
                         peerConnection = null;
                     }
-                    video.srcObject = null;
                 });
             }
             
             modalInstance.show();
 
             try {
-                peerConnection = new RTCPeerConnection();
+                // NAT Traversal configuration injected here if needed
+                const configuration = {
+                    iceServers: [
+                        { urls: "stun:stun.l.google.com:19302" }
+                    ],
+                    iceTransportPolicy: "all"
+                };
+
+                peerConnection = new RTCPeerConnection(configuration);
 
                 // Bind incoming video tracks to the HTML5 video element
                 peerConnection.ontrack = (event) => {
@@ -722,14 +736,11 @@
                     }
                 };
 
-                // We only want to receive media, not send microphone/webcam data
                 peerConnection.addTransceiver('video', { direction: 'recvonly' });
 
-                // Generate the SDP offer
                 const offer = await peerConnection.createOffer();
                 await peerConnection.setLocalDescription(offer);
 
-                // Send the offer to your secure Flask Proxy
                 const response = await fetch(`/api/webrtc/${id}/whep`, {
                     method: 'POST',
                     body: offer.sdp,
@@ -745,7 +756,6 @@
 
                 const answerSdp = await response.text();
                 
-                // Apply the remote SDP answer from MediaMTX
                 await peerConnection.setRemoteDescription({
                     type: 'answer',
                     sdp: answerSdp
@@ -1062,7 +1072,6 @@
         });
 
         // --- STATIC DOM HYDRATION ---
-        // Parses the backend-rendered timestamp on initial page load safely without document.write
         const stTimeEl = document.getElementById('st-time');
         if (stTimeEl && stTimeEl.dataset.timestamp) {
             stTimeEl.textContent = new Date(parseFloat(stTimeEl.dataset.timestamp) * 1000).toLocaleString();

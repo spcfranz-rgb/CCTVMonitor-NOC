@@ -5,17 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CCTV Monitor Dashboard</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
-    <!-- CSRF Token Meta Tag for secure fetch/AJAX calls -->
     <meta name="csrf-token" content="{{ csrf_token() }}">
 </head>
 <body class="container py-4">
 
-    <!-- Global Toasts Container -->
     <div aria-live="polite" aria-atomic="true" class="position-relative">
         <div class="toast-container position-fixed bottom-0 end-0 p-3" id="toastContainer" style="z-index: 1060;"></div>
     </div>
 
-    <!-- Header Navigation -->
     <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center mb-4 border-bottom pb-3 gap-3">
         <div class="d-flex align-items-center justify-content-center justify-content-md-start">
             {% if company_logo %}
@@ -27,7 +24,6 @@
             <h1 class="mb-0 h4">CCTV Dashboard</h1>
         </div>
         
-        <!-- TELEMETRY STATUS BADGES -->
         <div class="d-flex align-items-center gap-2">
             <span id="mqttStatus" class="badge bg-secondary" title="Zabbix Broker Connection">MQTT: Checking...</span>
             <span id="uiStatus" class="badge bg-success" title="WebSocket Hub Connection">UI: Online</span>
@@ -41,7 +37,6 @@
         </div>
     </div>
 
-    <!-- Flash Messages -->
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% if messages %}
         {% for category, message in messages %}
@@ -53,7 +48,6 @@
       {% endif %}
     {% endwith %}
 
-    <!-- Dashboard Tabs -->
     <ul class="nav nav-tabs mb-4" id="dashboardTabs" role="tablist">
         <li class="nav-item" role="presentation">
             <button class="nav-link active fw-bold" id="monitoring-tab" data-bs-toggle="tab" data-bs-target="#tab-monitoring" type="button" role="tab" aria-selected="true">
@@ -76,13 +70,10 @@
         {% endif %}
     </ul>
 
-    <!-- TAB CONTENT AREA -->
     <div class="tab-content" id="dashboardTabsContent">
 
-        <!-- TAB 1: LIVE MONITORING -->
         <div class="tab-pane fade show active" id="tab-monitoring" role="tabpanel">
             <div class="row">
-                <!-- Switches -->
                 <div class="col-xl-4 col-lg-5">
                     <div class="card mb-4 shadow-sm border-secondary">
                         <div class="card-header bg-dark border-secondary"><h5 class="mb-0">Network Switches</h5></div>
@@ -144,7 +135,6 @@
                     </div>
                 </div>
 
-                <!-- Cameras -->
                 <div class="col-xl-8 col-lg-7">
                     <div class="card shadow-sm mb-4 border-secondary">
                         <div class="card-header bg-dark border-secondary d-flex justify-content-between align-items-center">
@@ -159,7 +149,7 @@
                                         <tr>
                                             <td>
                                                 {{ c.name }}
-                                                <button class="btn btn-sm btn-outline-secondary ms-2 py-0" onclick="showPreview({{ c.id }}, '{{ c.name }}')">Preview</button>
+                                                <button class="btn btn-sm btn-outline-secondary ms-2 py-0" onclick="showPreview({{ c.id }}, '{{ c.name }}')">Live</button>
                                             </td>
                                             <td>
                                                 <div class="fw-bold">{{ c.ip }}</div>
@@ -274,11 +264,9 @@
             </div>
         </div>
 
-        <!-- TAB 2: DIAGNOSTICS & TOOLS -->
         {% if current_user.role in ['admin', 'operator'] %}
         <div class="tab-pane fade" id="tab-diagnostics" role="tabpanel">
             <div class="row">
-                <!-- Ping / Trace -->
                 <div class="col-lg-6 mb-4">
                     <div class="card h-100 shadow-sm border-info">
                         <div class="card-header bg-dark border-info text-info"><h5 class="mb-0">Manual Diagnostic Tool</h5></div>
@@ -299,7 +287,6 @@
                     </div>
                 </div>
 
-                <!-- Speed Test -->
                 <div class="col-lg-6 mb-4">
                     <div class="card h-100 shadow-sm border-warning">
                         <div class="card-header bg-dark border-warning text-warning"><h5 class="mb-0">WAN Speed Test</h5></div>
@@ -333,11 +320,9 @@
         </div>
         {% endif %}
 
-        <!-- TAB 3: ADMINISTRATION & SETTINGS -->
         {% if current_user.role == 'admin' %}
         <div class="tab-pane fade" id="tab-admin" role="tabpanel">
             <div class="row">
-                <!-- Global Settings -->
                 <div class="col-lg-6 mb-4">
                     <div class="card h-100 shadow-sm border-secondary">
                         <div class="card-header bg-dark border-secondary"><h5 class="mb-0">Global Configuration</h5></div>
@@ -395,7 +380,6 @@
                                     <input type="email" id="smtp_target" name="smtp_target" class="form-control border-secondary" placeholder="noc-alerts@company.com" value="{{ settings.smtp_target }}">
                                 </div>
 
-                                <!-- NEW: WAN Speed Automation & Alert Settings -->
                                 <h6 class="text-muted border-bottom border-secondary pb-2 mb-3 mt-4">WAN Speed Alerts & Automation</h6>
                                 <div class="row mb-4">
                                     <div class="col-md-3">
@@ -436,7 +420,6 @@
                     </div>
                 </div>
 
-                <!-- User Management -->
                 <div class="col-lg-6 mb-4">
                     <div class="card h-100 shadow-sm border-secondary">
                         <div class="card-header bg-dark border-secondary"><h5 class="mb-0">Access Management</h5></div>
@@ -484,29 +467,23 @@
         {% endif %}
     </div>
 
-    <!-- ========================================== -->
-    <!-- MODALS & DIALOGS                           -->
-    <!-- ========================================== -->
-    
-    <!-- Camera Preview Modal -->
     <div class="modal fade" id="previewModal" tabindex="-1" aria-hidden="true">
       <div class="modal-dialog modal-lg modal-dialog-centered">
         <div class="modal-content border-secondary">
           <div class="modal-header bg-dark border-secondary">
-            <h5 class="modal-title" id="previewModalLabel">Camera Preview</h5>
+            <h5 class="modal-title" id="previewModalLabel">Live Stream</h5>
             <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
           </div>
-          <div class="modal-body text-center bg-dark" style="min-height: 300px;">
-            <div class="spinner-border text-primary mt-5" id="previewSpinner" role="status">
-                <span class="visually-hidden">Loading...</span>
+          <div class="modal-body text-center bg-dark p-0" style="min-height: 400px; position: relative;">
+            <div class="spinner-border text-primary position-absolute top-50 start-50 translate-middle" id="previewSpinner" role="status" style="z-index: 10;">
+                <span class="visually-hidden">Negotiating WebRTC...</span>
             </div>
-            <img id="previewImage" src="" class="img-fluid d-none rounded border border-secondary" alt="Stream Preview">
+            <video id="previewVideo" class="w-100 h-100 d-none" autoplay muted playsinline controls style="background: black;"></video>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- Import Config Modal -->
     {% if current_user.role == 'admin' %}
     <div class="modal fade" id="importModal" tabindex="-1" aria-hidden="true">
       <div class="modal-dialog">
@@ -536,13 +513,11 @@
       </div>
     </div>
     
-    <!-- Confirm Delete Form (Hidden) -->
     <form id="deleteForm" method="POST" style="display: none;">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
     </form>
     {% endif %}
 
-    <!-- ARP Scanner Modal -->
     <div class="modal fade" id="arpScannerModal" tabindex="-1" aria-hidden="true">
       <div class="modal-dialog modal-lg">
         <div class="modal-content bg-dark border-secondary">
@@ -561,10 +536,6 @@
       </div>
     </div>
 
-    <!-- ========================================== -->
-    <!-- SCRIPTS                                    -->
-    <!-- ========================================== -->
-    
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" integrity="sha384-2huaZvOR9iDzHqslqwpR87isEmrfxqyWOF7hr7BY6KG0+hVKLoEXMPUJw3ynWuhO" crossorigin="anonymous"></script>
 
@@ -705,57 +676,87 @@
             });
         }
         
-        let modalInstance;
-        let previewTimer;
-        let currentPreviewId;
+        let peerConnection = null;
         let isModalOpen = false;
+        let modalInstance;
 
-        function showPreview(id, name) {
-            currentPreviewId = id;
+        async function showPreview(id, name) {
             isModalOpen = true;
+            document.getElementById('previewModalLabel').textContent = 'Live WebRTC: ' + name;
+            
+            const video = document.getElementById('previewVideo');
+            const spinner = document.getElementById('previewSpinner');
+            
+            video.classList.add('d-none');
+            spinner.classList.remove('d-none');
+
+            // Cleanup previous connection if it exists
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+
             if (!modalInstance) {
                 modalInstance = new bootstrap.Modal(document.getElementById('previewModal'));
                 document.getElementById('previewModal').addEventListener('hidden.bs.modal', function () {
                     isModalOpen = false;
-                    if (previewTimer) clearTimeout(previewTimer);
+                    if (peerConnection) {
+                        peerConnection.close();
+                        peerConnection = null;
+                    }
+                    video.srcObject = null;
                 });
             }
-            document.getElementById('previewModalLabel').textContent = 'Live Preview: ' + name;
-            const img = document.getElementById('previewImage');
-            const spinner = document.getElementById('previewSpinner');
-            if (previewTimer) clearTimeout(previewTimer);
             
-            function fetchSnapshot(isFirstLoad = false) {
-                if (!isModalOpen) return;
-                const timestamp = new Date().getTime();
-                const newSrc = `/snapshot/${currentPreviewId}?t=${timestamp}`;
-                
-                if (isFirstLoad) {
-                    img.classList.add('d-none'); spinner.classList.remove('d-none'); img.src = newSrc;
-                } else {
-                    const tempImg = new Image();
-                    tempImg.onload = function() { 
-                        if (isModalOpen) { img.src = this.src; previewTimer = setTimeout(() => fetchSnapshot(false), 10000); }
-                    };
-                    tempImg.onerror = function() {
-                        if (isModalOpen) { previewTimer = setTimeout(() => fetchSnapshot(false), 10000); }
-                    };
-                    tempImg.src = newSrc;
-                }
-            }
-
-            img.onload = function() { 
-                spinner.classList.add('d-none'); img.classList.remove('d-none'); 
-                if (!previewTimer && isModalOpen) { previewTimer = setTimeout(() => fetchSnapshot(false), 10000); }
-            };
-            img.onerror = function() {
-                spinner.classList.add('d-none');
-                showToast('Failed to load initial snapshot.', 'warning');
-                modalInstance.hide();
-            };
-            
-            fetchSnapshot(true);
             modalInstance.show();
+
+            try {
+                peerConnection = new RTCPeerConnection();
+
+                // Bind incoming video tracks to the HTML5 video element
+                peerConnection.ontrack = (event) => {
+                    if (video.srcObject !== event.streams[0]) {
+                        video.srcObject = event.streams[0];
+                        video.classList.remove('d-none');
+                        spinner.classList.add('d-none');
+                    }
+                };
+
+                // We only want to receive media, not send microphone/webcam data
+                peerConnection.addTransceiver('video', { direction: 'recvonly' });
+
+                // Generate the SDP offer
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+
+                // Send the offer to your secure Flask Proxy
+                const response = await fetch(`/api/webrtc/${id}/whep`, {
+                    method: 'POST',
+                    body: offer.sdp,
+                    headers: {
+                        'Content-Type': 'application/sdp',
+                        'X-CSRFToken': csrfToken
+                    }
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Server returned ${response.status}`);
+                }
+
+                const answerSdp = await response.text();
+                
+                // Apply the remote SDP answer from MediaMTX
+                await peerConnection.setRemoteDescription({
+                    type: 'answer',
+                    sdp: answerSdp
+                });
+
+            } catch (error) {
+                console.error("WebRTC Error:", error);
+                spinner.classList.add('d-none');
+                showToast('Stream negotiation failed. Check diagnostics.', 'danger');
+                if(isModalOpen) modalInstance.hide();
+            }
         }
 
         // --- DIAGNOSTICS (PING & TRACE) ---
@@ -1059,6 +1060,7 @@
                 }
             }
         });
+
         // --- STATIC DOM HYDRATION ---
         // Parses the backend-rendered timestamp on initial page load safely without document.write
         const stTimeEl = document.getElementById('st-time');

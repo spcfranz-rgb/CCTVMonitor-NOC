@@ -1737,29 +1737,25 @@ def init_logos():
     LOCAL_COMPANY_LOGO = process_logo('COMPANY_LOGO_URL', 'company_logo.png')
     LOCAL_CUSTOMER_LOGO = process_logo('CUSTOMER_LOGO_URL', 'customer_logo.png')
 
+# ==========================================
+# STARTUP INITIALIZATION
+# ==========================================
 try:
     init_db()
     init_logos()
     os.makedirs('/app/data', exist_ok=True)
+    
+    # Start background polling tasks
     socketio.start_background_task(monitor_loop)
     socketio.start_background_task(automated_speedtest_loop)
     socketio.start_background_task(sync_db_loop)
     socketio.start_background_task(log_prune_loop)
-except Exception as e: print(f"Startup initialization error: {e}")
+    
+    # Sync SQLite cameras to MediaMTX WebRTC Relay on boot
+    eventlet.spawn_n(sync_mediamtx_cameras)
+    
+except Exception as e: 
+    print(f"Startup initialization error: {e}")
 
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5000)
-
-try:
-    init_db()
-    init_logos()
-    os.makedirs('/app/data', exist_ok=True)
-    socketio.start_background_task(monitor_loop)
-    socketio.start_background_task(automated_speedtest_loop)
-    socketio.start_background_task(sync_db_loop)
-    socketio.start_background_task(log_prune_loop)
-    
-    # ADD THIS LINE: Push DB cameras to MediaMTX on boot
-    eventlet.spawn_n(sync_mediamtx_cameras)
-    
-except Exception as e: print(f"Startup initialization error: {e}")

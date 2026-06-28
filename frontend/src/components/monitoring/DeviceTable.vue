@@ -68,6 +68,10 @@ const singularType = computed(() => {
 
 const statusClass = (status) => {
   if (status === 'UP') return 'bg-success'
+  
+  // NEW: Catch the intermediate state and apply a distinct color (Cyan/Info)
+  if (status?.includes('EVALUATING')) return 'bg-info text-dark fw-bold' 
+  
   if (status?.includes('Silenced')) return 'bg-warning text-dark'
   if (status?.includes('DOWN') || status?.includes('UNREACHABLE') || status?.includes('ERR')) return 'bg-danger'
   return 'bg-secondary'

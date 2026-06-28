@@ -8,12 +8,13 @@ export const useSystemStore = defineStore('system', {
     csrfToken: '',
     mqttOnline: false,
     uiOnline: false,
-    socketId: null, // Needed for async diagnostics
+    socketId: null,
     logos: { company: null, customer: null },
     devices: { switches: [], nvrs: [], cameras: [] },
     settings: {},
     users: [],
     latestSpeedtest: null,
+    defaultSubnet: '192.168.1.0/24', // Added for Scanner
     toasts: []
   }),
   actions: {
@@ -41,6 +42,7 @@ export const useSystemStore = defineStore('system', {
         this.settings = data.settings || {}
         this.users = data.users || []
         this.latestSpeedtest = data.latest_speedtest || null
+        this.defaultSubnet = data.default_subnet || '192.168.1.0/24' // Capture LAN subnet
         this.initSocket()
       } catch (error) {
         console.error("Failed to fetch system data:", error)
@@ -70,7 +72,6 @@ export const useSystemStore = defineStore('system', {
         if (target) target.status = data.status
       })
     },
-    // Allows components to securely hook into specific Socket streams
     listen(event, callback) { if (this._socket) this._socket.on(event, callback) },
     unlisten(event) { if (this._socket) this._socket.off(event) }
   }

@@ -39,8 +39,11 @@ let pollInterval = null
 
 onMounted(async () => {
   try {
-    // Air-gapped config. Relies on internal mDNS/LAN routing, not Google STUN
-    peerConnection = new RTCPeerConnection({ iceServers: [], iceTransportPolicy: "all" })
+    // Inject the Context-Aware STUN/TURN servers pulled from the gateway
+    const rtcConfig = store.webrtcConfig || { iceServers: [] };
+    rtcConfig.iceTransportPolicy = "all"; // Allow both host (direct) and relay (TURN) candidates
+
+    peerConnection = new RTCPeerConnection(rtcConfig)
 
     peerConnection.ontrack = (event) => {
       if (videoEl.value.srcObject !== event.streams[0]) {
@@ -68,7 +71,7 @@ onMounted(async () => {
 const initFallbackMode = () => {
   loading.value = false
   fallbackMode.value = true
-  store.addToast('WebRTC failed. Falling back to snapshot polling.', 'warning')
+  store.addToast('WebRTC negotiation failed. Falling back to HTTP snapshot polling.', 'warning')
   
   const refresh = () => { snapshotUrl.value = `/api/snapshot/${props.camera.id}?t=${Date.now()}` }
   refresh()
@@ -76,7 +79,6 @@ const initFallbackMode = () => {
 }
 
 onUnmounted(() => {
-  // Absolute GC certainty
   if (pollInterval) clearInterval(pollInterval)
   if (videoEl.value?.srcObject) {
     videoEl.value.srcObject.getTracks().forEach(t => t.stop())

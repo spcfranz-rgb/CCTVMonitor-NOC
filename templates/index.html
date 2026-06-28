@@ -532,12 +532,13 @@
             <h5 class="modal-title" id="previewModalLabel">Live Stream</h5>
             <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
           </div>
-          <div class="modal-body text-center bg-dark p-0" style="min-height: 400px; position: relative;">
-            <div class="spinner-border text-primary position-absolute top-50 start-50 translate-middle" id="previewSpinner" role="status" style="z-index: 10;">
-                <span class="visually-hidden">Negotiating WebRTC...</span>
+            <div class="modal-body text-center bg-dark p-0" style="min-height: 400px; position: relative;">
+                <div class="spinner-border text-primary position-absolute top-50 start-50 translate-middle" id="previewSpinner" role="status" style="z-index: 10;">
+                    <span class="visually-hidden">Negotiating WebRTC...</span>
+                </div>
+                <video id="previewVideo" class="w-100 h-100 d-none" autoplay muted playsinline controls style="background: black;"></video>
+                <img id="previewImg" class="w-100 h-100 d-none" style="object-fit: contain;" alt="Camera Snapshot">
             </div>
-            <video id="previewVideo" class="w-100 h-100 d-none" autoplay muted playsinline controls style="background: black;"></video>
-          </div>
         </div>
       </div>
     </div>
@@ -738,90 +739,85 @@
         let isModalOpen = false;
         let modalInstance;
 
-        async function showPreview(id, name) {
-            isModalOpen = true;
-            document.getElementById('previewModalLabel').textContent = 'Live WebRTC: ' + name;
-            
-            const video = document.getElementById('previewVideo');
-            const spinner = document.getElementById('previewSpinner');
-            
-            video.classList.add('d-none');
-            spinner.classList.remove('d-none');
+async function showPreview(id, name) {
+    isModalOpen = true;
+    document.getElementById('previewModalLabel').textContent = 'Live Stream: ' + name;
+    
+    const video = document.getElementById('previewVideo');
+    const img = document.getElementById('previewImg'); 
+    const spinner = document.getElementById('previewSpinner');
+    
+    // Reset state
+    video.classList.add('d-none');
+    img.classList.add('d-none');
+    spinner.classList.remove('d-none');
 
+    // Cleanup previous connection
+    if (peerConnection) {
+        peerConnection.close();
+        peerConnection = null;
+    }
+
+    if (!modalInstance) {
+        modalInstance = new bootstrap.Modal(document.getElementById('previewModal'));
+        document.getElementById('previewModal').addEventListener('hidden.bs.modal', function () {
+            isModalOpen = false;
+            if (video.srcObject) {
+                video.srcObject.getTracks().forEach(track => track.stop());
+                video.srcObject = null;
+            }
             if (peerConnection) {
                 peerConnection.close();
                 peerConnection = null;
             }
+        });
+    }
+    
+    modalInstance.show();
 
-            if (!modalInstance) {
-                modalInstance = new bootstrap.Modal(document.getElementById('previewModal'));
-                document.getElementById('previewModal').addEventListener('hidden.bs.modal', function () {
-                    isModalOpen = false;
-                    
-                    if (video.srcObject) {
-                        video.srcObject.getTracks().forEach(track => track.stop());
-                        video.srcObject = null;
-                    }
+    try {
+        const configuration = {
+            iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+            iceTransportPolicy: "all"
+        };
 
-                    if (peerConnection) {
-                        peerConnection.close();
-                        peerConnection = null;
-                    }
-                });
-            }
-            
-            modalInstance.show();
+        peerConnection = new RTCPeerConnection(configuration);
 
-            try {
-                const configuration = {
-                    iceServers: [
-                        { urls: "stun:stun.l.google.com:19302" }
-                    ],
-                    iceTransportPolicy: "all"
-                };
-
-                peerConnection = new RTCPeerConnection(configuration);
-
-                peerConnection.ontrack = (event) => {
-                    if (video.srcObject !== event.streams[0]) {
-                        video.srcObject = event.streams[0];
-                        video.classList.remove('d-none');
-                        spinner.classList.add('d-none');
-                    }
-                };
-
-                peerConnection.addTransceiver('video', { direction: 'recvonly' });
-
-                const offer = await peerConnection.createOffer();
-                await peerConnection.setLocalDescription(offer);
-
-                const response = await fetch(`/api/webrtc/${id}/whep`, {
-                    method: 'POST',
-                    body: offer.sdp,
-                    headers: {
-                        'Content-Type': 'application/sdp',
-                        'X-CSRFToken': csrfToken
-                    }
-                });
-
-                if (!response.ok) {
-                    throw new Error(`Server returned ${response.status}`);
-                }
-
-                const answerSdp = await response.text();
-                
-                await peerConnection.setRemoteDescription({
-                    type: 'answer',
-                    sdp: answerSdp
-                });
-
-            } catch (error) {
-                console.error("WebRTC Error:", error);
+        peerConnection.ontrack = (event) => {
+            if (video.srcObject !== event.streams[0]) {
+                video.srcObject = event.streams[0];
+                video.classList.remove('d-none');
                 spinner.classList.add('d-none');
-                showToast('Stream negotiation failed. Check diagnostics.', 'danger');
-                if(isModalOpen) modalInstance.hide();
             }
-        }
+        };
+
+        peerConnection.addTransceiver('video', { direction: 'recvonly' });
+
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
+
+        const response = await fetch(`/api/webrtc/${id}/whep`, {
+            method: 'POST',
+            body: offer.sdp,
+            headers: { 'Content-Type': 'application/sdp', 'X-CSRFToken': csrfToken }
+        });
+
+        if (!response.ok) throw new Error(`Server returned ${response.status}`);
+
+        const answerSdp = await response.text();
+        await peerConnection.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+
+    } catch (error) {
+        console.error("WebRTC Error:", error);
+        spinner.classList.add('d-none');
+        
+        // FALLBACK: Load snapshot
+        showToast('WebRTC failed. Falling back to snapshot...', 'warning');
+        img.src = `/snapshot/${id}?t=${new Date().getTime()}`;
+        img.classList.remove('d-none');
+        video.classList.add('d-none');
+    }
+}
 
         // --- DIAGNOSTICS (PING & TRACE) ---
         function runPing() {

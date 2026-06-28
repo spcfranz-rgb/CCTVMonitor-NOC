@@ -18,9 +18,14 @@
       
       <div class="d-flex justify-content-between align-items-center mb-3">
         <h4 class="mb-0 text-light d-none d-md-block">Hardware Overview</h4>
-        <div v-if="store.user?.role === 'admin'" class="btn-group w-100 w-md-auto shadow-sm">
-          <button class="btn btn-outline-success fw-bold" @click="showScannerModal = true">🔍 Auto-Discover</button>
-          <button class="btn btn-outline-info fw-bold" @click="showAddModal = true">➕ Add Device</button>
+        
+        <div v-if="['admin', 'operator'].includes(store.user?.role)" class="btn-group w-100 w-md-auto shadow-sm">
+          
+          <button class="btn btn-outline-warning fw-bold" @click="showArpModal = true">📡 L2 ARP Sweep</button>
+          
+          <button v-if="store.user?.role === 'admin'" class="btn btn-outline-success fw-bold" @click="showScannerModal = true">🔍 Auto-Discover</button>
+          <button v-if="store.user?.role === 'admin'" class="btn btn-outline-info fw-bold" @click="showAddModal = true">➕ Add Device</button>
+          
         </div>
       </div>
 
@@ -87,6 +92,11 @@
       @close="editingDevice = null" 
     />
 
+    <ArpScannerModal 
+      v-if="showArpModal" 
+      @close="showArpModal = false" 
+    />
+
   </div>
 </template>
 
@@ -104,6 +114,7 @@ import WebRtcPreviewModal from '../components/modals/WebRtcPreviewModal.vue'
 import DeviceAddModal from '../components/modals/DeviceAddModal.vue'
 import NetworkScannerModal from '../components/modals/NetworkScannerModal.vue'
 import DeviceEditModal from '../components/modals/DeviceEditModal.vue'
+import ArpScannerModal from '../components/modals/ArpScannerModal.vue'
 
 // State Management
 import { useSystemStore } from '../stores/systemStore'
@@ -117,6 +128,7 @@ const showAddModal = ref(false)
 const showScannerModal = ref(false)
 const editingDevice = ref(null)
 const editingType = ref(null)
+const showArpModal = ref(false)
 
 // --- Lifecycle ---
 onMounted(() => {

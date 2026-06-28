@@ -735,9 +735,10 @@
             });
         }
         
-        let peerConnection = null;
-        let isModalOpen = false;
-        let modalInstance;
+let peerConnection = null;
+let snapshotInterval = null; // Persistent reference for the polling interval
+let isModalOpen = false;
+let modalInstance;
 
 async function showPreview(id, name) {
     isModalOpen = true;
@@ -747,21 +748,26 @@ async function showPreview(id, name) {
     const img = document.getElementById('previewImg'); 
     const spinner = document.getElementById('previewSpinner');
     
-    // Reset state
+    // --- 1. Reset UI State ---
     video.classList.add('d-none');
     img.classList.add('d-none');
     spinner.classList.remove('d-none');
 
-    // Cleanup previous connection
+    // --- 2. Cleanup Resources (Previous sessions) ---
+    if (snapshotInterval) clearInterval(snapshotInterval);
     if (peerConnection) {
         peerConnection.close();
         peerConnection = null;
     }
 
+    // --- 3. Modal Event Lifecycle ---
     if (!modalInstance) {
         modalInstance = new bootstrap.Modal(document.getElementById('previewModal'));
         document.getElementById('previewModal').addEventListener('hidden.bs.modal', function () {
             isModalOpen = false;
+            
+            // Critical: Ensure no memory leaks or background network noise
+            if (snapshotInterval) clearInterval(snapshotInterval);
             if (video.srcObject) {
                 video.srcObject.getTracks().forEach(track => track.stop());
                 video.srcObject = null;
@@ -811,11 +817,19 @@ async function showPreview(id, name) {
         console.error("WebRTC Error:", error);
         spinner.classList.add('d-none');
         
-        // FALLBACK: Load snapshot
-        showToast('WebRTC failed. Falling back to snapshot...', 'warning');
-        img.src = `/snapshot/${id}?t=${new Date().getTime()}`;
+        // --- 4. Fallback Execution ---
+        showToast('WebRTC failed. Falling back to snapshot (Polling enabled)...', 'warning');
+        
+        // Define polling function to bypass cache
+        const refreshSnapshot = () => {
+            img.src = `/snapshot/${id}?t=${new Date().getTime()}`;
+        };
+        
+        refreshSnapshot(); // Trigger initial load immediately
         img.classList.remove('d-none');
-        video.classList.add('d-none');
+        
+        // Poll every 5 seconds to provide "live-ish" updates
+        snapshotInterval = setInterval(refreshSnapshot, 5000);
     }
 }
 

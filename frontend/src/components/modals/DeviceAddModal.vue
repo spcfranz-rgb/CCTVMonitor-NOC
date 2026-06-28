@@ -81,9 +81,14 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import axios from 'axios'
 import { useSystemStore } from '../../stores/systemStore'
+
+// NEW: Accept the optional IP address from the parent
+const props = defineProps({
+  initialIp: { type: String, default: '' }
+})
 
 const emit = defineEmits(['close'])
 const store = useSystemStore()
@@ -97,15 +102,20 @@ const form = ref({
   username: '', password: ''
 })
 
+// NEW: Hydrate the form if an IP was passed in
+onMounted(() => {
+  if (props.initialIp) {
+    form.value.ip = props.initialIp
+  }
+})
+
 const submitForm = async () => {
   saving.value = true
   try {
-    // Dynamically route plurals for the API endpoint
     const endpoint = type.value === 'camera' ? 'cameras' : `${type.value}s`
-    
     await axios.post(`/api/v1/${endpoint}`, form.value)
     store.addToast(`${type.value.toUpperCase()} added successfully.`)
-    await store.fetchSystemData() // Re-hydrate the DOM tables instantly
+    await store.fetchSystemData() 
     emit('close')
   } catch (error) {
     store.addToast(error.response?.data?.message || 'Failed to add device.', 'danger')

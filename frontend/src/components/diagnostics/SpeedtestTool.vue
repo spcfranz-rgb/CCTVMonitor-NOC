@@ -15,35 +15,35 @@
 
       <div v-if="error" class="alert alert-danger">{{ error }}</div>
 
-      <div v-if="!loading && result" class="row text-center g-3 mt-2">
+      <div v-if="!loading && store.latestSpeedtest" class="row text-center g-3 mt-2">
         <div class="col-12 col-md-4">
           <div class="p-3 border border-secondary rounded bg-dark h-100">
             <div class="text-muted small fw-bold">PING</div>
-            <div class="fs-4 fw-bold text-info">{{ result.ping }}<span class="fs-6 ms-1">ms</span></div>
+            <div class="fs-4 fw-bold text-info">{{ formatNumber(store.latestSpeedtest.ping) }}<span class="fs-6 ms-1">ms</span></div>
           </div>
         </div>
         <div class="col-12 col-md-4">
           <div class="p-3 border border-secondary rounded bg-dark h-100">
             <div class="text-muted small fw-bold">DOWNLOAD</div>
-            <div class="fs-4 fw-bold text-success">{{ result.download }}</div>
+            <div class="fs-4 fw-bold text-success">{{ formatNumber(store.latestSpeedtest.download) }}<span class="fs-6 ms-1">Mbps</span></div>
           </div>
         </div>
         <div class="col-12 col-md-4">
           <div class="p-3 border border-secondary rounded bg-dark h-100">
             <div class="text-muted small fw-bold">UPLOAD</div>
-            <div class="fs-4 fw-bold text-warning">{{ result.upload }}</div>
+            <div class="fs-4 fw-bold text-warning">{{ formatNumber(store.latestSpeedtest.upload) }}<span class="fs-6 ms-1">Mbps</span></div>
           </div>
         </div>
         <div class="col-12 mt-3">
           <div class="small text-muted border-top border-secondary pt-2">
-            <strong>ISP:</strong> {{ result.isp }}<br>
-            <strong>Target Server:</strong> {{ result.server }}<br>
-            <strong>Tested:</strong> {{ formatDate(result.timestamp) }}
+            <strong>ISP:</strong> {{ store.latestSpeedtest.isp }}<br>
+            <strong>Target Server:</strong> {{ store.latestSpeedtest.server }}<br>
+            <strong>Tested:</strong> {{ formatDate(store.latestSpeedtest.timestamp) }}
           </div>
         </div>
       </div>
       
-      <div v-if="!loading && !result && !error" class="text-center text-muted py-5">
+      <div v-if="!loading && !store.latestSpeedtest && !error" class="text-center text-muted py-5">
         No recent speed tests on file.
       </div>
     </div>
@@ -51,55 +51,51 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, computed } from 'vue'
+import { ref, computed } from 'vue'
 import axios from 'axios'
 import { useSystemStore } from '../../stores/systemStore'
 
 const store = useSystemStore()
 const loading = ref(false)
 const error = ref('')
-const result = ref(null)
 
-// RBAC: Gate the manual test execution button
 const canRun = computed(() => {
   return ['admin', 'operator'].includes(store.user?.role)
-})
-
-onMounted(() => {
-  // Try parsing the latest result cached in SQLite from the boot payload
-  if (store.latestSpeedtest) {
-    result.value = store.latestSpeedtest
-  }
 })
 
 const formatDate = (ts) => {
   return new Date(ts * 1000).toLocaleString()
 }
 
+// Ensure strict numeric extraction regardless of whether payload is "10.08" or "10.08 Mbps"
+const formatNumber = (val) => {
+  if (val === undefined || val === null) return '-';
+  const num = parseFloat(String(val).replace(/[^\d.-]/g, ''));
+  return isNaN(num) ? '-' : num;
+}
+
 const runTest = async () => {
   loading.value = true;
   error.value = '';
-  result.value = null;
 
-  store.listen('speedtest_result', (data) => {
+  // Local handler just to clear the spinning loader and catch errors for THIS manual request
+  const tempHandler = (data) => {
     loading.value = false;
-    if (data.success) {
-      result.value = data;
-    } else {
+    if (!data.success) {
       error.value = data.error;
     }
-    store.unlisten('speedtest_result');
-  });
+    // Clean up ONLY this specific callback, leaving the global store listener perfectly intact
+    store.unlisten('speedtest_result', tempHandler);
+  };
+  
+  store.listen('speedtest_result', tempHandler);
 
   try {
     await axios.post('/api/speedtest', { sid: store.socketId });
   } catch (err) {
     error.value = "Failed to initiate test. Check permissions.";
     loading.value = false;
+    store.unlisten('speedtest_result', tempHandler);
   }
 }
-
-onUnmounted(() => {
-  store.unlisten('speedtest_result')
-})
 </script>

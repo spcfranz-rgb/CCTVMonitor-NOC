@@ -35,7 +35,7 @@ import imagehash
 from PIL import Image
 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 from urllib.parse import urlparse
-from functools import wraps
+from functools import wraps, lru_cache
 
 # --- ONVIF Integration ---
 from onvif import ONVIFCamera
@@ -1926,6 +1926,10 @@ def delete_user(id):
     force_disk_sync()
     flash('User deleted.', 'success')
     return redirect(url_for('index'))
+    
+@lru_cache(maxsize=32)
+def get_snapshot_cached(ip, mfg, user, pwd, stream_url, time_bucket):
+    return get_snapshot_bytes(ip, mfg, user, pwd, stream_url)
 
 @app.route('/snapshot/<int:id>')
 @login_required
@@ -1935,11 +1939,15 @@ def snapshot(id):
     conn.close()
     if not camera: return "Camera not found", 404
     
+    # 2-second bucket for caching
+    time_bucket = int(time.time() // 2)
     pwd = decrypt_pwd(camera['password'])
-    snap_bytes = get_snapshot_bytes(camera['ip'], camera['manufacturer'], camera['username'], pwd, camera['stream_url'])
+    
+    # Use cached function
+    snap_bytes = get_snapshot_cached(camera['ip'], camera['manufacturer'], camera['username'], pwd, camera['stream_url'], time_bucket)
+    
     if snap_bytes: return Response(snap_bytes, mimetype='image/jpeg')
     else: return "Failed to grab snapshot", 500
-
 # ==========================================
 # WEB UI TUNNELING (REVERSE PROXY)
 # ==========================================

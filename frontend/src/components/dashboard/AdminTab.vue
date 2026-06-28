@@ -1,5 +1,6 @@
 <template>
   <div class="row g-4">
+    
     <div class="col-lg-6">
       <div class="card shadow-sm border-secondary h-100">
         <div class="card-header bg-dark border-secondary">
@@ -50,8 +51,27 @@
       </div>
     </div>
 
-    <div class="col-lg-6">
-      <div class="card shadow-sm border-secondary mb-4">
+    <div class="col-lg-6 d-flex flex-column gap-4">
+      
+      <div class="card shadow-sm border-secondary">
+        <div class="card-header bg-dark border-secondary">
+          <h5 class="mb-0">Backup & Restore</h5>
+        </div>
+        <div class="card-body bg-body-tertiary">
+          <p class="small text-muted mb-3">Export your hardware configuration (Switches, NVRs, and Cameras) to a secure JSON file, or restore a previous configuration.</p>
+          
+          <div class="d-flex gap-2">
+            <a href="/api/v1/system/export" class="btn btn-outline-info w-50 fw-bold">⬇️ Export JSON</a>
+            
+            <button class="btn btn-outline-danger w-50 fw-bold" @click="triggerFileInput" :disabled="analyzing">
+                {{ analyzing ? 'Analyzing...' : '⬆️ Import / Merge JSON' }}
+            </button>
+            <input type="file" ref="fileInput" accept=".json" class="d-none" @change="handleAnalyze">
+          </div>
+        </div>
+      </div>
+
+      <div class="card shadow-sm border-secondary h-100">
         <div class="card-header bg-dark border-secondary">
           <h5 class="mb-0">Access Management</h5>
         </div>
@@ -76,21 +96,33 @@
           </table>
         </div>
       </div>
+      
     </div>
   </div>
+  <ImportResolutionModal 
+      v-if="analysisData" 
+      :analysis="analysisData" 
+      @close="analysisData = null" 
+      @merged="onMergeComplete" 
+    />
 </template>
 
 <script setup>
 import { ref, onMounted } from 'vue'
 import axios from 'axios'
 import { useSystemStore } from '../../stores/systemStore'
+import ImportResolutionModal from '../modals/ImportResolutionModal.vue'
 
 const store = useSystemStore()
 const form = ref({})
 const saving = ref(false)
 
+// Merge Pipeline State
+const analyzing = ref(false)
+const fileInput = ref(null)
+const analysisData = ref(null)
+
 onMounted(() => {
-  // Clone the settings object to prevent reactive layout jumping while typing
   form.value = { ...store.settings }
 })
 
@@ -98,7 +130,7 @@ const saveSettings = async () => {
   saving.value = true;
   try {
     await axios.put('/api/v1/settings', form.value);
-    store.settings = { ...form.value }; // Update store on success
+    store.settings = { ...form.value }; 
     store.addToast('Settings applied securely.');
   } catch (error) {
     store.addToast('Failed to apply settings.', 'danger');
@@ -116,5 +148,36 @@ const deleteUser = async (id) => {
   } catch (e) {
     store.addToast(e.response?.data?.message || 'Error deleting user', 'danger');
   }
+}
+
+// --- Interactive Merge Logic ---
+const triggerFileInput = () => { fileInput.value.click() }
+
+const handleAnalyze = async (event) => {
+  const file = event.target.files[0]
+  if (!file) return
+
+  analyzing.value = true
+  const formData = new FormData()
+  formData.append('file', file)
+
+  try {
+    const response = await axios.post('/api/v1/system/import/analyze', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    })
+    
+    if (response.data.success) {
+      analysisData.value = response.data.analysis
+    }
+  } catch (error) {
+    store.addToast(error.response?.data?.message || 'Failed to analyze configuration file.', 'danger')
+  } finally {
+    analyzing.value = false
+    event.target.value = '' // Reset input
+  }
+}
+
+const onMergeComplete = () => {
+  analysisData.value = null // Close the modal
 }
 </script>

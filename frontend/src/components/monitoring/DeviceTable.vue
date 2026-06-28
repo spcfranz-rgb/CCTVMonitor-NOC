@@ -44,7 +44,7 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import axios from 'axios'
 import { useSystemStore } from '../../stores/systemStore'
 
@@ -52,6 +52,14 @@ const props = defineProps(['title', 'type', 'devices'])
 const emit = defineEmits(['preview'])
 const store = useSystemStore()
 const working = ref(null)
+
+// FIX: Safely route plurals to exact backend tunnel names
+const singularType = computed(() => {
+  if (props.type === 'switches') return 'switch'
+  if (props.type === 'nvrs') return 'nvr'
+  if (props.type === 'cameras') return 'camera'
+  return props.type
+})
 
 const statusClass = (status) => {
   if (status === 'UP') return 'bg-success'
@@ -64,7 +72,7 @@ const toggleSilence = async (device) => {
   working.value = device.id
   const hours = device.is_silenced ? 0 : 24
   try {
-    await axios.post('/api/v1/devices/silence', { type: props.type.slice(0,-1), id: device.id, hours })
+    await axios.post('/api/v1/devices/silence', { type: singularType.value, id: device.id, hours })
     device.is_silenced = !device.is_silenced
     store.addToast(`Silence updated for ${device.name}`)
   } catch(e) {

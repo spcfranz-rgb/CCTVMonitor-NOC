@@ -12,7 +12,7 @@
               <th>IP/Host</th>
               <th v-if="type === 'cameras'">Switch</th>
               <th>Status</th>
-              <th class="text-end pe-3">Actions</th>
+              <th class="text-end pe-3" v-if="canEdit">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -29,9 +29,9 @@
               <td>
                 <span class="badge" :class="statusClass(device.status)">{{ device.status }}</span>
               </td>
-              <td class="text-end pe-3">
+              
+              <td class="text-end pe-3" v-if="canEdit">
                 <a v-if="isPrivateLocation(device.ip)" :href="`/tunnel/${singularType}/${device.id}/`" target="_blank" class="badge bg-info text-decoration-none me-2">WebUI</a>
-                
                 <button class="btn btn-sm" :class="device.is_silenced ? 'btn-warning' : 'btn-outline-secondary'" @click="toggleSilence(device)" :disabled="working === device.id">
                   {{ device.is_silenced ? '🔇' : '🔔' }}
                 </button>
@@ -54,6 +54,11 @@ const emit = defineEmits(['preview'])
 const store = useSystemStore()
 const working = ref(null)
 
+// RBAC Gate
+const canEdit = computed(() => {
+  return ['admin', 'operator'].includes(store.user?.role)
+})
+
 const singularType = computed(() => {
   if (props.type === 'switches') return 'switch'
   if (props.type === 'nvrs') return 'nvr'
@@ -68,31 +73,17 @@ const statusClass = (status) => {
   return 'bg-secondary'
 }
 
-// SECURE UX: Validates RFC 1918 Private Subnets and Local mDNS
 const isPrivateLocation = (ip) => {
   if (!ip) return false;
-  
-  // Always allow standard .local mDNS hostnames on the LAN
   if (ip.toLowerCase().endsWith('.local')) return true;
-
-  const ipv4Regex = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
-  const match = ip.match(ipv4Regex);
-
+  const match = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (match) {
     const p1 = parseInt(match[1], 10);
     const p2 = parseInt(match[2], 10);
-
-    // 10.0.0.0 - 10.255.255.255
     if (p1 === 10) return true;
-    
-    // 172.16.0.0 - 172.31.255.255
     if (p1 === 172 && p2 >= 16 && p2 <= 31) return true;
-    
-    // 192.168.0.0 - 192.168.255.255
     if (p1 === 192 && p2 === 168) return true;
   }
-
-  // If it's a public IP or an external hostname (like google.com), hide the button.
   return false;
 }
 

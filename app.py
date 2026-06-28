@@ -1268,6 +1268,21 @@ def api_system_init():
         try: latest_speedtest = json.loads(settings_dict['latest_speedtest'])
         except Exception: pass
         
+    # --- AIR-GAPPED WEBRTC ROUTING ---
+    # Dynamically grab the IP the browser used to access the gateway (LAN vs VPN)
+    client_accessed_host = request.host.split(':')[0]
+    
+    webrtc_config = {
+        'iceServers': [
+            {'urls': f"stun:{client_accessed_host}:3478"},
+            {
+                'urls': f"turn:{client_accessed_host}:3478",
+                'username': 'lighthouse',
+                'credential': 'lighthouse_webrtc'
+            }
+        ]
+    }
+        
     return jsonify({
         'switches': [dict(s) for s in switches],
         'nvrs': [dict(n) for n in nvrs],
@@ -1276,7 +1291,8 @@ def api_system_init():
         'users': [dict(u) for u in users],
         'default_subnet': get_local_subnet(),
         'latest_speedtest': latest_speedtest,
-        'logos': { 'company': LOCAL_COMPANY_LOGO, 'customer': LOCAL_CUSTOMER_LOGO }
+        'logos': { 'company': LOCAL_COMPANY_LOGO, 'customer': LOCAL_CUSTOMER_LOGO },
+        'webrtc_config': webrtc_config  # <-- Injected into the boot payload
     })
 
 @app.route('/api/v1/history', methods=['GET'])

@@ -22,7 +22,7 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import TopNav from '../components/layout/TopNav.vue'
 import DeviceTable from '../components/monitoring/DeviceTable.vue'
 import WebRtcPreviewModal from '../components/modals/WebRtcPreviewModal.vue'
@@ -30,6 +30,11 @@ import { useSystemStore } from '../stores/systemStore'
 
 const store = useSystemStore()
 const previewCam = ref(null)
+
+// Fetch the hardware grid once the dashboard loads
+onMounted(() => {
+  store.fetchSystemData()
+})
 
 const openPreview = (cam) => {
   previewCam.value = cam

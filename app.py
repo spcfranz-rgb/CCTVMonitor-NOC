@@ -557,6 +557,8 @@ def get_snapshot_bytes(ip, mfg, user, pwd, stream_url):
     if mfg and mfg != 'Other':
         url = None
         auth_in_url = False
+        
+        # URL construction remains the same
         if mfg == 'Hikvision': url = f"http://{ip}/ISAPI/Streaming/channels/101/picture"
         elif mfg in ['Dahua', 'Amcrest']: url = f"http://{ip}/cgi-bin/snapshot.cgi?chn=1"
         elif mfg == 'Axis': url = f"http://{ip}/axis-cgi/jpg/image.cgi"
@@ -567,18 +569,28 @@ def get_snapshot_bytes(ip, mfg, user, pwd, stream_url):
             
         if url:
             try:
-                # requests is globally monkey-patched by eventlet, so this is non-blocking.
-                if auth_in_url: resp = requests.get(url, timeout=3)
+                # 1. Handle URL-based auth (Foscam)
+                if auth_in_url: 
+                    resp = requests.get(url, timeout=3)
                 else:
-                    resp = requests.get(url, auth=HTTPDigestAuth(user, pwd), timeout=3)
-                    if resp.status_code != 200:
-                        resp = requests.get(url, auth=HTTPBasicAuth(user, pwd), timeout=3)
-                if resp.status_code == 200 and 'image' in resp.headers.get('Content-Type', ''): return resp.content
+                    # 2. Only initialize auth objects if credentials exist
+                    digest_auth = HTTPDigestAuth(user, pwd) if (user and pwd) else None
+                    basic_auth = HTTPBasicAuth(user, pwd) if (user and pwd) else None
+                    
+                    # Try with Digest Auth (or None)
+                    resp = requests.get(url, auth=digest_auth, timeout=3)
+                    
+                    # If 401 Unauthorized and we actually had credentials, try Basic Auth
+                    if resp.status_code == 401 and user and pwd:
+                        resp = requests.get(url, auth=basic_auth, timeout=3)
+                
+                if resp.status_code == 200 and 'image' in resp.headers.get('Content-Type', ''): 
+                    return resp.content
             except Exception: pass 
                 
     # Fallback to FFMPEG execution (Safe inside tpool)
     return eventlet.tpool.execute(_run_ffmpeg_snapshot, stream_url)
-
+    
 def threaded_camera_check(cam):
     cam_up = is_pingable(cam['ip']) or is_port_open(cam['ip'], 554) or is_port_open(cam['ip'], 80)
     stream_ok, snap_bytes, fetched_mac = False, None, None

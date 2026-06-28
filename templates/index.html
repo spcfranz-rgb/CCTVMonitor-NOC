@@ -171,17 +171,19 @@
                                                 </span>
                                             </td>
                                             {% if current_user.role in ['admin', 'operator'] %}
-                                            <td class="text-end text-nowrap" id="action-cell-camera-{{ c.id }}">
-                                                {% if c.is_silenced %}
-                                                    <button class="btn btn-warning btn-sm" onclick="toggleSilence('camera', {{ c.id }}, 0, this)" title="Un-silence Device">🔇</button>
-                                                {% else %}
-                                                    <button class="btn btn-outline-secondary btn-sm" onclick="toggleSilence('camera', {{ c.id }}, 24, this)" title="Silence Alerts (24h)">🔔</button>
-                                                {% endif %}
-                                                
-                                                {% if current_user.role == 'admin' %}
-                                                <a href="/edit_camera/{{ c.id }}" class="btn btn-outline-warning btn-sm">Edit</a>
-                                                <button class="btn btn-outline-danger btn-sm" onclick="confirmDelete('/delete_camera/{{ c.id }}', 'Camera: {{ c.name }}')">X</button>
-                                                {% endif %}
+                                            <td class="text-end" id="action-cell-camera-{{ c.id }}">
+                                                <div class="btn-group shadow-sm" role="group" aria-label="Camera Actions">
+                                                    {% if c.is_silenced %}
+                                                        <button class="btn btn-warning btn-sm" onclick="toggleSilence('camera', {{ c.id }}, 0, this)" title="Un-silence Device">🔇</button>
+                                                    {% else %}
+                                                        <button class="btn btn-outline-secondary btn-sm" onclick="toggleSilence('camera', {{ c.id }}, 24, this)" title="Silence Alerts (24h)">🔔</button>
+                                                    {% endif %}
+        
+                                                    {% if current_user.role == 'admin' %}
+                                                    <a href="/edit_camera/{{ c.id }}" class="btn btn-outline-warning btn-sm">Edit</a>
+                                                    <button class="btn btn-outline-danger btn-sm" onclick="confirmDelete('/delete_camera/{{ c.id }}', 'Camera: {{ c.name }}')">X</button>
+                                                    {% endif %}
+                                                </div>
                                             </td>
                                             {% endif %}
                                         </tr>

@@ -380,6 +380,8 @@ def log_prune_loop():
 # BACKGROUND MONITORING & NETWORK TASKS
 # ==========================================
 SNAPSHOT_SEMAPHORE = eventlet.semaphore.Semaphore(4)
+L7_POOL = eventlet.greenpool.GreenPool(size=15) # Decoupled deep-probing pool
+previous_hashes = {} # Extracted to global scope for the decoupled pool
 mqtt_client = None
 mqtt_prefix_global = 'zabbix/cctv'
 
@@ -531,23 +533,81 @@ def get_snapshot_bytes(ip, mfg, user, pwd, stream_url):
                 if resp.status_code == 200 and 'image' in resp.headers.get('Content-Type', ''): return resp.content
             except Exception: pass 
     return eventlet.tpool.execute(_run_ffmpeg_snapshot, stream_url)
-    
-def threaded_camera_check(cam):
+
+# --- STAGE 1: LIGHTWEIGHT L3 PROBE ---
+def fast_l3_camera_check(cam):
+    """Only checks Ping or Port 554/80. Returns instantly to unblock the main loop."""
     cam_up = is_pingable(cam['ip']) or is_port_open(cam['ip'], 554) or is_port_open(cam['ip'], 80)
-    stream_ok, snap_bytes, fetched_mac = False, None, None
-    mac = cam.get('mac_address', '')
-    if cam_up:
-        if not mac:
-            new_mac = get_mac_address(cam['ip'])
-            if new_mac: fetched_mac = new_mac.upper()
-        auth_url = cam['stream_url']
-        if cam.get('username') and cam.get('password') and '@' not in auth_url and auth_url.startswith('rtsp://'):
-            auth_url = f"rtsp://{cam['username']}:{cam['password']}@{auth_url[7:]}"
-        stream_ok = is_stream_active(auth_url)
-        if stream_ok:
-            with SNAPSHOT_SEMAPHORE:
-                snap_bytes = get_snapshot_bytes(cam['ip'], cam['manufacturer'], cam['username'], cam['password'], auth_url)
-    return cam['id'], cam_up, stream_ok, snap_bytes, fetched_mac
+    fetched_mac = None
+    if cam_up and not cam.get('mac_address'):
+        new_mac = get_mac_address(cam['ip'])
+        if new_mac: fetched_mac = new_mac.upper()
+    return cam['id'], cam_up, fetched_mac
+
+# --- STAGE 2: DECOUPLED L7 PROBE ---
+def perform_l7_camera_check(cam, cam_silenced, last_hash, check_time):
+    """Spawns in a background queue. Deeply probes video feeds without blocking the gateway."""
+    global previous_hashes, mqtt_client, mqtt_prefix_global
+    cam_id = cam['id']
+    cam_name = cam['name']
+    auth_url = cam['stream_url']
+    pwd = decrypt_pwd(cam['password'])
+    
+    if cam.get('username') and pwd and '@' not in auth_url and auth_url.startswith('rtsp://'):
+        auth_url = f"rtsp://{cam['username']}:{pwd}@{auth_url[7:]}"
+
+    stream_ok = is_stream_active(auth_url)
+    snap_bytes = None
+    is_frozen = False
+    
+    if stream_ok:
+        with SNAPSHOT_SEMAPHORE:
+            snap_bytes = get_snapshot_bytes(cam['ip'], cam['manufacturer'], cam.get('username'), pwd, auth_url)
+            
+    if stream_ok and snap_bytes:
+        try:
+            img = Image.open(io.BytesIO(snap_bytes))
+            current_hash = imagehash.average_hash(img)
+            if last_hash is not None and cam['status'] == 'UP' and (current_hash - last_hash) <= 2: 
+                is_frozen = True
+            previous_hashes[cam_id] = current_hash
+        except Exception: pass
+    else: 
+        previous_hashes.pop(cam_id, None)
+
+    if cam_silenced:
+        if mqtt_client and mqtt_client.is_connected():
+            mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "MAINTENANCE", retain=True)
+            mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "MAINTENANCE", retain=True)
+        new_status = 'FROZEN (Silenced)' if is_frozen else ('UP (Silenced)' if stream_ok else 'STREAM ERR (Silenced)')
+    else:
+        if mqtt_client and mqtt_client.is_connected():
+            mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "UP", retain=True)
+            mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "FROZEN" if is_frozen else ("UP" if stream_ok else "STREAM_ERROR"), retain=True)
+        new_status = 'DOWN (Frozen)' if is_frozen else ('UP' if stream_ok else 'DOWN (Stream Error)')
+        
+    # We must fetch the absolute latest status from SQLite to ensure we don't 
+    # overwrite a manual UI toggle (like 'EVALUATING...') if it happened mid-scan.
+    conn = get_db()
+    curr_row = conn.execute("SELECT status FROM cameras WHERE id = ?", (cam_id,)).fetchone()
+    curr_status = curr_row['status'] if curr_row else cam['status']
+    
+    if curr_status != new_status:
+        with conn:
+            if new_status != 'UNKNOWN':
+                conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (check_time, 'Camera', cam_name, new_status))
+            conn.execute("UPDATE cameras SET status = ? WHERE id = ?", (new_status, cam_id))
+        
+        socketio.emit('state_change', {
+            'type': 'cameras', 'id': cam_id, 'name': cam_name,
+            'status': new_status, 'device_type': 'Camera', 'timestamp': check_time
+        })
+        
+        if 'DOWN' in new_status or 'ERR' in new_status:
+            if not mqtt_client or not mqtt_client.is_connected():
+                send_failover_email(f"FAILOVER ALERT: {cam_name} is {new_status}", f"The Camera '{cam_name}' transitioned to a critical state ({new_status}).\n\nThis alert was routed via SMTP because the primary MQTT connection to Zabbix is currently offline.")
+    conn.close()
+
 
 def send_failover_email(subject, body):
     conn = get_db()
@@ -570,6 +630,7 @@ def send_failover_email(subject, body):
         except Exception as e:
             log_audit('System', 'Email Failover', f'Failed to send email: {str(e)}')
     eventlet.spawn_n(_send, settings)
+
 
 def automated_speedtest_loop():
     global mqtt_client, mqtt_prefix_global
@@ -636,7 +697,6 @@ def automated_speedtest_loop():
 
 def monitor_loop():
     global force_check_event, mqtt_client, mqtt_prefix_global
-    previous_hashes = {} 
     
     conn = get_db()
     settings_dict = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
@@ -702,17 +762,20 @@ def monitor_loop():
                         'status': new_status, 'device_type': dev_type, 'timestamp': now
                     })
                     if 'DOWN' in new_status or 'UNREACHABLE' in new_status or 'ERR' in new_status:
-                        if not mqtt_client.is_connected():
+                        if not mqtt_client or not mqtt_client.is_connected():
                             send_failover_email(f"FAILOVER ALERT: {item_name} is {new_status}", f"The {dev_type} '{item_name}' transitioned to a critical state ({new_status}).\n\nThis alert was routed via SMTP because the primary MQTT connection to Zabbix is currently offline.")
 
-            # Process NVRs
+            # Process NVRs (Fast L3/L4)
             for nvr in nvrs:
                 nvr_id, nvr_name, nvr_ip = nvr['id'], nvr['name'], nvr['ip']
                 s_until, mac = nvr['silenced_until'] or 0, nvr['mac_address'] or ''
                 silenced = s_until > now
                 is_up = is_pingable(nvr_ip) or is_port_open(nvr_ip, 80) or is_port_open(nvr_ip, 443) or is_port_open(nvr_ip, 554)
+                
                 nvr_payload = "MAINTENANCE" if silenced else ("UP" if is_up else "OFFLINE")
-                mqtt_client.publish(f"{mqtt_prefix_global}/{nvr_name}/ping", nvr_payload, retain=True)
+                if mqtt_client and mqtt_client.is_connected():
+                    mqtt_client.publish(f"{mqtt_prefix_global}/{nvr_name}/ping", nvr_payload, retain=True)
+                
                 if is_up:
                     if not mac:
                         fetched_mac = get_mac_address(nvr_ip)
@@ -723,20 +786,26 @@ def monitor_loop():
                     new_s_stat = 'DOWN' if not silenced else 'DOWN (Silenced)'
                     queue_status('nvrs', nvr_id, nvr_name, 'NVR', nvr['status'], new_s_stat)
 
-            # Process Switches & Cameras
+            # Process Switches
             cameras_by_switch = {}
             standalone_cameras = []
             for c in all_cameras:
                 if c['switch_id']: cameras_by_switch.setdefault(c['switch_id'], []).append(c)
                 else: standalone_cameras.append(c)
 
+            l3_pool = eventlet.greenpool.GreenPool(size=50)
+            cameras_to_l3_check = []
+            cameras_dead_by_switch = []
+
             for switch in switches:
                 switch_id, switch_name, switch_ip = switch['id'], switch['name'], switch['ip']
                 s_until, mac = switch['silenced_until'] or 0, switch['mac_address'] or ''
                 silenced = s_until > now
                 is_up = is_pingable(switch_ip) or is_port_open(switch_ip, 80) or is_port_open(switch_ip, 443)
+                
                 switch_payload = "MAINTENANCE" if silenced else ("UP" if is_up else "OFFLINE")
-                mqtt_client.publish(f"{mqtt_prefix_global}/{switch_name}/ping", switch_payload, retain=True)
+                if mqtt_client and mqtt_client.is_connected():
+                    mqtt_client.publish(f"{mqtt_prefix_global}/{switch_name}/ping", switch_payload, retain=True)
                 
                 if is_up:
                     if not mac:
@@ -745,122 +814,68 @@ def monitor_loop():
                     new_s_stat = 'UP' if not silenced else 'UP (Silenced)'
                     queue_status('switches', switch_id, switch_name, 'Switch', switch['status'], new_s_stat)
                     
-                    camera_list = cameras_by_switch.get(switch_id, [])
-                    camera_dicts_for_pool = [dict(c, password=decrypt_pwd(c['password'])) for c in camera_list]
-                    camera_results = {}
-                    
-                    pool = eventlet.greenpool.GreenPool(size=20)
-                    for c_id, cam_up, stream_ok, snap_bytes, fetched_mac in pool.imap(threaded_camera_check, camera_dicts_for_pool):
-                        camera_results[c_id] = (cam_up, stream_ok, snap_bytes)
-                        if fetched_mac: pending_mac_updates.append(('cameras', fetched_mac.upper(), c_id))
-                    
-                    for cam in camera_list:
-                        c_until = cam['silenced_until'] or 0
-                        cam_silenced = (c_until > now) or silenced
-                        cam_id, cam_name = cam['id'], cam['name']
-                        cam_up, stream_ok, snap_bytes = camera_results[cam_id]
-                        is_frozen = False
-                        
-                        if cam_up:
-                            if stream_ok and snap_bytes:
-                                try:
-                                    img = Image.open(io.BytesIO(snap_bytes))
-                                    current_hash = imagehash.average_hash(img)
-                                    last_hash = previous_hashes.get(cam_id)
-                                    if last_hash is not None and cam['status'] == 'UP' and (current_hash - last_hash) <= 2: 
-                                        is_frozen = True
-                                    previous_hashes[cam_id] = current_hash
-                                except Exception: pass
-                            else: previous_hashes.pop(cam_id, None)
-                            
-                            if cam_silenced:
-                                mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "MAINTENANCE", retain=True)
-                                mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "MAINTENANCE", retain=True)
-                                if is_frozen: queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'FROZEN (Silenced)')
-                                else: queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'UP (Silenced)' if stream_ok else 'STREAM ERR (Silenced)')
-                            else:
-                                mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "UP", retain=True)
-                                if is_frozen:
-                                    mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "FROZEN", retain=True)
-                                    queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'DOWN (Frozen)')
-                                else:
-                                    mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "UP" if stream_ok else "STREAM_ERROR", retain=True)
-                                    queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'UP' if stream_ok else 'DOWN (Stream Error)')
-                        else:
-                            if cam_silenced:
-                                mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "MAINTENANCE", retain=True)
-                                mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "MAINTENANCE", retain=True)
-                                queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'DOWN (Silenced)')
-                            else:
-                                mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "OFFLINE", retain=True)
-                                mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "OFFLINE", retain=True)
-                                queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'DOWN (Offline)')
+                    # Switch is online, queue its cameras for L3 Ping Check
+                    for cam in cameras_by_switch.get(switch_id, []):
+                        cameras_to_l3_check.append((cam, silenced)) 
                 else:
                     new_s_stat = 'DOWN' if not silenced else 'DOWN (Silenced)'
                     queue_status('switches', switch_id, switch_name, 'Switch', switch['status'], new_s_stat)
+                    # Switch is offline, all child cameras are dead instantly
                     for cam in cameras_by_switch.get(switch_id, []):
-                        c_until = cam['silenced_until'] or 0
-                        cam_silenced = (c_until > now) or silenced
-                        if cam_silenced:
-                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/ping", "MAINTENANCE", retain=True)
-                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/stream", "MAINTENANCE", retain=True)
-                            new_c_stat = 'UNREACHABLE (Silenced)'
-                        else:
-                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/ping", "OFFLINE", retain=True)
-                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/stream", "OFFLINE", retain=True)
-                            new_c_stat = 'UNREACHABLE (Switch Down)'
-                        queue_status('cameras', cam['id'], cam['name'], 'Camera', cam['status'], new_c_stat)
-
-            standalone_results = {}
-            if standalone_cameras:
-                pool = eventlet.greenpool.GreenPool(size=20)
-                standalone_dicts = [dict(c, password=decrypt_pwd(c['password'])) for c in standalone_cameras]
-                for c_id, cam_up, stream_ok, snap_bytes, fetched_mac in pool.imap(threaded_camera_check, standalone_dicts):
-                    standalone_results[c_id] = (cam_up, stream_ok, snap_bytes)
-                    if fetched_mac: pending_mac_updates.append(('cameras', fetched_mac.upper(), c_id))
+                        cameras_dead_by_switch.append((cam, silenced))
 
             for cam in standalone_cameras:
-                c_until = cam['silenced_until'] or 0
-                cam_id, cam_name, cam_silenced = cam['id'], cam['name'], (c_until > now)
-                
-                cam_up, stream_ok, snap_bytes = standalone_results.get(cam_id, (False, False, None))
-                is_frozen = False
-                
-                if cam_up:
-                    if stream_ok and snap_bytes:
-                        try:
-                            img = Image.open(io.BytesIO(snap_bytes))
-                            current_hash = imagehash.average_hash(img)
-                            last_hash = previous_hashes.get(cam_id)
-                            if last_hash is not None and cam['status'] == 'UP' and (current_hash - last_hash) <= 2: 
-                                is_frozen = True
-                            previous_hashes[cam_id] = current_hash
-                        except Exception: pass
-                    else: previous_hashes.pop(cam_id, None)
-                            
-                    if cam_silenced:
-                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "MAINTENANCE", retain=True)
-                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "MAINTENANCE", retain=True)
-                        if is_frozen: queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'FROZEN (Silenced)')
-                        else: queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'UP (Silenced)' if stream_ok else 'STREAM ERR (Silenced)')
-                    else:
-                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "UP", retain=True)
-                        if is_frozen:
-                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "FROZEN", retain=True)
-                            queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'DOWN (Frozen)')
-                        else:
-                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "UP" if stream_ok else "STREAM_ERROR", retain=True)
-                            queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'UP' if stream_ok else 'DOWN (Stream Error)')
-                else:
-                    if cam_silenced:
-                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "MAINTENANCE", retain=True)
-                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "MAINTENANCE", retain=True)
-                        queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'DOWN (Silenced)')
-                    else:
-                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/ping", "OFFLINE", retain=True)
-                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "OFFLINE", retain=True)
-                        queue_status('cameras', cam_id, cam_name, 'Camera', cam['status'], 'DOWN (Offline)')
+                cameras_to_l3_check.append((cam, False))
 
+            # Process Instant Camera Failures (Switch Down)
+            for cam, switch_silenced in cameras_dead_by_switch:
+                c_until = cam['silenced_until'] or 0
+                cam_silenced = (c_until > now) or switch_silenced
+                if cam_silenced:
+                    if mqtt_client and mqtt_client.is_connected():
+                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/ping", "MAINTENANCE", retain=True)
+                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/stream", "MAINTENANCE", retain=True)
+                    new_c_stat = 'UNREACHABLE (Silenced)'
+                else:
+                    if mqtt_client and mqtt_client.is_connected():
+                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/ping", "OFFLINE", retain=True)
+                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/stream", "OFFLINE", retain=True)
+                    new_c_stat = 'UNREACHABLE (Switch Down)'
+                queue_status('cameras', cam['id'], cam['name'], 'Camera', cam['status'], new_c_stat)
+
+            # Process Fast L3 Ping Sweeps for Cameras
+            l3_results = {}
+            l3_dicts = [c[0] for c in cameras_to_l3_check]
+            
+            for c_id, cam_up, fetched_mac in l3_pool.imap(fast_l3_camera_check, l3_dicts):
+                l3_results[c_id] = (cam_up, fetched_mac)
+
+            for cam, switch_silenced in cameras_to_l3_check:
+                c_id = cam['id']
+                cam_up, fetched_mac = l3_results.get(c_id, (False, None))
+                if fetched_mac: pending_mac_updates.append(('cameras', fetched_mac.upper(), c_id))
+                
+                c_until = cam['silenced_until'] or 0
+                cam_silenced = (c_until > now) or switch_silenced
+                
+                if not cam_up:
+                    # Camera failed ICMP ping. Update DB immediately and skip L7.
+                    if cam_silenced:
+                        if mqtt_client and mqtt_client.is_connected():
+                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/ping", "MAINTENANCE", retain=True)
+                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/stream", "MAINTENANCE", retain=True)
+                        new_c_stat = 'DOWN (Silenced)'
+                    else:
+                        if mqtt_client and mqtt_client.is_connected():
+                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/ping", "OFFLINE", retain=True)
+                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/stream", "OFFLINE", retain=True)
+                        new_c_stat = 'DOWN (Offline)'
+                    queue_status('cameras', cam['id'], cam['name'], 'Camera', cam['status'], new_c_stat)
+                else:
+                    # DECOUPLED HINTOFF: Camera is L3 UP. Dispatch to L7 Pool.
+                    L7_POOL.spawn_n(perform_l7_camera_check, cam, cam_silenced, previous_hashes.get(c_id), now)
+
+            # Batch execute all L3 DB updates (NVRs, Switches, Offline Cameras)
             if pending_db_updates or pending_mac_updates:
                 conn = get_db()
                 with conn:

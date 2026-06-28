@@ -73,25 +73,22 @@
     <div class="tab-content" id="dashboardTabsContent">
 
         <div class="tab-pane fade show active" id="tab-monitoring" role="tabpanel">
-            <div class="row">
-                <div class="col-xl-5 col-lg-6">
-                    <div class="card mb-4 shadow-sm border-secondary">
+            <div class="row mb-4">
+                
+                <div class="col-lg-6 mb-4 mb-lg-0">
+                    <div class="card h-100 shadow-sm border-secondary">
                         <div class="card-header bg-dark border-secondary"><h5 class="mb-0">Network Switches</h5></div>
                         <div class="card-body">
                             <div class="table-responsive">
                                 <table class="table table-sm align-middle text-nowrap">
-                                    <thead><tr><th>Name</th><th>IP/Host</th><th>Status</th>{% if current_user.role in ['admin', 'operator'] %}<th></th>{% endif %}</tr></thead>
+                                    <thead><tr><th>Name</th><th>IP/Host</th><th>Status</th>{% if current_user.role in ['admin', 'operator'] %}<th class="text-end">Actions</th>{% endif %}</tr></thead>
                                     <tbody>
                                         {% for s in switches %}
                                         <tr>
                                             <td>{{ s.name }}</td>
                                             <td>
                                                 <div class="fw-bold">{{ s.ip }}</div>
-                                                {% if s.mac_address %}
-                                                    <div class="small text-muted font-monospace" style="font-size: 0.75rem;">{{ s.mac_address }}</div>
-                                                {% else %}
-                                                    <div class="small text-muted" style="font-size: 0.75rem;">Waiting for ARP...</div>
-                                                {% endif %}
+                                                <div class="small text-muted font-monospace" style="font-size: 0.75rem;">{{ s.mac_address or 'Waiting for ARP...' }}</div>
                                                 {% if current_user.role in ['admin', 'operator'] %}
                                                 <a href="/tunnel/switch/{{ s.id }}/" target="_blank" class="badge bg-info text-decoration-none mt-1">WebUI</a>
                                                 {% endif %}
@@ -104,12 +101,9 @@
                                             {% if current_user.role in ['admin', 'operator'] %}
                                             <td class="text-end" id="action-cell-switch-{{ s.id }}">
                                                 <div class="btn-group shadow-sm" role="group" aria-label="Switch Actions">
-                                                    {% if s.is_silenced %}
-                                                        <button class="btn btn-warning btn-sm" onclick="toggleSilence('switch', {{ s.id }}, 0, this)" title="Un-silence Device">🔇</button>
-                                                    {% else %}
-                                                        <button class="btn btn-outline-secondary btn-sm" onclick="toggleSilence('switch', {{ s.id }}, 24, this)" title="Silence Alerts (24h)">🔔</button>
-                                                    {% endif %}
-        
+                                                    <button class="btn {% if s.is_silenced %}btn-warning{% else %}btn-outline-secondary{% endif %} btn-sm" onclick="toggleSilence('switch', {{ s.id }}, {% if s.is_silenced %}0{% else %}24{% endif %}, this)" title="{% if s.is_silenced %}Un-silence Device{% else %}Silence Alerts (24h){% endif %}">
+                                                        {% if s.is_silenced %}🔇{% else %}🔔{% endif %}
+                                                    </button>
                                                     {% if current_user.role == 'admin' %}
                                                     <a href="/edit_switch/{{ s.id }}" class="btn btn-outline-warning btn-sm">Edit</a>
                                                     <button class="btn btn-outline-danger btn-sm" onclick="confirmDelete('/delete_switch/{{ s.id }}', 'Switch: {{ s.name }}')">X</button>
@@ -122,22 +116,82 @@
                                     </tbody>
                                 </table>
                             </div>
-                            
                             {% if current_user.role == 'admin' %}
                             <hr class="border-secondary">
                             <h6>Add Switch</h6>
                             <form action="/add_switch" method="POST" id="addSwitchForm">
                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
-                                <input type="text" name="name" class="form-control mb-2 border-secondary" placeholder="Switch Name" aria-label="Switch Name" required>
-                                <input type="text" name="ip" class="form-control mb-2 border-secondary" placeholder="IP / Hostname" aria-label="Switch IP" required>
-                                <button type="submit" class="btn btn-primary btn-sm w-100 fw-bold">Add Switch</button>
+                                <div class="input-group input-group-sm">
+                                    <input type="text" name="name" class="form-control border-secondary" placeholder="Switch Name" required>
+                                    <input type="text" name="ip" class="form-control border-secondary" placeholder="IP / Hostname" required>
+                                    <button type="submit" class="btn btn-primary fw-bold">+</button>
+                                </div>
                             </form>
                             {% endif %}
                         </div>
                     </div>
                 </div>
 
-                <div class="col-xl-7 col-lg-6">
+                <div class="col-lg-6">
+                    <div class="card h-100 shadow-sm border-secondary">
+                        <div class="card-header bg-dark border-secondary"><h5 class="mb-0">Network Video Recorders</h5></div>
+                        <div class="card-body">
+                            <div class="table-responsive">
+                                <table class="table table-sm align-middle text-nowrap">
+                                    <thead><tr><th>Name</th><th>IP/Host</th><th>Status</th>{% if current_user.role in ['admin', 'operator'] %}<th class="text-end">Actions</th>{% endif %}</tr></thead>
+                                    <tbody>
+                                        {% for n in nvrs %}
+                                        <tr>
+                                            <td>{{ n.name }}</td>
+                                            <td>
+                                                <div class="fw-bold">{{ n.ip }}</div>
+                                                <div class="small text-muted font-monospace" style="font-size: 0.75rem;">{{ n.mac_address or 'Waiting for ARP...' }}</div>
+                                                {% if current_user.role in ['admin', 'operator'] %}
+                                                <a href="/tunnel/nvr/{{ n.id }}/" target="_blank" class="badge bg-info text-decoration-none mt-1">WebUI</a>
+                                                {% endif %}
+                                            </td>
+                                            <td>
+                                                <span id="status-nvr-{{ n.id }}" class="badge {% if n.status == 'UP' %}bg-success{% elif 'Silenced' in n.status %}bg-warning text-dark{% elif 'DOWN' in n.status %}bg-danger{% else %}bg-secondary{% endif %}">
+                                                    {{ n.status }}
+                                                </span>
+                                            </td>
+                                            {% if current_user.role in ['admin', 'operator'] %}
+                                            <td class="text-end" id="action-cell-nvr-{{ n.id }}">
+                                                <div class="btn-group shadow-sm" role="group" aria-label="NVR Actions">
+                                                    <button class="btn {% if n.is_silenced %}btn-warning{% else %}btn-outline-secondary{% endif %} btn-sm" onclick="toggleSilence('nvr', {{ n.id }}, {% if n.is_silenced %}0{% else %}24{% endif %}, this)" title="{% if n.is_silenced %}Un-silence Device{% else %}Silence Alerts (24h){% endif %}">
+                                                        {% if n.is_silenced %}🔇{% else %}🔔{% endif %}
+                                                    </button>
+                                                    {% if current_user.role == 'admin' %}
+                                                    <a href="/edit_nvr/{{ n.id }}" class="btn btn-outline-warning btn-sm">Edit</a>
+                                                    <button class="btn btn-outline-danger btn-sm" onclick="confirmDelete('/delete_nvr/{{ n.id }}', 'NVR: {{ n.name }}')">X</button>
+                                                    {% endif %}
+                                                </div>
+                                            </td>
+                                            {% endif %}
+                                        </tr>
+                                        {% endfor %}
+                                    </tbody>
+                                </table>
+                            </div>
+                            {% if current_user.role == 'admin' %}
+                            <hr class="border-secondary">
+                            <h6>Add NVR</h6>
+                            <form action="/add_nvr" method="POST" id="addNvrForm">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+                                <div class="input-group input-group-sm">
+                                    <input type="text" name="name" class="form-control border-secondary" placeholder="NVR Name" required>
+                                    <input type="text" name="ip" class="form-control border-secondary" placeholder="IP / Hostname" required>
+                                    <button type="submit" class="btn btn-primary fw-bold">+</button>
+                                </div>
+                            </form>
+                            {% endif %}
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="row">
+                <div class="col-12">
                     <div class="card shadow-sm mb-4 border-secondary">
                         <div class="card-header bg-dark border-secondary d-flex justify-content-between align-items-center">
                             <h5 class="mb-0">Cameras</h5>
@@ -145,7 +199,7 @@
                         <div class="card-body">
                             <div class="table-responsive">
                                 <table class="table table-sm align-middle text-nowrap">
-                                    <thead><tr><th>Name</th><th>IP/Host</th><th>Switch</th><th>Status</th>{% if current_user.role in ['admin', 'operator'] %}<th></th>{% endif %}</tr></thead>
+                                    <thead><tr><th>Name</th><th>IP/Host</th><th>Switch</th><th>Status</th>{% if current_user.role in ['admin', 'operator'] %}<th class="text-end">Actions</th>{% endif %}</tr></thead>
                                     <tbody>
                                         {% for c in cameras %}
                                         <tr>
@@ -178,7 +232,7 @@
                                                     {% else %}
                                                         <button class="btn btn-outline-secondary btn-sm" onclick="toggleSilence('camera', {{ c.id }}, 24, this)" title="Silence Alerts (24h)">🔔</button>
                                                     {% endif %}
-        
+                                                    
                                                     {% if current_user.role == 'admin' %}
                                                     <a href="/edit_camera/{{ c.id }}" class="btn btn-outline-warning btn-sm">Edit</a>
                                                     <button class="btn btn-outline-danger btn-sm" onclick="confirmDelete('/delete_camera/{{ c.id }}', 'Camera: {{ c.name }}')">X</button>
@@ -694,7 +748,6 @@
             video.classList.add('d-none');
             spinner.classList.remove('d-none');
 
-            // Cleanup previous connection if it exists
             if (peerConnection) {
                 peerConnection.close();
                 peerConnection = null;
@@ -705,7 +758,6 @@
                 document.getElementById('previewModal').addEventListener('hidden.bs.modal', function () {
                     isModalOpen = false;
                     
-                    // ARCHITECT FIX: Forcefully stop media tracks to prevent browser memory leaks
                     if (video.srcObject) {
                         video.srcObject.getTracks().forEach(track => track.stop());
                         video.srcObject = null;
@@ -721,7 +773,6 @@
             modalInstance.show();
 
             try {
-                // NAT Traversal configuration injected here if needed
                 const configuration = {
                     iceServers: [
                         { urls: "stun:stun.l.google.com:19302" }
@@ -731,7 +782,6 @@
 
                 peerConnection = new RTCPeerConnection(configuration);
 
-                // Bind incoming video tracks to the HTML5 video element
                 peerConnection.ontrack = (event) => {
                     if (video.srcObject !== event.streams[0]) {
                         video.srcObject = event.streams[0];
@@ -1025,7 +1075,11 @@
         });
 
         socket.on('state_change', function(data) {
-            const key = (data.type === 'switches' ? 'switch-' : 'camera-') + data.id;
+            let prefix = 'camera-';
+            if (data.type === 'switches') prefix = 'switch-';
+            else if (data.type === 'nvrs') prefix = 'nvr-';
+            const key = prefix + data.id;
+
             const badge = document.getElementById('status-' + key);
             if (badge) {
                 badge.innerText = data.status; badge.className = 'badge'; 

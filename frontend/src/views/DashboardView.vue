@@ -15,6 +15,15 @@
     </ul>
 
     <div v-if="activeTab === 'monitoring'">
+      
+      <div class="d-flex justify-content-between align-items-center mb-3">
+        <h4 class="mb-0 text-light d-none d-md-block">Hardware Overview</h4>
+        <div v-if="store.user?.role === 'admin'" class="btn-group w-100 w-md-auto shadow-sm">
+          <button class="btn btn-outline-success fw-bold" @click="showScannerModal = true">🔍 Auto-Discover</button>
+          <button class="btn btn-outline-info fw-bold" @click="showAddModal = true">➕ Add Device</button>
+        </div>
+      </div>
+
       <div class="row mb-4">
         <div class="col-lg-6 mb-4 mb-lg-0">
           <DeviceTable title="Network Switches" type="switches" :devices="store.devices.switches" />
@@ -39,6 +48,9 @@
     </div>
 
     <WebRtcPreviewModal v-if="previewCam" :camera="previewCam" @close="previewCam = null" />
+    <DeviceAddModal v-if="showAddModal" @close="showAddModal = false" />
+    <NetworkScannerModal v-if="showScannerModal" @close="showScannerModal = false" />
+
   </div>
 </template>
 
@@ -48,12 +60,20 @@ import TopNav from '../components/layout/TopNav.vue'
 import DeviceTable from '../components/monitoring/DeviceTable.vue'
 import DiagnosticsTab from '../components/dashboard/DiagnosticsTab.vue'
 import AdminTab from '../components/dashboard/AdminTab.vue'
+
 import WebRtcPreviewModal from '../components/modals/WebRtcPreviewModal.vue'
+import DeviceAddModal from '../components/modals/DeviceAddModal.vue'
+import NetworkScannerModal from '../components/modals/NetworkScannerModal.vue'
+
 import { useSystemStore } from '../stores/systemStore'
 
 const store = useSystemStore()
 const activeTab = ref('monitoring')
+
+// Modal States
 const previewCam = ref(null)
+const showAddModal = ref(false)
+const showScannerModal = ref(false)
 
 onMounted(() => {
   store.fetchSystemData()

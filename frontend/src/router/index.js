@@ -7,6 +7,7 @@ const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
   routes: [
     { path: '/', name: 'dashboard', component: DashboardView, meta: { requiresAuth: true } },
+    { path: '/logs', name: 'logs', component: () => import('../views/EventLogsView.vue'), meta: { requiresAuth: true } }, // NEW LINE
     { path: '/login', name: 'login', component: LoginView },
     // You can easily add the HistoryView later: 
     // { path: '/history', name: 'history', component: () => import('../views/HistoryView.vue'), meta: { requiresAuth: true } }

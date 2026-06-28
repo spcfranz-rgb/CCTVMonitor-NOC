@@ -18,8 +18,8 @@ services:
         max-size: "10m"
         max-file: "5"
         compress: "true"
-        
-cctv-coturn:
+
+  cctv-coturn:
     image: coturn/coturn:latest
     container_name: lighthouse-coturn
     restart: unless-stopped
@@ -34,8 +34,8 @@ cctv-coturn:
       --lt-cred-mech
       --stale-nonce
       --no-cli
-      
-webrtc-relay:
+
+  webrtc-relay:
     image: bluenviron/mediamtx:latest
     container_name: cctv-webrtc
     restart: unless-stopped
@@ -49,7 +49,7 @@ webrtc-relay:
         max-file: "5"
         compress: "true"
 
-cctv-dashboard:
+  cctv-dashboard:
     build: .
     container_name: lighthouse-dashboard
     restart: unless-stopped

@@ -18,7 +18,23 @@ services:
         max-size: "10m"
         max-file: "5"
         compress: "true"
-
+        
+cctv-coturn:
+    image: coturn/coturn:latest
+    container_name: lighthouse-coturn
+    restart: unless-stopped
+    network_mode: "host"
+    command: >
+      -n
+      --log-file=stdout
+      --min-port=49152
+      --max-port=65535
+      --realm=lighthouse.local
+      --user=lighthouse:lighthouse_webrtc
+      --lt-cred-mech
+      --stale-nonce
+      --no-cli
+      
   webrtc-relay:
     image: bluenviron/mediamtx:latest
     container_name: cctv-webrtc

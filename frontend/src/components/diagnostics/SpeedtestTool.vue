@@ -2,7 +2,8 @@
   <div class="card shadow-sm border-secondary h-100">
     <div class="card-header bg-dark border-secondary d-flex justify-content-between align-items-center">
       <h5 class="mb-0">WAN Bandwidth (Ookla Native)</h5>
-      <button class="btn btn-sm btn-outline-primary fw-bold" @click="runTest" :disabled="loading">Run Test</button>
+      
+      <button v-if="canRun" class="btn btn-sm btn-outline-primary fw-bold" @click="runTest" :disabled="loading">Run Test</button>
     </div>
     
     <div class="card-body bg-body-tertiary">
@@ -15,20 +16,20 @@
       <div v-if="error" class="alert alert-danger">{{ error }}</div>
 
       <div v-if="!loading && result" class="row text-center g-3 mt-2">
-        <div class="col-4">
-          <div class="p-3 border border-secondary rounded bg-dark">
+        <div class="col-12 col-md-4">
+          <div class="p-3 border border-secondary rounded bg-dark h-100">
             <div class="text-muted small fw-bold">PING</div>
             <div class="fs-4 fw-bold text-info">{{ result.ping }}<span class="fs-6 ms-1">ms</span></div>
           </div>
         </div>
-        <div class="col-4">
-          <div class="p-3 border border-secondary rounded bg-dark">
+        <div class="col-12 col-md-4">
+          <div class="p-3 border border-secondary rounded bg-dark h-100">
             <div class="text-muted small fw-bold">DOWNLOAD</div>
             <div class="fs-4 fw-bold text-success">{{ result.download }}</div>
           </div>
         </div>
-        <div class="col-4">
-          <div class="p-3 border border-secondary rounded bg-dark">
+        <div class="col-12 col-md-4">
+          <div class="p-3 border border-secondary rounded bg-dark h-100">
             <div class="text-muted small fw-bold">UPLOAD</div>
             <div class="fs-4 fw-bold text-warning">{{ result.upload }}</div>
           </div>
@@ -50,7 +51,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, computed } from 'vue'
 import axios from 'axios'
 import { useSystemStore } from '../../stores/systemStore'
 
@@ -58,6 +59,11 @@ const store = useSystemStore()
 const loading = ref(false)
 const error = ref('')
 const result = ref(null)
+
+// RBAC: Gate the manual test execution button
+const canRun = computed(() => {
+  return ['admin', 'operator'].includes(store.user?.role)
+})
 
 onMounted(() => {
   // Try parsing the latest result cached in SQLite from the boot payload
@@ -88,7 +94,7 @@ const runTest = async () => {
   try {
     await axios.post('/api/speedtest', { sid: store.socketId });
   } catch (err) {
-    error.value = "Failed to initiate test.";
+    error.value = "Failed to initiate test. Check permissions.";
     loading.value = false;
   }
 }

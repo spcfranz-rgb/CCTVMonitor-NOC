@@ -957,7 +957,6 @@ def probe_onvif_camera(ip, user, pwd):
             return {"success": True, "make": make, "model": model, "mac": mac, "stream_url": stream_url}
         except Exception: continue
     return {"success": False, "error": "ONVIF negotiation failed on all standard ports."}
-
 # ==========================================
 # FLASK SPA & JSON API ROUTES
 # ==========================================
@@ -965,10 +964,33 @@ def probe_onvif_camera(ip, user, pwd):
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve_spa(path):
+    """
+    Acts as the master traffic controller. 
+    1. Serves Vite SPA static assets.
+    2. Intercepts and proxies orphaned WebUI requests.
+    3. Serves the Vue index.html for client-side routing.
+    """
+    
+    # 1. If the path exists physically in the build folder (JS/CSS assets)
     if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
         return send_from_directory(app.static_folder, path)
-    return send_from_directory(app.static_folder, 'index.html')
 
+    # 2. CRITICAL PROXY FIX: Intercept orphaned WebUI absolute paths
+    # If a tunneled camera requests '/images/logo.png', it hits this catch-all.
+    # We inspect the Referer to detect if it originated from our tunnel, and proxy it back.
+    referer = request.headers.get('Referer')
+    if referer:
+        parsed_referer = urlparse(referer)
+        parts = parsed_referer.path.split('/')
+        # Example parsed path: /tunnel/switch/1/
+        if len(parts) >= 4 and parts[1] == 'tunnel':
+            if current_user.is_authenticated and current_user.role in ['admin', 'operator']:
+                # Pass it directly to the tunnel function with a leading slash
+                return tunnel(parts[2], parts[3], '/' + path)
+
+    # 3. Otherwise, serve index.html and let Vue Router take over
+    return send_from_directory(app.static_folder, 'index.html')
+    
 @app.route('/api/v1/auth/status', methods=['GET'])
 def auth_status():
     if current_user.is_authenticated:

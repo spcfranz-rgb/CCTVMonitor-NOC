@@ -30,7 +30,7 @@
                 <span class="badge" :class="statusClass(device.status)">{{ device.status }}</span>
               </td>
               <td class="text-end pe-3">
-                <a :href="`/tunnel/${type.slice(0,-1)}/${device.id}/`" target="_blank" class="badge bg-info text-decoration-none me-2">WebUI</a>
+                <a :href="`/tunnel/${singularType}/${device.id}/`" target="_blank" class="badge bg-info text-decoration-none me-2">WebUI</a>
                 <button class="btn btn-sm" :class="device.is_silenced ? 'btn-warning' : 'btn-outline-secondary'" @click="toggleSilence(device)" :disabled="working === device.id">
                   {{ device.is_silenced ? '🔇' : '🔔' }}
                 </button>

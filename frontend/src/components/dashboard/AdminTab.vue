@@ -55,18 +55,19 @@
       
       <div class="card shadow-sm border-secondary">
         <div class="card-header bg-dark border-secondary">
-          <h5 class="mb-0">Backup & Restore</h5>
+          <h5 class="mb-0">Backup & Restore (CSV)</h5>
         </div>
         <div class="card-body bg-body-tertiary">
-          <p class="small text-muted mb-3">Export your hardware configuration (Switches, NVRs, and Cameras) to a secure JSON file, or restore a previous configuration.</p>
+          <p class="small text-muted mb-3">Export your hardware configuration as a CSV file, or merge a CSV file into the current database.</p>
           
           <div class="d-flex gap-2">
-            <a href="/api/v1/system/export" class="btn btn-outline-info w-50 fw-bold">⬇️ Export JSON</a>
+            <a href="/api/v1/system/export" class="btn btn-outline-info w-50 fw-bold">⬇️ Export CSV</a>
             
             <button class="btn btn-outline-danger w-50 fw-bold" @click="triggerFileInput" :disabled="analyzing">
-                {{ analyzing ? 'Analyzing...' : '⬆️ Import / Merge JSON' }}
+                {{ analyzing ? 'Analyzing...' : '⬆️ Import / Merge CSV' }}
             </button>
-            <input type="file" ref="fileInput" accept=".json" class="d-none" @change="handleAnalyze">
+            
+            <input type="file" ref="fileInput" accept=".csv" class="d-none" @change="handleAnalyze">
           </div>
         </div>
       </div>
@@ -99,12 +100,13 @@
       
     </div>
   </div>
+
   <ImportResolutionModal 
-      v-if="analysisData" 
-      :analysis="analysisData" 
-      @close="analysisData = null" 
-      @merged="onMergeComplete" 
-    />
+    v-if="analysisData" 
+    :analysis="analysisData" 
+    @close="analysisData = null" 
+    @merged="onMergeComplete" 
+  />
 </template>
 
 <script setup>
@@ -116,8 +118,6 @@ import ImportResolutionModal from '../modals/ImportResolutionModal.vue'
 const store = useSystemStore()
 const form = ref({})
 const saving = ref(false)
-
-// Merge Pipeline State
 const analyzing = ref(false)
 const fileInput = ref(null)
 const analysisData = ref(null)
@@ -150,7 +150,7 @@ const deleteUser = async (id) => {
   }
 }
 
-// --- Interactive Merge Logic ---
+// --- CSV Import Logic ---
 const triggerFileInput = () => { fileInput.value.click() }
 
 const handleAnalyze = async (event) => {
@@ -159,7 +159,7 @@ const handleAnalyze = async (event) => {
 
   analyzing.value = true
   const formData = new FormData()
-  formData.append('file', file)
+  formData.append('file', file) // Backend expects raw file stream
 
   try {
     const response = await axios.post('/api/v1/system/import/analyze', formData, {
@@ -170,14 +170,14 @@ const handleAnalyze = async (event) => {
       analysisData.value = response.data.analysis
     }
   } catch (error) {
-    store.addToast(error.response?.data?.message || 'Failed to analyze configuration file.', 'danger')
+    store.addToast(error.response?.data?.message || 'Failed to analyze CSV file.', 'danger')
   } finally {
     analyzing.value = false
-    event.target.value = '' // Reset input
+    event.target.value = ''
   }
 }
 
 const onMergeComplete = () => {
-  analysisData.value = null // Close the modal
+  analysisData.value = null
 }
 </script>

@@ -472,10 +472,20 @@ def is_port_open(target, port, timeout=2):
     except OSError: return False
 
 def is_stream_active(url):
+    """Checks if a stream is reachable and active using ffprobe."""
+    cmd = ['ffprobe', '-rtsp_transport', 'tcp', '-v', 'error', '-i', url]
     try:
-        response = eventlet.tpool.execute(subprocess.call, ['ffprobe', '-rtsp_transport', 'tcp', '-v', 'error', '-i', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-        return response == 0
-    except Exception: return False
+        # tpool.execute ensures this blocking call stays off the main eventlet loop
+        result = eventlet.tpool.execute(
+            subprocess.run, 
+            cmd, 
+            stdout=subprocess.DEVNULL, 
+            stderr=subprocess.DEVNULL, 
+            timeout=10
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, Exception):
+        return False
 
 def get_mac_address(ip):
     try:
@@ -502,15 +512,31 @@ def get_camlan_arp_table():
     return arp_entries
 
 def _run_ffmpeg_snapshot(stream_url):
+    """Captures a single frame, with aggressive cleanup for hung processes."""
     cmd = ['ffmpeg', '-y', '-rtsp_transport', 'tcp', '-i', stream_url, '-vframes', '1', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-']
+    
+    # We don't use 'with' here because of the complex error/timeout recovery logic required
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
-            stdout, _ = proc.communicate(timeout=5)
-            if proc.returncode == 0: return stdout
+        stdout, _ = proc.communicate(timeout=5)
+        if proc.returncode == 0:
+            return stdout
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
-    except Exception: pass
+        # 1. Attempt graceful shutdown
+        proc.terminate()
+        try:
+            # 2. Wait 1 second for buffers to flush and process to exit
+            proc.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            # 3. Aggressive cleanup if still alive
+            proc.kill()
+            proc.communicate()
+    except Exception:
+        # Ensure we don't leave a dangling process if something else crashes
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+            
     return None
 
 def get_snapshot_bytes(ip, mfg, user, pwd, stream_url):

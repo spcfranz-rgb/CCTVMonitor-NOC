@@ -54,8 +54,16 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
 
 # --- SECURITY: CSRF PROTECTION & SESSIONS ---
-app.secret_key = os.environ.get('SECRET_KEY', 'cctv-super-secret-key-change-me')
-db_key_env = os.environ.get('DB_ENCRYPTION_KEY', app.secret_key)
+secret_key = os.environ.get('SECRET_KEY')
+if not secret_key:
+    print("CRITICAL: SECRET_KEY environment variable is not set. Aborting.")
+    sys.exit(1)
+app.secret_key = secret_key
+
+db_key_env = os.environ.get('DB_ENCRYPTION_KEY')
+if not db_key_env:
+    print("CRITICAL: DB_ENCRYPTION_KEY environment variable is not set. Aborting.")
+    sys.exit(1)
 
 csrf = CSRFProtect(app)
 app.config['SESSION_COOKIE_HTTPONLY'] = True 

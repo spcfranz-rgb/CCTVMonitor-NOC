@@ -6,25 +6,48 @@ import LoginView from '../views/LoginView.vue'
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
   routes: [
-    { path: '/', name: 'dashboard', component: DashboardView, meta: { requiresAuth: true } },
-    { path: '/logs', name: 'logs', component: () => import('../views/EventLogsView.vue'), meta: { requiresAuth: true } }, // NEW LINE
-    { path: '/login', name: 'login', component: LoginView },
-    // You can easily add the HistoryView later: 
-    // { path: '/history', name: 'history', component: () => import('../views/HistoryView.vue'), meta: { requiresAuth: true } }
+    { 
+      path: '/', 
+      name: 'dashboard', 
+      component: DashboardView, 
+      meta: { requiresAuth: true } 
+    },
+    { 
+      path: '/logs', 
+      name: 'logs', 
+      component: () => import('../views/EventLogsView.vue'), 
+      meta: { requiresAuth: true } 
+    },
+    { 
+      path: '/login', 
+      name: 'login', 
+      component: LoginView 
+    },
+    // Catch-all route to redirect invalid paths to dashboard or login
+    { 
+      path: '/:pathMatch(.*)*', 
+      redirect: '/' 
+    }
   ]
 })
 
 router.beforeEach(async (to, from, next) => {
   const store = useSystemStore()
   
-  // ALWAYS hydrate auth state & CSRF token on first load
-  if (!store.csrfToken) {
+  // 1. Ensure we have authenticated against the backend before making routing decisions
+  if (!store.user) {
     await store.checkAuth()
   }
 
-  if (to.meta.requiresAuth && !store.user) {
-    next({ name: 'login' })
+  // 2. Route Protection Logic
+  if (to.meta.requiresAuth) {
+    if (store.user) {
+      next()
+    } else {
+      next({ name: 'login', query: { redirect: to.fullPath } })
+    }
   } else if (to.name === 'login' && store.user) {
+    // Prevent logged-in users from hitting the login page
     next({ name: 'dashboard' })
   } else {
     next()

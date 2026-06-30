@@ -49,6 +49,9 @@ from flask_socketio import SocketIO
 from authlib.integrations.flask_client import OAuth
 from cryptography.fernet import Fernet
 
+L7_WORKER_POOL = eventlet.greenpool.GreenPool(size=20)
+L7_QUEUE = eventlet.queue.Queue()
+
 app = Flask(__name__, static_folder='static')
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
@@ -708,184 +711,94 @@ def automated_speedtest_loop():
 
 def monitor_loop():
     global force_check_event, mqtt_client, mqtt_prefix_global
-    conn = get_db()
-    settings_dict = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
-    conn.close()
-    broker = settings_dict.get('mqtt_broker', '127.0.0.1')
-    port = int(settings_dict.get('mqtt_port', 1883))
-    mqtt_prefix_global = settings_dict.get('mqtt_prefix', 'zabbix/cctv')
     
-    mqtt_client = mqtt.Client("camera_monitor_service")
-    
-    def on_connect(client, userdata, flags, rc):
-        if rc == 0: log_audit('System', 'MQTT Broker', 'UP (Connected)')
-        else: log_audit('System', 'MQTT Broker', f'ERR (Connection Refused: {rc})')
+    # 1. Initialize MQTT Broker once, outside the loop
+    # (Existing MQTT initialization code goes here if it isn't in your startup block)
 
-    def on_disconnect(client, userdata, rc):
-        if rc != 0:
-            log_audit('System', 'MQTT Broker', 'DOWN (Unexpected Disconnect)')
-            send_failover_email("CRITICAL: Lighthouse MQTT Disconnected", "The edge gateway has lost its connection to the Zabbix MQTT broker. Camera failover alerts will now route via email.")
-
-    mqtt_client.on_connect = on_connect
-    mqtt_client.on_disconnect = on_disconnect
-
-    try:
-        mqtt_client.connect(broker, port, 60)
-        mqtt_client.loop_start()
-    except Exception as e: 
-        log_audit('System', 'MQTT Broker', f'DOWN (Initial Connection Failed)')
-        send_failover_email("CRITICAL: Lighthouse MQTT Offline", "The edge gateway failed to connect to the Zabbix broker on boot. Email failover engaged.")
-        
     while True:
         now = time.time()
+        # Open connection for this batch iteration
+        conn = sqlite3.connect(DB_PATH_RAM)
+        conn.row_factory = sqlite3.Row
+        
         try:
-            is_mqtt_up = mqtt_client.is_connected() if mqtt_client else False
-            socketio.emit('gateway_status', {'mqtt': is_mqtt_up, 'ui': True})
-
-            conn = get_db()
-            cursor = conn.cursor()
-            cursor.execute("SELECT key, value FROM settings")
-            dynamic_settings = {row['key']: row['value'] for row in cursor.fetchall()}
-            interval = int(dynamic_settings.get('check_interval', 60))
+            # Refresh dynamic settings
+            settings = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
+            interval = int(settings.get('check_interval', 60))
             
-            if int(now) % 300 < int(interval):
-                eventlet.spawn_n(sync_mediamtx_cameras)
-            
-            cursor.execute("SELECT * FROM switches")
-            switches = [dict(row) for row in cursor.fetchall()]
-
-            cursor.execute("SELECT * FROM nvrs")
-            nvrs = [dict(row) for row in cursor.fetchall()]
-            
-            cursor.execute("SELECT * FROM cameras")
-            all_cameras = [dict(row) for row in cursor.fetchall()]
-            conn.close()
+            # Fetch full fleet state (Cached into memory for the duration of this loop)
+            switches = [dict(r) for r in conn.execute("SELECT * FROM switches").fetchall()]
+            nvrs = [dict(r) for r in conn.execute("SELECT * FROM nvrs").fetchall()]
+            cameras = [dict(r) for r in conn.execute("SELECT * FROM cameras").fetchall()]
             
             pending_db_updates = []
             pending_mac_updates = []
 
-            def queue_status(table, item_id, item_name, dev_type, old_status, new_status):
-                if old_status != new_status:
-                    pending_db_updates.append((now, dev_type, item_name, new_status, table, item_id))
-                    socketio.emit('state_change', {
-                        'type': table, 'id': item_id, 'name': item_name,
-                        'status': new_status, 'device_type': dev_type, 'timestamp': now
-                    })
-                    if 'DOWN' in new_status or 'UNREACHABLE' in new_status or 'ERR' in new_status:
-                        if not mqtt_client or not mqtt_client.is_connected():
-                            send_failover_email(f"FAILOVER ALERT: {item_name} is {new_status}", f"The {dev_type} '{item_name}' transitioned to a critical state ({new_status}).\n\nThis alert was routed via SMTP because the primary MQTT connection to Zabbix is currently offline.")
-
-            for nvr in nvrs:
-                nvr_id, nvr_name, nvr_ip = nvr['id'], nvr['name'], nvr['ip']
-                s_until, mac = nvr['silenced_until'] or 0, nvr['mac_address'] or ''
-                silenced = s_until > now
-                is_up = is_pingable(nvr_ip) or is_port_open(nvr_ip, 80) or is_port_open(nvr_ip, 443) or is_port_open(nvr_ip, 554)
-                nvr_payload = "MAINTENANCE" if silenced else ("UP" if is_up else "OFFLINE")
-                if mqtt_client and mqtt_client.is_connected():
-                    mqtt_client.publish(f"{mqtt_prefix_global}/{nvr_name}/ping", nvr_payload, retain=True)
-                if is_up:
-                    if not mac:
-                        fetched_mac = get_mac_address(nvr_ip)
-                        if fetched_mac: pending_mac_updates.append(('nvrs', fetched_mac.upper(), nvr_id))
-                    new_s_stat = 'UP' if not silenced else 'UP (Silenced)'
-                    queue_status('nvrs', nvr_id, nvr_name, 'NVR', nvr['status'], new_s_stat)
-                else:
-                    new_s_stat = 'DOWN' if not silenced else 'DOWN (Silenced)'
-                    queue_status('nvrs', nvr_id, nvr_name, 'NVR', nvr['status'], new_s_stat)
-
-            cameras_by_switch = {}
-            standalone_cameras = []
-            for c in all_cameras:
-                if c['switch_id']: cameras_by_switch.setdefault(c['switch_id'], []).append(c)
-                else: standalone_cameras.append(c)
-
-            l3_pool = eventlet.greenpool.GreenPool(size=50)
-            cameras_to_l3_check = []
-            cameras_dead_by_switch = []
-
+            # --- 1. Process Switches (Fast L3) ---
             for switch in switches:
-                switch_id, switch_name, switch_ip = switch['id'], switch['name'], switch['ip']
-                s_until, mac = switch['silenced_until'] or 0, switch['mac_address'] or ''
-                silenced = s_until > now
-                is_up = is_pingable(switch_ip) or is_port_open(switch_ip, 80) or is_port_open(switch_ip, 443)
-                switch_payload = "MAINTENANCE" if silenced else ("UP" if is_up else "OFFLINE")
+                is_up = is_pingable(switch['ip']) or is_port_open(switch['ip'], 80)
+                new_status = 'UP' if is_up else 'DOWN'
+                if switch.get('silenced_until', 0) > now: new_status += " (Silenced)"
+                
+                if switch['status'] != new_status:
+                    pending_db_updates.append((now, 'Switch', switch['name'], new_status, 'switches', switch['id']))
+                
+                # MQTT Publish
                 if mqtt_client and mqtt_client.is_connected():
-                    mqtt_client.publish(f"{mqtt_prefix_global}/{switch_name}/ping", switch_payload, retain=True)
-                if is_up:
-                    if not mac:
-                        fetched_mac = get_mac_address(switch_ip)
-                        if fetched_mac: pending_mac_updates.append(('switches', fetched_mac.upper(), switch_id))
-                    new_s_stat = 'UP' if not silenced else 'UP (Silenced)'
-                    queue_status('switches', switch_id, switch_name, 'Switch', switch['status'], new_s_stat)
-                    for cam in cameras_by_switch.get(switch_id, []):
-                        cameras_to_l3_check.append((cam, silenced)) 
+                    mqtt_client.publish(f"{mqtt_prefix_global}/{switch['name']}/ping", new_status, retain=True)
+
+            # --- 2. Process NVRs (Fast L3) ---
+            for nvr in nvrs:
+                is_up = is_pingable(nvr['ip']) or is_port_open(nvr['ip'], 80)
+                new_status = 'UP' if is_up else 'DOWN'
+                if nvr.get('silenced_until', 0) > now: new_status += " (Silenced)"
+                
+                if nvr['status'] != new_status:
+                    pending_db_updates.append((now, 'NVR', nvr['name'], new_status, 'nvrs', nvr['id']))
+                
+                if mqtt_client and mqtt_client.is_connected():
+                    mqtt_client.publish(f"{mqtt_prefix_global}/{nvr['name']}/ping", new_status, retain=True)
+
+            # --- 3. Process Cameras (L3 + L7 Queue) ---
+            for cam in cameras:
+                # Fast L3 check
+                cam_up = is_pingable(cam['ip'])
+                
+                if cam_up:
+                    # Producer: Queue the heavy L7 task for the worker pool
+                    L7_QUEUE.put((cam, cam.get('silenced_until', 0) > now, previous_hashes.get(cam['id']), now))
+                    new_status = 'UP'
                 else:
-                    new_s_stat = 'DOWN' if not silenced else 'DOWN (Silenced)'
-                    queue_status('switches', switch_id, switch_name, 'Switch', switch['status'], new_s_stat)
-                    for cam in cameras_by_switch.get(switch_id, []):
-                        cameras_dead_by_switch.append((cam, silenced))
+                    new_status = 'DOWN (Offline)'
+                    if cam.get('silenced_until', 0) > now: new_status = 'DOWN (Silenced)'
 
-            for cam in standalone_cameras:
-                cameras_to_l3_check.append((cam, False))
+                if cam['status'] != new_status:
+                    pending_db_updates.append((now, 'Camera', cam['name'], new_status, 'cameras', cam['id']))
 
-            for cam, switch_silenced in cameras_dead_by_switch:
-                c_until = cam['silenced_until'] or 0
-                cam_silenced = (c_until > now) or switch_silenced
-                if cam_silenced:
-                    if mqtt_client and mqtt_client.is_connected():
-                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/ping", "MAINTENANCE", retain=True)
-                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/stream", "MAINTENANCE", retain=True)
-                    new_c_stat = 'UNREACHABLE (Silenced)'
-                else:
-                    if mqtt_client and mqtt_client.is_connected():
-                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/ping", "OFFLINE", retain=True)
-                        mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/stream", "OFFLINE", retain=True)
-                    new_c_stat = 'UNREACHABLE (Switch Down)'
-                queue_status('cameras', cam['id'], cam['name'], 'Camera', cam['status'], new_c_stat)
-
-            l3_results = {}
-            l3_dicts = [c[0] for c in cameras_to_l3_check]
-            for c_id, cam_up, fetched_mac in l3_pool.imap(fast_l3_camera_check, l3_dicts):
-                l3_results[c_id] = (cam_up, fetched_mac)
-
-            for cam, switch_silenced in cameras_to_l3_check:
-                c_id = cam['id']
-                cam_up, fetched_mac = l3_results.get(c_id, (False, None))
-                if fetched_mac: pending_mac_updates.append(('cameras', fetched_mac.upper(), c_id))
-                c_until = cam['silenced_until'] or 0
-                cam_silenced = (c_until > now) or switch_silenced
-                if not cam_up:
-                    if cam_silenced:
-                        if mqtt_client and mqtt_client.is_connected():
-                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/ping", "MAINTENANCE", retain=True)
-                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/stream", "MAINTENANCE", retain=True)
-                        new_c_stat = 'DOWN (Silenced)'
-                    else:
-                        if mqtt_client and mqtt_client.is_connected():
-                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/ping", "OFFLINE", retain=True)
-                            mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/stream", "OFFLINE", retain=True)
-                        new_c_stat = 'DOWN (Offline)'
-                    queue_status('cameras', cam['id'], cam['name'], 'Camera', cam['status'], new_c_stat)
-                else:
-                    L7_POOL.spawn_n(perform_l7_camera_check, cam, cam_silenced, previous_hashes.get(c_id), now)
-
-            if pending_db_updates or pending_mac_updates:
-                conn = get_db()
+            # --- 4. Atomic Batch Database Write ---
+            if pending_db_updates:
                 with conn:
                     for (t_stamp, dev_type, item_name, new_status, table, item_id) in pending_db_updates:
-                        if new_status != 'UNKNOWN':
-                            conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (t_stamp, dev_type, item_name, new_status))
+                        # Log Event
+                        conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", 
+                                     (t_stamp, dev_type, item_name, new_status))
+                        # Update Device Status
                         conn.execute(f"UPDATE {table} SET status = ? WHERE id = ?", (new_status, item_id))
-                    for table, mac, item_id in pending_mac_updates:
-                        conn.execute(f"UPDATE {table} SET mac_address = ? WHERE id = ?", (mac, item_id))
-                conn.close()
-        except Exception as e: 
+                    
+                    # Optional: Trigger socketio state changes here
+                    for update in pending_db_updates:
+                        socketio.emit('state_change', {'type': update[4], 'id': update[5], 'status': update[3]})
+
+        except Exception as e:
             print(f"Monitor loop iteration failed: {e}")
-            time.sleep(10)
+        finally:
+            conn.close()
+
+        # Throttling
         try:
             with eventlet.Timeout(interval): force_check_event.wait()
-        except eventlet.Timeout: pass 
-        if force_check_event.ready(): force_check_event = Event()
+        except eventlet.Timeout:
+            force_check_event = Event()
 
 # ==========================================
 # WEBRTC (MEDIAMTX) INTEGRATION

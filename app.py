@@ -170,7 +170,6 @@ if KEYCLOAK_URL and KEYCLOAK_REALM:
         server_metadata_url=f"{KEYCLOAK_URL.rstrip('/')}/realms/{KEYCLOAK_REALM}/.well-known/openid-configuration",
         client_kwargs={'scope': 'openid profile email'}
     )
-
 # ==========================================
 # DATABASE & CONNECTION POOLING
 # ==========================================
@@ -178,17 +177,41 @@ DB_PATH_DISK = '/app/data/cctv.db'
 DB_PATH_RAM = '/app/data_ram/cctv.db'     
 force_check_event = Event()
 
+class RequestDBWrapper:
+    """Wraps the SQLite connection to prevent premature closure during a Flask request lifecycle."""
+    def __init__(self, conn):
+        self._conn = conn
+        
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+        
+    def __enter__(self):
+        return self._conn.__enter__()
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self._conn.__exit__(exc_type, exc_val, exc_tb)
+        
+    def close(self):
+        # Ignore premature closes from `contextlib.closing` in routes
+        pass 
+        
+    def force_close(self):
+        # Called only by Flask teardown
+        self._conn.close()
+
 def get_db():
     """Returns a request-scoped connection if in a Flask request, otherwise a standalone connection."""
     if has_app_context():
         if 'db' not in g:
             os.makedirs(os.path.dirname(DB_PATH_RAM), exist_ok=True)
-            g.db = sqlite3.connect(DB_PATH_RAM, check_same_thread=False, timeout=10)
-            try: g.db.execute("PRAGMA journal_mode=WAL;")
+            conn = sqlite3.connect(DB_PATH_RAM, check_same_thread=False, timeout=10)
+            try: conn.execute("PRAGMA journal_mode=WAL;")
             except sqlite3.OperationalError: pass
-            g.db.row_factory = sqlite3.Row
+            conn.row_factory = sqlite3.Row
+            g.db = RequestDBWrapper(conn)
         return g.db
-    # Fallback for background threads (manual close required - wrap in closing())
+        
+    # Fallback for background Eventlet threads (manual close required)
     conn = sqlite3.connect(DB_PATH_RAM, check_same_thread=False, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
@@ -197,14 +220,17 @@ def get_db():
 def close_db(error):
     db = g.pop('db', None)
     if db is not None:
-        db.close()
+        db.force_close()
 
 def log_audit(device_type, device_name, status):
     try:
-        with closing(get_db()) as conn:
-            conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)",
-                         (time.time(), device_type, device_name, status))
-            conn.commit()
+        conn = get_db()
+        conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)",
+                     (time.time(), device_type, device_name, status))
+        conn.commit()
+        # Clean up ONLY if this was spawned by an Eventlet background thread
+        if not has_app_context():
+            conn.close() 
     except Exception: pass
 
 # ==========================================

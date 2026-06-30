@@ -154,15 +154,22 @@ def get_db():
 
 # [ ... Keep init_db(), logic for default admin generation updated ... ]
 def init_db():
-    # ... inside user check section:
-    if cursor.fetchone()[0] == 0:
-        default_user = os.environ.get('DEFAULT_ADMIN_USER', 'admin')
-        default_pass = os.environ.get('DEFAULT_ADMIN_PASS')
-        if not default_pass:
-            default_pass = secrets.token_urlsafe(16)
-            print(f"CRITICAL: No ADMIN_PASS set. Temporary access: {default_pass}")
-        cursor.execute("INSERT INTO users (username, password, role) VALUES (?, ?, 'admin')", 
-                       (default_user, generate_password_hash(default_pass)))
+    try:
+        init_ram_db() 
+        conn = sqlite3.connect(DB_PATH_RAM, timeout=10) # Added timeout
+        cursor = conn.cursor()
+        
+        # Wrap schema creation in a try-except to debug
+        cursor.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        # ... (rest of your table creation)
+        
+        conn.commit()
+        conn.close()
+    except sqlite3.OperationalError as e:
+        print(f"CRITICAL: Database initialization failed: {e}")
+        # Optionally sys.exit(1) if you want the container to restart, 
+        # but check if the file is locked by a zombie process first.
+        raise
 
 # [ ... Updated Snapshotter with Context Manager ... ]
 def _run_ffmpeg_snapshot(stream_url):

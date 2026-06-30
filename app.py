@@ -21,6 +21,7 @@ import re
 import atexit
 import signal
 import smtplib
+import secrets
 from contextlib import closing
 from email.message import EmailMessage
 from datetime import datetime
@@ -50,7 +51,6 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from flask_socketio import SocketIO
 from authlib.integrations.flask_client import OAuth
 from cryptography.fernet import Fernet
-import secrets
 
 L7_WORKER_POOL = eventlet.greenpool.GreenPool(size=20)
 L7_QUEUE = eventlet.queue.Queue()
@@ -59,14 +59,16 @@ app = Flask(__name__, static_folder='static')
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
 
-# --- SECURITY: CONFIGURATION ---
+# --- SECURITY: CONFIGURATION & HARD-FAIL ---
 secret_key = os.environ.get('SECRET_KEY')
 if not secret_key:
+    print("CRITICAL: SECRET_KEY environment variable is not set. Aborting.")
     sys.exit(1)
 app.secret_key = secret_key
 
 db_key_env = os.environ.get('DB_ENCRYPTION_KEY')
 if not db_key_env:
+    print("CRITICAL: DB_ENCRYPTION_KEY environment variable is not set. Aborting.")
     sys.exit(1)
 
 csrf = CSRFProtect(app)
@@ -77,14 +79,41 @@ app.config['SESSION_COOKIE_SECURE'] = os.environ.get('REQUIRE_HTTPS', 'False').l
 # --- SECURITY: STRICT AIR-GAPPED CSP ---
 @app.after_request
 def apply_csp(response):
-    response.headers['Content-Security-Policy'] = (
-        "default-src 'self'; script-src 'self' 'unsafe-eval'; "
-        "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http: https:; "
-        "connect-src 'self' ws: wss:; media-src 'self' blob:; object-src 'none';"
+    csp = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-eval'; " 
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob: http: https:; "
+        "connect-src 'self' ws: wss:; "
+        "media-src 'self' blob:; "
+        "object-src 'none';"
     )
+    response.headers['Content-Security-Policy'] = csp
     return response
 
 socketio = SocketIO(app, async_mode='eventlet', logger=False, engineio_logger=False)
+
+LOCAL_COMPANY_LOGO = None
+LOCAL_CUSTOMER_LOGO = None
+
+def get_cipher():
+    key_bytes = db_key_env.encode('utf-8')
+    fernet_key = base64.urlsafe_b64encode(hashlib.sha256(key_bytes).digest())
+    return Fernet(fernet_key)
+
+def encrypt_pwd(pwd):
+    if not pwd: return ''
+    return get_cipher().encrypt(pwd.encode('utf-8')).decode('utf-8')
+
+def decrypt_pwd(pwd):
+    if not pwd: return ''
+    try:
+        return get_cipher().decrypt(pwd.encode('utf-8')).decode('utf-8')
+    except Exception:
+        if pwd.startswith('gAAAAA'):
+            print("ERROR: Database decryption failed! Secret Key mismatch.")
+            return '' 
+        return pwd
 
 # ==========================================
 # OPENID CONNECT (OIDC) / MULTI-TENANT SSO
@@ -143,56 +172,43 @@ if KEYCLOAK_URL and KEYCLOAK_REALM:
     )
 
 # ==========================================
-# DATABASE & CONNECTION POOLING (Hardened)
+# DATABASE & CONNECTION POOLING
 # ==========================================
-DB_PATH_RAM = '/app/data_ram/cctv.db'
+DB_PATH_DISK = '/app/data/cctv.db'        
+DB_PATH_RAM = '/app/data_ram/cctv.db'     
+force_check_event = Event()
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH_RAM, check_same_thread=False, timeout=30)
+    """Returns a request-scoped connection if in a Flask request, otherwise a standalone connection."""
+    if has_app_context():
+        if 'db' not in g:
+            os.makedirs(os.path.dirname(DB_PATH_RAM), exist_ok=True)
+            g.db = sqlite3.connect(DB_PATH_RAM, check_same_thread=False, timeout=10)
+            try: g.db.execute("PRAGMA journal_mode=WAL;")
+            except sqlite3.OperationalError: pass
+            g.db.row_factory = sqlite3.Row
+        return g.db
+    # Fallback for background threads (manual close required - wrap in closing())
+    conn = sqlite3.connect(DB_PATH_RAM, check_same_thread=False, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
 
-# [ ... Keep init_db(), logic for default admin generation updated ... ]
-def init_db():
+@app.teardown_appcontext
+def close_db(error):
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
+
+def log_audit(device_type, device_name, status):
     try:
-        init_ram_db() 
-        conn = sqlite3.connect(DB_PATH_RAM, timeout=10) # Added timeout
-        cursor = conn.cursor()
-        
-        # Wrap schema creation in a try-except to debug
-        cursor.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
-        # ... (rest of your table creation)
-        
-        conn.commit()
-        conn.close()
-    except sqlite3.OperationalError as e:
-        print(f"CRITICAL: Database initialization failed: {e}")
-        # Optionally sys.exit(1) if you want the container to restart, 
-        # but check if the file is locked by a zombie process first.
-        raise
+        with closing(get_db()) as conn:
+            conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)",
+                         (time.time(), device_type, device_name, status))
+            conn.commit()
+    except Exception: pass
 
-# [ ... Updated Snapshotter with Context Manager ... ]
-def _run_ffmpeg_snapshot(stream_url):
-    cmd = ['ffmpeg', '-y', '-rtsp_transport', 'tcp', '-i', stream_url, '-vframes', '1', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-']
-    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
-        try:
-            stdout, _ = proc.communicate(timeout=5)
-            return stdout if proc.returncode == 0 else None
-        except Exception:
-            proc.kill()
-            return None
-
-# [ ... Updated Tunnel Route to Enforce CSRF validation manually for safety ... ]
-@app.route('/tunnel/<device_type>/<int:device_id>/<path:req_path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-@login_required
-@operator_required
-def tunnel(device_type, device_id, req_path):
-    # Enforce CSRF check manually for proxy target to ensure traffic originates from our own UI
-    csrf.protect() 
-    # ... Rest of existing tunnel proxy logic ...
-    pass
 # ==========================================
-# AUTHENTICATION & GLOBALS
+# AUTHENTICATION & GLOBALS 
 # ==========================================
 login_manager = LoginManager()
 login_manager.init_app(app)
@@ -205,12 +221,12 @@ class User(UserMixin):
 
 @login_manager.user_loader
 def load_user(user_id):
-    conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    if not has_app_context(): conn.close()
-    if user: return User(user['id'], user['username'], user['role'])
+    with closing(get_db()) as conn:
+        user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if user: return User(user['id'], user['username'], user['role'])
     return None
 
+# ---> CRITICAL FIX: RBAC DECORATORS MUST BE DEFINED HERE BEFORE ANY ROUTES <---
 def admin_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -241,10 +257,9 @@ def manage_idle_timeout():
         now = time.time()
         last_active = session.get('last_active', now)
         
-        conn = get_db()
-        idle_row = conn.execute("SELECT value FROM settings WHERE key = 'inactive_timeout'").fetchone()
-        
-        idle_mins = int(idle_row['value']) if idle_row else 20
+        with closing(get_db()) as conn:
+            idle_row = conn.execute("SELECT value FROM settings WHERE key = 'inactive_timeout'").fetchone()
+            idle_mins = int(idle_row['value']) if idle_row else 20
         
         if idle_mins > 0 and (now - last_active) > (idle_mins * 60):
             log_audit('System', current_user.username, 'Auto-logged out (Idle Timeout)')
@@ -270,65 +285,78 @@ def init_ram_db():
         except Exception as e: print(f"Boot restoration failed: {e}")
 
 def init_db():
-    init_ram_db() 
-    conn = sqlite3.connect(DB_PATH_RAM)
-    cursor = conn.cursor()
-    cursor.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
-    cursor.execute("CREATE TABLE IF NOT EXISTS switches (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, ip TEXT, status TEXT DEFAULT 'UNKNOWN')")
-    cursor.execute("CREATE TABLE IF NOT EXISTS nvrs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, ip TEXT, status TEXT DEFAULT 'UNKNOWN')")
-    cursor.execute("CREATE TABLE IF NOT EXISTS cameras (id INTEGER PRIMARY KEY AUTOINCREMENT, switch_id INTEGER, name TEXT UNIQUE, ip TEXT, stream_url TEXT, status TEXT DEFAULT 'UNKNOWN', FOREIGN KEY(switch_id) REFERENCES switches(id))")
-    cursor.execute("CREATE TABLE IF NOT EXISTS event_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, device_type TEXT, device_name TEXT, status TEXT)")
-    
-    try: cursor.execute("ALTER TABLE cameras ADD COLUMN manufacturer TEXT DEFAULT 'Other'")
-    except sqlite3.OperationalError: pass
-    try: cursor.execute("ALTER TABLE cameras ADD COLUMN username TEXT DEFAULT ''")
-    except sqlite3.OperationalError: pass
-    try: cursor.execute("ALTER TABLE cameras ADD COLUMN password TEXT DEFAULT ''")
-    except sqlite3.OperationalError: pass
-    try: cursor.execute("ALTER TABLE switches ADD COLUMN silenced_until REAL DEFAULT 0")
-    except sqlite3.OperationalError: pass
-    try: cursor.execute("ALTER TABLE nvrs ADD COLUMN silenced_until REAL DEFAULT 0")
-    except sqlite3.OperationalError: pass
-    try: cursor.execute("ALTER TABLE cameras ADD COLUMN silenced_until REAL DEFAULT 0")
-    except sqlite3.OperationalError: pass
-    try: cursor.execute("ALTER TABLE switches ADD COLUMN mac_address TEXT DEFAULT ''")
-    except sqlite3.OperationalError: pass
-    try: cursor.execute("ALTER TABLE nvrs ADD COLUMN mac_address TEXT DEFAULT ''")
-    except sqlite3.OperationalError: pass
-    try: cursor.execute("ALTER TABLE cameras ADD COLUMN mac_address TEXT DEFAULT ''")
-    except sqlite3.OperationalError: pass
-    
-    cursor.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT, role TEXT)")
-    
-    cursor.execute("SELECT count(*) FROM settings")
-    if cursor.fetchone()[0] == 0:
-        settings = [
-            ('mqtt_broker', os.environ.get('DEFAULT_MQTT_BROKER', '127.0.0.1')),
-            ('mqtt_port', os.environ.get('DEFAULT_MQTT_PORT', '1883')),
-            ('mqtt_prefix', os.environ.get('DEFAULT_MQTT_PREFIX', 'zabbix/cctv')),
-            ('check_interval', os.environ.get('DEFAULT_CHECK_INTERVAL', '60')),
-            ('inactive_timeout', '20'),
-            ('smtp_host', ''),     
-            ('smtp_port', '587'),  
-            ('smtp_user', ''),     
-            ('smtp_pass', ''),     
-            ('smtp_target', ''),
-            ('st_interval', '0'),
-            ('st_alert_dl', '0'),
-            ('st_alert_ul', '0'),
-            ('st_alert_ping', '0')
-        ]
-        cursor.executemany("INSERT INTO settings (key, value) VALUES (?, ?)", settings)
+    try:
+        init_ram_db() 
+        conn = sqlite3.connect(DB_PATH_RAM, timeout=10)
+        cursor = conn.cursor()
         
-    cursor.execute("SELECT count(*) FROM users")
-    if cursor.fetchone()[0] == 0:
-        default_user = os.environ.get('DEFAULT_ADMIN_USER', 'admin')
-        default_pass = os.environ.get('DEFAULT_ADMIN_PASS', 'admin')
-        default_hash = generate_password_hash(default_pass)
-        cursor.execute("INSERT INTO users (username, password, role) VALUES (?, ?, 'admin')", (default_user, default_hash))
-    
-    conn.commit()
-    conn.close()
+        cursor.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        cursor.execute("CREATE TABLE IF NOT EXISTS switches (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, ip TEXT, status TEXT DEFAULT 'UNKNOWN')")
+        cursor.execute("CREATE TABLE IF NOT EXISTS nvrs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, ip TEXT, status TEXT DEFAULT 'UNKNOWN')")
+        cursor.execute("CREATE TABLE IF NOT EXISTS cameras (id INTEGER PRIMARY KEY AUTOINCREMENT, switch_id INTEGER, name TEXT UNIQUE, ip TEXT, stream_url TEXT, status TEXT DEFAULT 'UNKNOWN', FOREIGN KEY(switch_id) REFERENCES switches(id))")
+        cursor.execute("CREATE TABLE IF NOT EXISTS event_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, device_type TEXT, device_name TEXT, status TEXT)")
+        
+        try: cursor.execute("ALTER TABLE cameras ADD COLUMN manufacturer TEXT DEFAULT 'Other'")
+        except sqlite3.OperationalError: pass
+        try: cursor.execute("ALTER TABLE cameras ADD COLUMN username TEXT DEFAULT ''")
+        except sqlite3.OperationalError: pass
+        try: cursor.execute("ALTER TABLE cameras ADD COLUMN password TEXT DEFAULT ''")
+        except sqlite3.OperationalError: pass
+        try: cursor.execute("ALTER TABLE switches ADD COLUMN silenced_until REAL DEFAULT 0")
+        except sqlite3.OperationalError: pass
+        try: cursor.execute("ALTER TABLE nvrs ADD COLUMN silenced_until REAL DEFAULT 0")
+        except sqlite3.OperationalError: pass
+        try: cursor.execute("ALTER TABLE cameras ADD COLUMN silenced_until REAL DEFAULT 0")
+        except sqlite3.OperationalError: pass
+        try: cursor.execute("ALTER TABLE switches ADD COLUMN mac_address TEXT DEFAULT ''")
+        except sqlite3.OperationalError: pass
+        try: cursor.execute("ALTER TABLE nvrs ADD COLUMN mac_address TEXT DEFAULT ''")
+        except sqlite3.OperationalError: pass
+        try: cursor.execute("ALTER TABLE cameras ADD COLUMN mac_address TEXT DEFAULT ''")
+        except sqlite3.OperationalError: pass
+        
+        cursor.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT, role TEXT)")
+        
+        cursor.execute("SELECT count(*) FROM settings")
+        if cursor.fetchone()[0] == 0:
+            settings = [
+                ('mqtt_broker', os.environ.get('DEFAULT_MQTT_BROKER', '127.0.0.1')),
+                ('mqtt_port', os.environ.get('DEFAULT_MQTT_PORT', '1883')),
+                ('mqtt_prefix', os.environ.get('DEFAULT_MQTT_PREFIX', 'zabbix/cctv')),
+                ('check_interval', os.environ.get('DEFAULT_CHECK_INTERVAL', '60')),
+                ('inactive_timeout', '20'),
+                ('smtp_host', ''),     
+                ('smtp_port', '587'),  
+                ('smtp_user', ''),     
+                ('smtp_pass', ''),     
+                ('smtp_target', ''),
+                ('st_interval', '0'),
+                ('st_alert_dl', '0'),
+                ('st_alert_ul', '0'),
+                ('st_alert_ping', '0')
+            ]
+            cursor.executemany("INSERT INTO settings (key, value) VALUES (?, ?)", settings)
+            
+        cursor.execute("SELECT count(*) FROM users")
+        if cursor.fetchone()[0] == 0:
+            default_user = os.environ.get('DEFAULT_ADMIN_USER', 'admin')
+            default_pass = os.environ.get('DEFAULT_ADMIN_PASS')
+            if not default_pass:
+                default_pass = secrets.token_urlsafe(16)
+                print(f"\n======================================================\n"
+                      f"CRITICAL: NO ADMIN_PASS PROVIDED. SECURE FALLBACK USED.\n"
+                      f"Temporary Local Username: {default_user}\n"
+                      f"Temporary Local Password: {default_pass}\n"
+                      f"======================================================\n")
+            
+            default_hash = generate_password_hash(default_pass)
+            cursor.execute("INSERT INTO users (username, password, role) VALUES (?, ?, 'admin')", (default_user, default_hash))
+        
+        conn.commit()
+        conn.close()
+    except sqlite3.OperationalError as e:
+        print(f"CRITICAL ERROR: Database initialization failed (Check for lingering file locks or zombie containers): {e}")
+        raise
 
 def _perform_disk_sync():
     if os.path.exists(DB_PATH_RAM):
@@ -373,11 +401,10 @@ def log_prune_loop():
     while True:
         eventlet.sleep(86400) 
         try:
-            conn = sqlite3.connect(DB_PATH_RAM)
-            seven_days_ago = time.time() - (7 * 24 * 3600)
-            conn.execute("DELETE FROM event_logs WHERE timestamp < ?", (seven_days_ago,))
-            conn.commit()
-            conn.close()
+            with closing(sqlite3.connect(DB_PATH_RAM)) as conn:
+                seven_days_ago = time.time() - (7 * 24 * 3600)
+                conn.execute("DELETE FROM event_logs WHERE timestamp < ?", (seven_days_ago,))
+                conn.commit()
             force_disk_sync()
         except Exception: pass
 
@@ -475,7 +502,6 @@ def is_port_open(target, port, timeout=2):
     except OSError: return False
 
 def is_stream_active(url):
-    """Checks if a stream is reachable and active using ffprobe."""
     cmd = ['ffprobe', '-rtsp_transport', 'tcp', '-v', 'error', '-i', url]
     try:
         result = eventlet.tpool.execute(
@@ -514,22 +540,21 @@ def get_camlan_arp_table():
     return arp_entries
 
 def _run_ffmpeg_snapshot(stream_url):
-    """Captures a single frame, with aggressive cleanup for hung processes."""
     cmd = ['ffmpeg', '-y', '-rtsp_transport', 'tcp', '-i', stream_url, '-vframes', '1', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-']
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    try:
-        stdout, _ = proc.communicate(timeout=5)
-        if proc.returncode == 0:
-            return stdout
-    except subprocess.TimeoutExpired:
-        proc.terminate()
+    # Use context manager to prevent lingering File Descriptors
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
         try:
-            proc.communicate(timeout=1)
+            stdout, _ = proc.communicate(timeout=5)
+            if proc.returncode == 0:
+                return stdout
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
-    except Exception:
-        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+        except Exception:
             proc.kill()
             proc.communicate()
     return None
@@ -600,31 +625,31 @@ def perform_l7_camera_check(cam, cam_silenced, last_hash, check_time):
             mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "FROZEN" if is_frozen else ("UP" if stream_ok else "STREAM_ERROR"), retain=True)
         new_status = 'DOWN (Frozen)' if is_frozen else ('UP' if stream_ok else 'DOWN (Stream Error)')
         
-    conn = get_db()
-    curr_row = conn.execute("SELECT status FROM cameras WHERE id = ?", (cam_id,)).fetchone()
-    curr_status = curr_row['status'] if curr_row else cam['status']
-    
-    if curr_status != new_status:
-        with conn:
-            if new_status != 'UNKNOWN':
-                conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (check_time, 'Camera', cam_name, new_status))
-            conn.execute("UPDATE cameras SET status = ? WHERE id = ?", (new_status, cam_id))
+    with closing(get_db()) as conn:
+        curr_row = conn.execute("SELECT status FROM cameras WHERE id = ?", (cam_id,)).fetchone()
+        curr_status = curr_row['status'] if curr_row else cam['status']
         
-        socketio.emit('state_change', {
-            'type': 'cameras', 'id': cam_id, 'name': cam_name,
-            'status': new_status, 'device_type': 'Camera', 'timestamp': check_time
-        })
-        
-        if 'DOWN' in new_status or 'ERR' in new_status:
-            if not mqtt_client or not mqtt_client.is_connected():
-                send_failover_email(f"FAILOVER ALERT: {cam_name} is {new_status}", f"The Camera '{cam_name}' transitioned to a critical state ({new_status}).\n\nThis alert was routed via SMTP because the primary MQTT connection to Zabbix is currently offline.")
-    conn.close()
+        if curr_status != new_status:
+            with conn:
+                if new_status != 'UNKNOWN':
+                    conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (check_time, 'Camera', cam_name, new_status))
+                conn.execute("UPDATE cameras SET status = ? WHERE id = ?", (new_status, cam_id))
+            
+            socketio.emit('state_change', {
+                'type': 'cameras', 'id': cam_id, 'name': cam_name,
+                'status': new_status, 'device_type': 'Camera', 'timestamp': check_time
+            })
+            
+            if 'DOWN' in new_status or 'ERR' in new_status:
+                if not mqtt_client or not mqtt_client.is_connected():
+                    send_failover_email(f"FAILOVER ALERT: {cam_name} is {new_status}", f"The Camera '{cam_name}' transitioned to a critical state ({new_status}).\n\nThis alert was routed via SMTP because the primary MQTT connection to Zabbix is currently offline.")
 
 def send_failover_email(subject, body):
-    conn = get_db()
-    settings = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
-    conn.close()
+    with closing(get_db()) as conn:
+        settings = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
+        
     if not settings.get('smtp_host') or not settings.get('smtp_target'): return 
+    
     def _send(stgs):
         try:
             msg = EmailMessage()
@@ -649,9 +674,9 @@ def automated_speedtest_loop():
     while True:
         eventlet.sleep(60)
         try:
-            conn = get_db()
-            settings_dict = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
-            conn.close()
+            with closing(get_db()) as conn:
+                settings_dict = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
+            
             st_interval = float(settings_dict.get('st_interval', 0))
             if st_interval > 0 and (time.time() - last_run) >= (st_interval * 3600):
                 last_run = time.time()
@@ -674,33 +699,37 @@ def automated_speedtest_loop():
                         ping = round(data['ping']['latency'], 1)
                         server_string = f"{data.get('server', {}).get('name', 'Unknown')} ({data.get('server', {}).get('location', 'Unknown')})"
                         now = time.time()
+                        
                         if mqtt_client and mqtt_client.is_connected():
                             try:
                                 mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_download", str(download), retain=True)
                                 mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_upload", str(upload), retain=True)
                                 mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_ping", str(ping), retain=True)
                             except Exception: pass
-                        conn = get_db()
-                        log_status = f"DL: {download} Mbps | UL: {upload} Mbps | Ping: {ping} ms"
-                        conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Auto-Speedtest', log_status))
-                        st_alert_dl = float(settings_dict.get('st_alert_dl', 0))
-                        st_alert_ul = float(settings_dict.get('st_alert_ul', 0))
-                        st_alert_ping = float(settings_dict.get('st_alert_ping', 0))
-                        alerts = []
-                        if st_alert_dl > 0 and download < st_alert_dl: alerts.append(f"DL {download} < {st_alert_dl} Mbps")
-                        if st_alert_ul > 0 and upload < st_alert_ul: alerts.append(f"UL {upload} < {st_alert_ul} Mbps")
-                        if st_alert_ping > 0 and ping > st_alert_ping: alerts.append(f"Ping {ping} > {st_alert_ping} ms")
-                        if alerts:
-                            alert_text = "WARNING: " + " | ".join(alerts)
-                            conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Speedtest Alert', alert_text))
-                            if mqtt_client and mqtt_client.is_connected(): mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_alert", alert_text, retain=True)
-                            else: send_failover_email("WAN Auto-Speedtest Alert", f"The automated gateway speed test breached configured thresholds:\n\n{alert_text}\n\nTarget Server: {server_string}")
-                        else:
-                            if mqtt_client and mqtt_client.is_connected(): mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_alert", "OK", retain=True)
-                        st_data = json.dumps({'download': download, 'upload': upload, 'ping': ping, 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
-                        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('latest_speedtest', ?)", (st_data,))
-                        conn.commit()
-                        conn.close()
+                            
+                        with closing(get_db()) as conn:
+                            log_status = f"DL: {download} Mbps | UL: {upload} Mbps | Ping: {ping} ms"
+                            conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Auto-Speedtest', log_status))
+                            st_alert_dl = float(settings_dict.get('st_alert_dl', 0))
+                            st_alert_ul = float(settings_dict.get('st_alert_ul', 0))
+                            st_alert_ping = float(settings_dict.get('st_alert_ping', 0))
+                            alerts = []
+                            if st_alert_dl > 0 and download < st_alert_dl: alerts.append(f"DL {download} < {st_alert_dl} Mbps")
+                            if st_alert_ul > 0 and upload < st_alert_ul: alerts.append(f"UL {upload} < {st_alert_ul} Mbps")
+                            if st_alert_ping > 0 and ping > st_alert_ping: alerts.append(f"Ping {ping} > {st_alert_ping} ms")
+                            
+                            if alerts:
+                                alert_text = "WARNING: " + " | ".join(alerts)
+                                conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Speedtest Alert', alert_text))
+                                if mqtt_client and mqtt_client.is_connected(): mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_alert", alert_text, retain=True)
+                                else: send_failover_email("WAN Auto-Speedtest Alert", f"The automated gateway speed test breached configured thresholds:\n\n{alert_text}\n\nTarget Server: {server_string}")
+                            else:
+                                if mqtt_client and mqtt_client.is_connected(): mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_alert", "OK", retain=True)
+                                
+                            st_data = json.dumps({'download': download, 'upload': upload, 'ping': ping, 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
+                            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('latest_speedtest', ?)", (st_data,))
+                            conn.commit()
+                            
                         force_disk_sync()
                         socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
         except Exception as e: print(f"Automated speedtest loop error: {e}")
@@ -714,103 +743,83 @@ def is_local_ip(ip):
         
 def monitor_loop():
     global force_check_event, mqtt_client, mqtt_prefix_global
-    
-    # 1. Initialize MQTT Broker once, outside the loop
-    # (Existing MQTT initialization code goes here if it isn't in your startup block)
 
     while True:
         now = time.time()
-        # Open connection for this batch iteration
-        conn = sqlite3.connect(DB_PATH_RAM)
-        conn.row_factory = sqlite3.Row
+        # Using context manager for safe DB closure inside loops
+        with closing(sqlite3.connect(DB_PATH_RAM, timeout=10)) as conn:
+            conn.row_factory = sqlite3.Row
+            
+            try:
+                settings = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
+                interval = int(settings.get('check_interval', 60))
+                
+                switches = [dict(r) for r in conn.execute("SELECT * FROM switches").fetchall()]
+                nvrs = [dict(r) for r in conn.execute("SELECT * FROM nvrs").fetchall()]
+                cameras = [dict(r) for r in conn.execute("SELECT * FROM cameras").fetchall()]
+                
+                pending_db_updates = []
+                pending_mac_updates = []
+
+                # --- 1. Process Switches ---
+                for switch in switches:
+                    timeout = 1.5 if is_local_ip(switch['ip']) else 3.0
+                    is_up = is_pingable(switch['ip'], timeout=timeout) or is_port_open(switch['ip'], 80, timeout=timeout)
         
-        try:
-            # Refresh dynamic settings
-            settings = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
-            interval = int(settings.get('check_interval', 60))
-            
-            # Fetch full fleet state (Cached into memory for the duration of this loop)
-            switches = [dict(r) for r in conn.execute("SELECT * FROM switches").fetchall()]
-            nvrs = [dict(r) for r in conn.execute("SELECT * FROM nvrs").fetchall()]
-            cameras = [dict(r) for r in conn.execute("SELECT * FROM cameras").fetchall()]
-            
-            pending_db_updates = []
-            pending_mac_updates = []
-
-            # --- 1. Process Switches (Fast L3) ---
-            for switch in switches:
-                # 1. Connectivity Check (Increase timeout for external IPs)
-                timeout = 1.5 if is_local_ip(switch['ip']) else 3.0
-                is_up = is_pingable(switch['ip'], timeout=timeout) or is_port_open(switch['ip'], 80, timeout=timeout)
-    
-                # 2. Logic: Only fetch MAC if it's a private, local IP
-                mac = switch.get('mac_address') or ''
-                if is_up and not mac and is_local_ip(switch['ip']):
-                    fetched_mac = get_mac_address(switch['ip'])
-                    if fetched_mac: 
-                        pending_mac_updates.append(('switches', fetched_mac.upper(), switch['id']))
-    
-                # 3. Status Construction & State Sync
-                new_status = 'UP' if is_up else 'DOWN'
-                if switch.get('silenced_until', 0) > now: new_status += " (Silenced)"
-                
-                if switch['status'] != new_status:
-                    pending_db_updates.append((now, 'Switch', switch['name'], new_status, 'switches', switch['id']))
-                
-                if mqtt_client and mqtt_client.is_connected():
-                    mqtt_client.publish(f"{mqtt_prefix_global}/{switch['name']}/ping", new_status, retain=True)
-
-            # --- 2. Process NVRs (Fast L3 - LAN ONLY) ---
-            for nvr in nvrs:
-                # Fixed 1.5s timeout for local networks
-                is_up = is_pingable(nvr['ip'], timeout=1.5) or is_port_open(nvr['ip'], 80, timeout=1.5)
-                new_status = 'UP' if is_up else 'DOWN'
-                if nvr.get('silenced_until', 0) > now: new_status += " (Silenced)"
-                
-                if nvr['status'] != new_status:
-                    pending_db_updates.append((now, 'NVR', nvr['name'], new_status, 'nvrs', nvr['id']))
-                
-                if mqtt_client and mqtt_client.is_connected():
-                    mqtt_client.publish(f"{mqtt_prefix_global}/{nvr['name']}/ping", new_status, retain=True)
-
-            # --- 3. Process Cameras (L3 + L7 Queue - LAN ONLY) ---
-            for cam in cameras:
-                # Fixed 1.5s timeout for local networks. 
-                # Keep TCP fallbacks (554/80) in case a local VLAN firewall drops ICMP.
-                cam_up = is_pingable(cam['ip'], timeout=1.5) or is_port_open(cam['ip'], 554, timeout=1.5) or is_port_open(cam['ip'], 80, timeout=1.5)
-                
-                if cam_up:
-                    # Producer: Queue the heavy L7 task for the worker pool
-                    L7_QUEUE.put((cam, cam.get('silenced_until', 0) > now, previous_hashes.get(cam['id']), now))
-                    new_status = 'UP'
-                else:
-                    new_status = 'DOWN (Offline)'
-                    if cam.get('silenced_until', 0) > now: new_status = 'DOWN (Silenced)'
-
-                if cam['status'] != new_status:
-                    pending_db_updates.append((now, 'Camera', cam['name'], new_status, 'cameras', cam['id']))
-
-            # --- 4. Atomic Batch Database Write ---
-            if pending_db_updates or pending_mac_updates:
-                with conn:
-                    # 1. Process Status Changes & Event Logs
-                    for (t_stamp, dev_type, item_name, new_status, table, item_id) in pending_db_updates:
-                        conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", 
-                                     (t_stamp, dev_type, item_name, new_status))
-                        conn.execute(f"UPDATE {table} SET status = ? WHERE id = ?", (new_status, item_id))
+                    mac = switch.get('mac_address') or ''
+                    if is_up and not mac and is_local_ip(switch['ip']):
+                        fetched_mac = get_mac_address(switch['ip'])
+                        if fetched_mac: 
+                            pending_mac_updates.append(('switches', fetched_mac.upper(), switch['id']))
+        
+                    new_status = 'UP' if is_up else 'DOWN'
+                    if switch.get('silenced_until', 0) > now: new_status += " (Silenced)"
                     
-                    # 2. Process newly discovered L2 MAC Addresses
-                    for (table, mac, item_id) in pending_mac_updates:
-                        conn.execute(f"UPDATE {table} SET mac_address = ? WHERE id = ?", (mac, item_id))
+                    if switch['status'] != new_status:
+                        pending_db_updates.append((now, 'Switch', switch['name'], new_status, 'switches', switch['id']))
                     
-                    # 3. Stream real-time status changes to Vue UI via Socket.IO
-                    for update in pending_db_updates:
-                        socketio.emit('state_change', {'type': update[4], 'id': update[5], 'status': update[3]})
+                    if mqtt_client and mqtt_client.is_connected():
+                        mqtt_client.publish(f"{mqtt_prefix_global}/{switch['name']}/ping", new_status, retain=True)
 
-        except Exception as e:
-            print(f"Monitor loop iteration failed: {e}")
-        finally:
-            conn.close()
+                # --- 2. Process NVRs ---
+                for nvr in nvrs:
+                    is_up = is_pingable(nvr['ip'], timeout=1.5) or is_port_open(nvr['ip'], 80, timeout=1.5)
+                    new_status = 'UP' if is_up else 'DOWN'
+                    if nvr.get('silenced_until', 0) > now: new_status += " (Silenced)"
+                    
+                    if nvr['status'] != new_status:
+                        pending_db_updates.append((now, 'NVR', nvr['name'], new_status, 'nvrs', nvr['id']))
+                    
+                    if mqtt_client and mqtt_client.is_connected():
+                        mqtt_client.publish(f"{mqtt_prefix_global}/{nvr['name']}/ping", new_status, retain=True)
+
+                # --- 3. Process Cameras ---
+                for cam in cameras:
+                    cam_up = is_pingable(cam['ip'], timeout=1.5) or is_port_open(cam['ip'], 554, timeout=1.5) or is_port_open(cam['ip'], 80, timeout=1.5)
+                    if cam_up:
+                        L7_QUEUE.put((cam, cam.get('silenced_until', 0) > now, previous_hashes.get(cam['id']), now))
+                        new_status = 'UP'
+                    else:
+                        new_status = 'DOWN (Offline)'
+                        if cam.get('silenced_until', 0) > now: new_status = 'DOWN (Silenced)'
+
+                    if cam['status'] != new_status:
+                        pending_db_updates.append((now, 'Camera', cam['name'], new_status, 'cameras', cam['id']))
+
+                # --- 4. Atomic Batch Database Write ---
+                if pending_db_updates or pending_mac_updates:
+                    with conn:
+                        for (t_stamp, dev_type, item_name, new_status, table, item_id) in pending_db_updates:
+                            conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", 
+                                         (t_stamp, dev_type, item_name, new_status))
+                            conn.execute(f"UPDATE {table} SET status = ? WHERE id = ?", (new_status, item_id))
+                        for (table, mac, item_id) in pending_mac_updates:
+                            conn.execute(f"UPDATE {table} SET mac_address = ? WHERE id = ?", (mac, item_id))
+                        for update in pending_db_updates:
+                            socketio.emit('state_change', {'type': update[4], 'id': update[5], 'status': update[3]})
+
+            except Exception as e:
+                print(f"Monitor loop iteration failed: {e}")
 
         # Throttling
         try:
@@ -825,9 +834,9 @@ MEDIAMTX_API = "http://127.0.0.1:9997/v3/config/paths"
 
 def sync_mediamtx_cameras():
     try:
-        conn = get_db()
-        cameras = conn.execute("SELECT id, stream_url, username, password FROM cameras").fetchall()
-        conn.close()
+        with closing(get_db()) as conn:
+            cameras = conn.execute("SELECT id, stream_url, username, password FROM cameras").fetchall()
+            
         resp = requests.get(MEDIAMTX_API, timeout=3)
         current_paths = resp.json().get('items', {}) if resp.status_code == 200 else {}
         configured_cam_ids = set()
@@ -899,14 +908,14 @@ def probe_onvif_camera(ip, user, pwd):
 @login_required
 @admin_required
 def export_config():
-    conn = get_db()
     devices = []
-    for table in ['switches', 'nvrs', 'cameras']:
-        for row in conn.execute(f"SELECT *, '{table}' as dev_type FROM {table}").fetchall():
-            d = dict(row)
-            d.pop('status', None)
-            devices.append(d)
-    conn.close()
+    with closing(get_db()) as conn:
+        for table in ['switches', 'nvrs', 'cameras']:
+            for row in conn.execute(f"SELECT *, '{table}' as dev_type FROM {table}").fetchall():
+                d = dict(row)
+                d.pop('status', None)
+                devices.append(d)
+                
     si = io.StringIO()
     cw = csv.DictWriter(si, fieldnames=['dev_type', 'id', 'name', 'ip', 'switch_id', 'stream_url', 'manufacturer', 'username', 'password', 'silenced_until', 'mac_address'])
     cw.writeheader()
@@ -925,11 +934,12 @@ def import_analyze():
         imported_devices = [row for row in reader]
         if not imported_devices:
             return jsonify({'success': False, 'message': 'CSV appears empty or malformed.'}), 400
-        conn = get_db()
-        existing_switches = {row['id']: dict(row) for row in conn.execute("SELECT * FROM switches").fetchall()}
-        existing_nvrs = {row['id']: dict(row) for row in conn.execute("SELECT * FROM nvrs").fetchall()}
-        existing_cameras = {row['id']: dict(row) for row in conn.execute("SELECT * FROM cameras").fetchall()}
-        conn.close()
+            
+        with closing(get_db()) as conn:
+            existing_switches = {row['id']: dict(row) for row in conn.execute("SELECT * FROM switches").fetchall()}
+            existing_nvrs = {row['id']: dict(row) for row in conn.execute("SELECT * FROM nvrs").fetchall()}
+            existing_cameras = {row['id']: dict(row) for row in conn.execute("SELECT * FROM cameras").fetchall()}
+            
         analysis = {'conflicts': [], 'clean_inserts': []}
         for row in imported_devices:
             dev_type = row.get('dev_type')
@@ -962,56 +972,55 @@ def import_apply():
     payload = request.get_json()
     resolved_conflicts = payload.get('resolved_conflicts', [])
     clean_inserts = payload.get('clean_inserts', [])
-    conn = get_db()
+    
     try:
-        with conn:
-            def cast_device(dev):
-                return {
-                    "id": int(dev['id']),
-                    "name": dev['name'],
-                    "ip": dev['ip'],
-                    "switch_id": int(dev['switch_id']) if dev.get('switch_id') else None,
-                    "stream_url": dev.get('stream_url', ''),
-                    "manufacturer": dev.get('manufacturer', 'Other'),
-                    "username": dev.get('username', ''),
-                    "password": dev.get('password', ''),
-                    "silenced_until": float(dev.get('silenced_until', 0)) if dev.get('silenced_until') else 0,
-                    "mac_address": dev.get('mac_address', '')
-                }
-            for item in clean_inserts:
-                dev = cast_device(item['data'])
-                if item['type'] == 'switch':
-                    conn.execute("INSERT INTO switches (id, name, ip, silenced_until, mac_address) VALUES (?, ?, ?, ?, ?)", 
-                                 (dev['id'], dev['name'], dev['ip'], dev['silenced_until'], dev['mac_address']))
-                elif item['type'] == 'nvr':
-                    conn.execute("INSERT INTO nvrs (id, name, ip, silenced_until, mac_address) VALUES (?, ?, ?, ?, ?)", 
-                                 (dev['id'], dev['name'], dev['ip'], dev['silenced_until'], dev['mac_address']))
-                elif item['type'] == 'camera':
-                    pwd = encrypt_pwd(dev['password']) if dev['password'] else ''
-                    conn.execute("INSERT INTO cameras (id, switch_id, name, ip, stream_url, manufacturer, username, password, silenced_until, mac_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
-                                 (dev['id'], dev['switch_id'], dev['name'], dev['ip'], dev['stream_url'], dev['manufacturer'], dev['username'], pwd, dev['silenced_until'], dev['mac_address']))
-            for item in resolved_conflicts:
-                dev = cast_device(item['data'])
-                if item['type'] == 'switch':
-                    conn.execute("UPDATE switches SET name=?, ip=?, silenced_until=?, mac_address=? WHERE id=?", 
-                                 (dev['name'], dev['ip'], dev['silenced_until'], dev['mac_address'], dev['id']))
-                elif item['type'] == 'nvr':
-                    conn.execute("UPDATE nvrs SET name=?, ip=?, silenced_until=?, mac_address=? WHERE id=?", 
-                                 (dev['name'], dev['ip'], dev['silenced_until'], dev['mac_address'], dev['id']))
-                elif item['type'] == 'camera':
-                    pwd = encrypt_pwd(dev['password']) if dev['password'] else ''
-                    if pwd:
-                        conn.execute("UPDATE cameras SET switch_id=?, name=?, ip=?, stream_url=?, manufacturer=?, username=?, password=?, silenced_until=?, mac_address=? WHERE id=?", 
-                                     (dev['switch_id'], dev['name'], dev['ip'], dev['stream_url'], dev['manufacturer'], dev['username'], pwd, dev['silenced_until'], dev['mac_address'], dev['id']))
-                    else:
-                        conn.execute("UPDATE cameras SET switch_id=?, name=?, ip=?, stream_url=?, manufacturer=?, username=?, silenced_until=?, mac_address=? WHERE id=?", 
-                                     (dev['switch_id'], dev['name'], dev['ip'], dev['stream_url'], dev['manufacturer'], dev['username'], dev['silenced_until'], dev['mac_address'], dev['id']))
+        with closing(get_db()) as conn:
+            with conn:
+                def cast_device(dev):
+                    return {
+                        "id": int(dev['id']),
+                        "name": dev['name'],
+                        "ip": dev['ip'],
+                        "switch_id": int(dev['switch_id']) if dev.get('switch_id') else None,
+                        "stream_url": dev.get('stream_url', ''),
+                        "manufacturer": dev.get('manufacturer', 'Other'),
+                        "username": dev.get('username', ''),
+                        "password": dev.get('password', ''),
+                        "silenced_until": float(dev.get('silenced_until', 0)) if dev.get('silenced_until') else 0,
+                        "mac_address": dev.get('mac_address', '')
+                    }
+                for item in clean_inserts:
+                    dev = cast_device(item['data'])
+                    if item['type'] == 'switch':
+                        conn.execute("INSERT INTO switches (id, name, ip, silenced_until, mac_address) VALUES (?, ?, ?, ?, ?)", 
+                                     (dev['id'], dev['name'], dev['ip'], dev['silenced_until'], dev['mac_address']))
+                    elif item['type'] == 'nvr':
+                        conn.execute("INSERT INTO nvrs (id, name, ip, silenced_until, mac_address) VALUES (?, ?, ?, ?, ?)", 
+                                     (dev['id'], dev['name'], dev['ip'], dev['silenced_until'], dev['mac_address']))
+                    elif item['type'] == 'camera':
+                        pwd = encrypt_pwd(dev['password']) if dev['password'] else ''
+                        conn.execute("INSERT INTO cameras (id, switch_id, name, ip, stream_url, manufacturer, username, password, silenced_until, mac_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
+                                     (dev['id'], dev['switch_id'], dev['name'], dev['ip'], dev['stream_url'], dev['manufacturer'], dev['username'], pwd, dev['silenced_until'], dev['mac_address']))
+                for item in resolved_conflicts:
+                    dev = cast_device(item['data'])
+                    if item['type'] == 'switch':
+                        conn.execute("UPDATE switches SET name=?, ip=?, silenced_until=?, mac_address=? WHERE id=?", 
+                                     (dev['name'], dev['ip'], dev['silenced_until'], dev['mac_address'], dev['id']))
+                    elif item['type'] == 'nvr':
+                        conn.execute("UPDATE nvrs SET name=?, ip=?, silenced_until=?, mac_address=? WHERE id=?", 
+                                     (dev['name'], dev['ip'], dev['silenced_until'], dev['mac_address'], dev['id']))
+                    elif item['type'] == 'camera':
+                        pwd = encrypt_pwd(dev['password']) if dev['password'] else ''
+                        if pwd:
+                            conn.execute("UPDATE cameras SET switch_id=?, name=?, ip=?, stream_url=?, manufacturer=?, username=?, password=?, silenced_until=?, mac_address=? WHERE id=?", 
+                                         (dev['switch_id'], dev['name'], dev['ip'], dev['stream_url'], dev['manufacturer'], dev['username'], pwd, dev['silenced_until'], dev['mac_address'], dev['id']))
+                        else:
+                            conn.execute("UPDATE cameras SET switch_id=?, name=?, ip=?, stream_url=?, manufacturer=?, username=?, silenced_until=?, mac_address=? WHERE id=?", 
+                                         (dev['switch_id'], dev['name'], dev['ip'], dev['stream_url'], dev['manufacturer'], dev['username'], dev['silenced_until'], dev['mac_address'], dev['id']))
         force_disk_sync()
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'message': f"Merge failed: {str(e)}"}), 500
-    finally:
-        conn.close()
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
@@ -1043,9 +1052,10 @@ def api_login():
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
-    conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-    conn.close()
+    
+    with closing(get_db()) as conn:
+        user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        
     if user and check_password_hash(user['password'], password):
         login_user(User(user['id'], user['username'], user['role']))
         log_audit('System', username, 'User Logged In (Local API)')
@@ -1090,16 +1100,17 @@ def auth_callback(provider):
         elif 'cctv-operator' in roles: role = 'operator'
     elif provider == 'google' and username and username.endswith('@yourcompany.com'):
         role = 'operator' 
-    conn = get_db()
-    db_user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-    if not db_user:
-        cursor = conn.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", (username, f'SSO_{provider.upper()}', role))
-        user_id = cursor.lastrowid
-    else:
-        user_id = db_user['id']
-        conn.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
-    conn.commit()
-    conn.close()
+        
+    with closing(get_db()) as conn:
+        db_user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        if not db_user:
+            cursor = conn.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", (username, f'SSO_{provider.upper()}', role))
+            user_id = cursor.lastrowid
+        else:
+            user_id = db_user['id']
+            conn.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
+        conn.commit()
+        
     force_disk_sync()
     login_user(User(user_id, username, role))
     log_audit('System', username, f'User Logged In ({provider.capitalize()} SSO)')
@@ -1117,17 +1128,17 @@ def api_logout():
 @login_required
 def api_system_init():
     now = time.time()
-    conn = get_db()
-    switches = conn.execute("SELECT *, (IFNULL(silenced_until, 0) > ?) as is_silenced FROM switches", (now,)).fetchall()
-    nvrs = conn.execute("SELECT *, (IFNULL(silenced_until, 0) > ?) as is_silenced FROM nvrs", (now,)).fetchall()
-    cameras = conn.execute("""
-        SELECT c.*, s.name as switch_name, 
-               ((IFNULL(c.silenced_until, 0) > ?) OR (IFNULL(s.silenced_until, 0) > ?)) as is_silenced 
-        FROM cameras c LEFT JOIN switches s ON c.switch_id = s.id
-    """, (now, now)).fetchall()
-    settings_dict = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
-    users = conn.execute("SELECT id, username, role FROM users").fetchall()
-    conn.close()
+    with closing(get_db()) as conn:
+        switches = conn.execute("SELECT *, (IFNULL(silenced_until, 0) > ?) as is_silenced FROM switches", (now,)).fetchall()
+        nvrs = conn.execute("SELECT *, (IFNULL(silenced_until, 0) > ?) as is_silenced FROM nvrs", (now,)).fetchall()
+        cameras = conn.execute("""
+            SELECT c.*, s.name as switch_name, 
+                   ((IFNULL(c.silenced_until, 0) > ?) OR (IFNULL(s.silenced_until, 0) > ?)) as is_silenced 
+            FROM cameras c LEFT JOIN switches s ON c.switch_id = s.id
+        """, (now, now)).fetchall()
+        settings_dict = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
+        users = conn.execute("SELECT id, username, role FROM users").fetchall()
+        
     latest_speedtest = None
     if 'latest_speedtest' in settings_dict:
         try: latest_speedtest = json.loads(settings_dict['latest_speedtest'])
@@ -1157,41 +1168,39 @@ def api_system_init():
 def add_switch():
     data = request.get_json()
     name = data.get('name')
-    conn = get_db()
     try:
-        conn.execute("INSERT INTO switches (name, ip) VALUES (?, ?)", (name, data.get('ip')))
-        conn.commit()
+        with closing(get_db()) as conn:
+            conn.execute("INSERT INTO switches (name, ip) VALUES (?, ?)", (name, data.get('ip')))
+            conn.commit()
         log_audit('User', current_user.username, f'Added new switch: {name}')
         force_disk_sync()
         trigger_monitor_check()
         return jsonify({'success': True, 'message': 'Switch added.'})
     except sqlite3.IntegrityError: return jsonify({'success': False, 'message': 'Switch name already exists.'}), 400
-    finally: conn.close()
 
 @app.route('/api/v1/switches/<int:id>', methods=['PUT', 'DELETE'])
 @login_required
 @admin_required
 def edit_delete_switch(id):
-    conn = get_db()
     if request.method == 'PUT':
         data = request.get_json()
         name = data.get('name')
         try:
-            conn.execute("UPDATE switches SET name = ?, ip = ? WHERE id = ?", (name, data.get('ip'), id))
-            conn.commit()
+            with closing(get_db()) as conn:
+                conn.execute("UPDATE switches SET name = ?, ip = ? WHERE id = ?", (name, data.get('ip'), id))
+                conn.commit()
             log_audit('User', current_user.username, f'Edited switch config: {name}')
             force_disk_sync()
             trigger_monitor_check()
             return jsonify({'success': True, 'message': 'Switch updated.'})
         except sqlite3.IntegrityError: return jsonify({'success': False, 'message': 'Name exists.'}), 400
-        finally: conn.close()
     elif request.method == 'DELETE':
-        row = conn.execute("SELECT name FROM switches WHERE id = ?", (id,)).fetchone()
-        name = row['name'] if row else "Unknown"
-        conn.execute("DELETE FROM cameras WHERE switch_id = ?", (id,))
-        conn.execute("DELETE FROM switches WHERE id = ?", (id,))
-        conn.commit()
-        conn.close()
+        with closing(get_db()) as conn:
+            row = conn.execute("SELECT name FROM switches WHERE id = ?", (id,)).fetchone()
+            name = row['name'] if row else "Unknown"
+            conn.execute("DELETE FROM cameras WHERE switch_id = ?", (id,))
+            conn.execute("DELETE FROM switches WHERE id = ?", (id,))
+            conn.commit()
         log_audit('User', current_user.username, f'Deleted switch: {name}')
         force_disk_sync()
         trigger_monitor_check()
@@ -1206,22 +1215,20 @@ def add_nvr():
         return jsonify({'success': False, 'message': 'NVRs must use local LAN IP addresses.'}), 400
         
     name = data.get('name')
-    conn = get_db()
     try:
-        conn.execute("INSERT INTO nvrs (name, ip) VALUES (?, ?)", (name, data.get('ip')))
-        conn.commit()
+        with closing(get_db()) as conn:
+            conn.execute("INSERT INTO nvrs (name, ip) VALUES (?, ?)", (name, data.get('ip')))
+            conn.commit()
         log_audit('User', current_user.username, f'Added new NVR: {name}')
         force_disk_sync()
         trigger_monitor_check()
         return jsonify({'success': True, 'message': 'NVR added.'})
     except sqlite3.IntegrityError: return jsonify({'success': False, 'message': 'NVR name already exists.'}), 400
-    finally: conn.close()
 
 @app.route('/api/v1/nvrs/<int:id>', methods=['PUT', 'DELETE'])
 @login_required
 @admin_required
 def edit_delete_nvr(id):
-    conn = get_db()
     if request.method == 'PUT':
         data = request.get_json()
         if not is_local_ip(data.get('ip')):
@@ -1229,20 +1236,20 @@ def edit_delete_nvr(id):
             
         name = data.get('name')
         try:
-            conn.execute("UPDATE nvrs SET name = ?, ip = ? WHERE id = ?", (name, data.get('ip'), id))
-            conn.commit()
+            with closing(get_db()) as conn:
+                conn.execute("UPDATE nvrs SET name = ?, ip = ? WHERE id = ?", (name, data.get('ip'), id))
+                conn.commit()
             log_audit('User', current_user.username, f'Edited NVR config: {name}')
             force_disk_sync()
             trigger_monitor_check()
             return jsonify({'success': True, 'message': 'NVR updated.'})
         except sqlite3.IntegrityError: return jsonify({'success': False, 'message': 'Name exists.'}), 400
-        finally: conn.close()
     elif request.method == 'DELETE':
-        row = conn.execute("SELECT name FROM nvrs WHERE id = ?", (id,)).fetchone()
-        name = row['name'] if row else "Unknown"
-        conn.execute("DELETE FROM nvrs WHERE id = ?", (id,))
-        conn.commit()
-        conn.close()
+        with closing(get_db()) as conn:
+            row = conn.execute("SELECT name FROM nvrs WHERE id = ?", (id,)).fetchone()
+            name = row['name'] if row else "Unknown"
+            conn.execute("DELETE FROM nvrs WHERE id = ?", (id,))
+            conn.commit()
         log_audit('User', current_user.username, f'Deleted NVR: {name}')
         force_disk_sync()
         trigger_monitor_check()
@@ -1258,24 +1265,22 @@ def add_camera():
         
     switch_id = data.get('switch_id') or None
     name = data.get('name')
-    conn = get_db()
     try:
-        conn.execute("""INSERT INTO cameras (switch_id, name, ip, stream_url, manufacturer, username, password) VALUES (?, ?, ?, ?, ?, ?, ?)""", 
-                     (switch_id, name, data.get('ip'), data.get('stream_url'), data.get('manufacturer', 'Other'), data.get('username', ''), encrypt_pwd(data.get('password', ''))))
-        conn.commit()
+        with closing(get_db()) as conn:
+            conn.execute("""INSERT INTO cameras (switch_id, name, ip, stream_url, manufacturer, username, password) VALUES (?, ?, ?, ?, ?, ?, ?)""", 
+                         (switch_id, name, data.get('ip'), data.get('stream_url'), data.get('manufacturer', 'Other'), data.get('username', ''), encrypt_pwd(data.get('password', ''))))
+            conn.commit()
         eventlet.spawn_n(sync_mediamtx_cameras)
         log_audit('User', current_user.username, f'Added new camera: {name}')
         force_disk_sync()
         trigger_monitor_check()
         return jsonify({'success': True, 'message': 'Camera added.'})
     except sqlite3.IntegrityError: return jsonify({'success': False, 'message': 'Camera name already exists.'}), 400
-    finally: conn.close()
 
 @app.route('/api/v1/cameras/<int:id>', methods=['PUT', 'DELETE'])
 @login_required
 @admin_required
 def edit_delete_camera(id):
-    conn = get_db()
     if request.method == 'PUT':
         data = request.get_json()
         if not is_local_ip(data.get('ip')):
@@ -1284,27 +1289,27 @@ def edit_delete_camera(id):
         switch_id = data.get('switch_id') or None 
         name = data.get('name')
         try:
-            pwd_update = data.get('password', '').strip()
-            if pwd_update:
-                conn.execute("""UPDATE cameras SET switch_id = ?, name = ?, ip = ?, stream_url = ?, manufacturer = ?, username = ?, password = ? WHERE id = ?""", 
-                             (switch_id, name, data.get('ip'), data.get('stream_url'), data.get('manufacturer', 'Other'), data.get('username', ''), encrypt_pwd(pwd_update), id))
-            else:
-                conn.execute("""UPDATE cameras SET switch_id = ?, name = ?, ip = ?, stream_url = ?, manufacturer = ?, username = ? WHERE id = ?""", 
-                             (switch_id, name, data.get('ip'), data.get('stream_url'), data.get('manufacturer', 'Other'), data.get('username', ''), id))
-            conn.commit()
+            with closing(get_db()) as conn:
+                pwd_update = data.get('password', '').strip()
+                if pwd_update:
+                    conn.execute("""UPDATE cameras SET switch_id = ?, name = ?, ip = ?, stream_url = ?, manufacturer = ?, username = ?, password = ? WHERE id = ?""", 
+                                 (switch_id, name, data.get('ip'), data.get('stream_url'), data.get('manufacturer', 'Other'), data.get('username', ''), encrypt_pwd(pwd_update), id))
+                else:
+                    conn.execute("""UPDATE cameras SET switch_id = ?, name = ?, ip = ?, stream_url = ?, manufacturer = ?, username = ? WHERE id = ?""", 
+                                 (switch_id, name, data.get('ip'), data.get('stream_url'), data.get('manufacturer', 'Other'), data.get('username', ''), id))
+                conn.commit()
             eventlet.spawn_n(sync_mediamtx_cameras)
             log_audit('User', current_user.username, f'Edited camera config: {name}')
             force_disk_sync()
             trigger_monitor_check()
             return jsonify({'success': True, 'message': 'Camera updated.'})
         except sqlite3.IntegrityError: return jsonify({'success': False, 'message': 'Name exists.'}), 400
-        finally: conn.close()
     elif request.method == 'DELETE':
-        row = conn.execute("SELECT name FROM cameras WHERE id = ?", (id,)).fetchone()
-        name = row['name'] if row else "Unknown"
-        conn.execute("DELETE FROM cameras WHERE id = ?", (id,))
-        conn.commit()
-        conn.close()
+        with closing(get_db()) as conn:
+            row = conn.execute("SELECT name FROM cameras WHERE id = ?", (id,)).fetchone()
+            name = row['name'] if row else "Unknown"
+            conn.execute("DELETE FROM cameras WHERE id = ?", (id,))
+            conn.commit()
         eventlet.spawn_n(sync_mediamtx_cameras)
         log_audit('User', current_user.username, f'Deleted camera: {name}')
         force_disk_sync()
@@ -1319,27 +1324,25 @@ def api_add_user():
     username = data.get('username')
     password = generate_password_hash(data.get('password'))
     role = data.get('role')
-    conn = get_db()
     try:
-        conn.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", (username, password, role))
-        conn.commit()
+        with closing(get_db()) as conn:
+            conn.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", (username, password, role))
+            conn.commit()
         log_audit('User', current_user.username, f'Provisioned new account for: {username}')
         force_disk_sync()
         return jsonify({'success': True, 'message': 'User added.'})
     except sqlite3.IntegrityError: return jsonify({'success': False, 'message': 'Username exists.'}), 400
-    finally: conn.close()
 
 @app.route('/api/v1/users/<int:id>', methods=['DELETE'])
 @login_required
 @admin_required
 def api_delete_user(id):
     if id == current_user.id: return jsonify({'success': False, 'message': 'Cannot delete yourself.'}), 400
-    conn = get_db()
-    row = conn.execute("SELECT username FROM users WHERE id = ?", (id,)).fetchone()
-    uname = row['username'] if row else "Unknown"
-    conn.execute("DELETE FROM users WHERE id = ?", (id,))
-    conn.commit()
-    conn.close()
+    with closing(get_db()) as conn:
+        row = conn.execute("SELECT username FROM users WHERE id = ?", (id,)).fetchone()
+        uname = row['username'] if row else "Unknown"
+        conn.execute("DELETE FROM users WHERE id = ?", (id,))
+        conn.commit()
     log_audit('User', current_user.username, f'Deleted account: {uname}')
     force_disk_sync()
     return jsonify({'success': True, 'message': 'User deleted.'})
@@ -1349,12 +1352,11 @@ def api_delete_user(id):
 @admin_required
 def api_update_settings():
     data = request.get_json()
-    conn = get_db()
-    for key, val in data.items():
-        if key in ['mqtt_broker', 'mqtt_port', 'mqtt_prefix', 'check_interval', 'inactive_timeout', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass', 'smtp_target', 'st_interval', 'st_alert_dl', 'st_alert_ul', 'st_alert_ping']:
-            conn.execute("UPDATE settings SET value = ? WHERE key = ?", (str(val), key))
-    conn.commit()
-    conn.close()
+    with closing(get_db()) as conn:
+        for key, val in data.items():
+            if key in ['mqtt_broker', 'mqtt_port', 'mqtt_prefix', 'check_interval', 'inactive_timeout', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass', 'smtp_target', 'st_interval', 'st_alert_dl', 'st_alert_ul', 'st_alert_ping']:
+                conn.execute("UPDATE settings SET value = ? WHERE key = ?", (str(val), key))
+        conn.commit()
     log_audit('User', current_user.username, 'Updated Global Gateway Settings') 
     force_disk_sync()
     trigger_monitor_check()
@@ -1369,26 +1371,26 @@ def api_toggle_silence():
     dev_id = data.get('id')
     hours = float(data.get('hours', 0))
     silence_until = time.time() + (hours * 3600) if hours > 0 else 0
-    conn = get_db()
     device_name = "Unknown"
     table_name = ""
-    if device_type == 'switch':
-        table_name = "switches"
-        conn.execute("UPDATE switches SET silenced_until = ? WHERE id = ?", (silence_until, dev_id))
-        row = conn.execute("SELECT name FROM switches WHERE id = ?", (dev_id,)).fetchone()
-        if row: device_name = row['name']
-    elif device_type == 'nvr':
-        table_name = "nvrs"
-        conn.execute("UPDATE nvrs SET silenced_until = ? WHERE id = ?", (silence_until, dev_id))
-        row = conn.execute("SELECT name FROM nvrs WHERE id = ?", (dev_id,)).fetchone()
-        if row: device_name = row['name']
-    elif device_type == 'camera':
-        table_name = "cameras"
-        conn.execute("UPDATE cameras SET silenced_until = ? WHERE id = ?", (silence_until, dev_id))
-        row = conn.execute("SELECT name FROM cameras WHERE id = ?", (dev_id,)).fetchone()
-        if row: device_name = row['name']
-    conn.commit()
-    conn.close()
+    with closing(get_db()) as conn:
+        if device_type == 'switch':
+            table_name = "switches"
+            conn.execute("UPDATE switches SET silenced_until = ? WHERE id = ?", (silence_until, dev_id))
+            row = conn.execute("SELECT name FROM switches WHERE id = ?", (dev_id,)).fetchone()
+            if row: device_name = row['name']
+        elif device_type == 'nvr':
+            table_name = "nvrs"
+            conn.execute("UPDATE nvrs SET silenced_until = ? WHERE id = ?", (silence_until, dev_id))
+            row = conn.execute("SELECT name FROM nvrs WHERE id = ?", (dev_id,)).fetchone()
+            if row: device_name = row['name']
+        elif device_type == 'camera':
+            table_name = "cameras"
+            conn.execute("UPDATE cameras SET silenced_until = ? WHERE id = ?", (silence_until, dev_id))
+            row = conn.execute("SELECT name FROM cameras WHERE id = ?", (dev_id,)).fetchone()
+            if row: device_name = row['name']
+        conn.commit()
+        
     if hours == 0:
         socketio.emit('state_change', {
             'type': table_name, 'id': dev_id, 'name': device_name,
@@ -1443,9 +1445,9 @@ def scan_network():
     pool = eventlet.greenpool.GreenPool(size=100)
     for result in pool.imap(check_rtsp_port, hosts):
         if result: discovered_ips.append(result)
-    conn = get_db()
-    existing_cameras = [row['ip'] for row in conn.execute("SELECT ip FROM cameras").fetchall()]
-    conn.close()
+        
+    with closing(get_db()) as conn:
+        existing_cameras = [row['ip'] for row in conn.execute("SELECT ip FROM cameras").fetchall()]
     new_discoveries = [ip for ip in discovered_ips if ip not in existing_cameras]
     return jsonify({'success': True, 'discovered': new_discoveries, 'total_found': len(discovered_ips), 'already_added': len(discovered_ips) - len(new_discoveries)})
 
@@ -1461,7 +1463,6 @@ def add_cameras_bulk():
     user = data.get('username', '')
     raw_pwd = data.get('password', '')
     pwd = encrypt_pwd(raw_pwd)
-    conn = get_db()
     added_count, errors = 0, []
     def process_camera(ip):
         onvif_data = eventlet.tpool.execute(probe_onvif_camera, ip, user, raw_pwd)
@@ -1478,13 +1479,15 @@ def add_cameras_bulk():
         return (ip, name, stream_url, mfg, mac)
     pool = eventlet.greenpool.GreenPool(size=20)
     results = pool.imap(process_camera, ips)
-    for ip, name, stream_url, mfg, mac in results:
-        try:
-            conn.execute("""INSERT INTO cameras (switch_id, name, ip, stream_url, manufacturer, username, password, mac_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (switch_id, name, ip, stream_url, mfg, user, pwd, mac or ''))
-            added_count += 1
-        except sqlite3.IntegrityError: errors.append(ip)
-    conn.commit()
-    conn.close()
+    
+    with closing(get_db()) as conn:
+        for ip, name, stream_url, mfg, mac in results:
+            try:
+                conn.execute("""INSERT INTO cameras (switch_id, name, ip, stream_url, manufacturer, username, password, mac_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (switch_id, name, ip, stream_url, mfg, user, pwd, mac or ''))
+                added_count += 1
+            except sqlite3.IntegrityError: errors.append(ip)
+        conn.commit()
+        
     eventlet.spawn_n(sync_mediamtx_cameras)
     force_disk_sync()
     trigger_monitor_check()
@@ -1551,13 +1554,12 @@ def run_speedtest():
                 server_string = f"{data.get('server', {}).get('name', 'Unknown')} ({data.get('server', {}).get('location', 'Unknown')})"
                 now = time.time()
                 try:
-                    conn = get_db()
-                    log_status = f"DL: {download} Mbps | UL: {upload} Mbps | Ping: {ping} ms"
-                    conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Speedtest (Manual)', log_status))
-                    st_data = json.dumps({'download': download, 'upload': upload, 'ping': ping, 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
-                    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('latest_speedtest', ?)", (st_data,))
-                    conn.commit()
-                    conn.close()
+                    with closing(get_db()) as conn:
+                        log_status = f"DL: {download} Mbps | UL: {upload} Mbps | Ping: {ping} ms"
+                        conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Speedtest (Manual)', log_status))
+                        st_data = json.dumps({'download': download, 'upload': upload, 'ping': ping, 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
+                        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('latest_speedtest', ?)", (st_data,))
+                        conn.commit()
                     force_disk_sync()
                 except Exception as e: print(f"DB Error saving speedtest: {e}")
                 socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now}, to=sid)
@@ -1583,20 +1585,14 @@ def run_speedtest():
     eventlet.spawn(execute_test)
     return jsonify({'status': 'running'})
 
-@lru_cache(maxsize=32)
-def get_snapshot_cached(ip, mfg, user, pwd, stream_url, time_bucket):
-    return get_snapshot_bytes(ip, mfg, user, pwd, stream_url)
-
 @app.route('/api/snapshot/<int:id>')
 @login_required
 def snapshot(id):
-    conn = get_db()
-    camera = conn.execute("SELECT stream_url, ip, manufacturer, username, password FROM cameras WHERE id = ?", (id,)).fetchone()
-    conn.close()
+    with closing(get_db()) as conn:
+        camera = conn.execute("SELECT stream_url, ip, manufacturer, username, password FROM cameras WHERE id = ?", (id,)).fetchone()
     if not camera: return jsonify({'error': "Camera not found"}), 404
-    time_bucket = int(time.time() // 2)
     pwd = decrypt_pwd(camera['password'])
-    snap_bytes = get_snapshot_cached(camera['ip'], camera['manufacturer'], camera['username'], pwd, camera['stream_url'], time_bucket)
+    snap_bytes = get_snapshot_bytes(camera['ip'], camera['manufacturer'], camera['username'], pwd, camera['stream_url'])
     if snap_bytes: return Response(snap_bytes, mimetype='image/jpeg')
     else: return jsonify({'error': "Failed to grab snapshot"}), 500
 
@@ -1606,18 +1602,17 @@ def snapshot(id):
 @login_required
 @operator_required
 def tunnel(device_type, device_id, req_path):
-    conn = get_db()
-    if device_type == 'switch': device = conn.execute("SELECT ip FROM switches WHERE id = ?", (device_id,)).fetchone()
-    elif device_type == 'nvr': device = conn.execute("SELECT ip FROM nvrs WHERE id = ?", (device_id,)).fetchone()
-    elif device_type == 'camera': device = conn.execute("SELECT ip FROM cameras WHERE id = ?", (device_id,)).fetchone()
-    else: 
-        conn.close()
-        return "Invalid device type", 404
-    
-    if not device:
-        conn.close()
-        return "Device not found", 404
-    conn.close()
+    # Enforce CSRF checks manually for non-GET requests since the route is globally exempt
+    if request.method in ['POST', 'PUT', 'DELETE', 'PATCH']:
+        csrf.protect()
+
+    with closing(get_db()) as conn:
+        if device_type == 'switch': device = conn.execute("SELECT ip FROM switches WHERE id = ?", (device_id,)).fetchone()
+        elif device_type == 'nvr': device = conn.execute("SELECT ip FROM nvrs WHERE id = ?", (device_id,)).fetchone()
+        elif device_type == 'camera': device = conn.execute("SELECT ip FROM cameras WHERE id = ?", (device_id,)).fetchone()
+        else: return "Invalid device type", 404
+        
+        if not device: return "Device not found", 404
     
     try:
         resolved_ip = socket.gethostbyname(device['ip'])
@@ -1720,6 +1715,21 @@ try:
     init_db()
     init_logos()
     os.makedirs('/app/data', exist_ok=True)
+    
+    # Initialize hardened MQTT Client
+    mqtt_user = os.environ.get('MQTT_USER')
+    mqtt_pass = os.environ.get('MQTT_PASS')
+    mqtt_client = mqtt.Client()
+    if mqtt_user and mqtt_pass:
+        mqtt_client.username_pw_set(mqtt_user, mqtt_pass)
+        
+    try:
+        mqtt_client.connect(os.environ.get('DEFAULT_MQTT_BROKER', '127.0.0.1'), 
+                            int(os.environ.get('DEFAULT_MQTT_PORT', 1883)), 60)
+        mqtt_client.loop_start()
+    except Exception as e:
+        print(f"MQTT startup/auth failed: {e}")
+
     socketio.start_background_task(monitor_loop)
     socketio.start_background_task(automated_speedtest_loop)
     socketio.start_background_task(sync_db_loop)

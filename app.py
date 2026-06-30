@@ -806,16 +806,19 @@ def monitor_loop():
                     pending_db_updates.append((now, 'Camera', cam['name'], new_status, 'cameras', cam['id']))
 
             # --- 4. Atomic Batch Database Write ---
-            if pending_db_updates:
+            if pending_db_updates or pending_mac_updates:
                 with conn:
+                    # 1. Process Status Changes & Event Logs
                     for (t_stamp, dev_type, item_name, new_status, table, item_id) in pending_db_updates:
-                        # Log Event
                         conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", 
                                      (t_stamp, dev_type, item_name, new_status))
-                        # Update Device Status
                         conn.execute(f"UPDATE {table} SET status = ? WHERE id = ?", (new_status, item_id))
                     
-                    # Optional: Trigger socketio state changes here
+                    # 2. Process newly discovered L2 MAC Addresses
+                    for (table, mac, item_id) in pending_mac_updates:
+                        conn.execute(f"UPDATE {table} SET mac_address = ? WHERE id = ?", (mac, item_id))
+                    
+                    # 3. Stream real-time status changes to Vue UI via Socket.IO
                     for update in pending_db_updates:
                         socketio.emit('state_change', {'type': update[4], 'id': update[5], 'status': update[3]})
 

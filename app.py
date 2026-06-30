@@ -710,6 +710,13 @@ def automated_speedtest_loop():
                         socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
         except Exception as e: print(f"Automated speedtest loop error: {e}")
 
+def is_local_ip(ip):
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        return ip_obj.is_private
+    except ValueError:
+        return False
+        
 def monitor_loop():
     global force_check_event, mqtt_client, mqtt_prefix_global
     
@@ -736,17 +743,20 @@ def monitor_loop():
             pending_mac_updates = []
 
             # --- 1. Process Switches (Fast L3) ---
-            for switch in switches:
-                is_up = is_pingable(switch['ip']) or is_port_open(switch['ip'], 80)
-                new_status = 'UP' if is_up else 'DOWN'
-                if switch.get('silenced_until', 0) > now: new_status += " (Silenced)"
-                
-                if switch['status'] != new_status:
-                    pending_db_updates.append((now, 'Switch', switch['name'], new_status, 'switches', switch['id']))
-                
-                # MQTT Publish
-                if mqtt_client and mqtt_client.is_connected():
-                    mqtt_client.publish(f"{mqtt_prefix_global}/{switch['name']}/ping", new_status, retain=True)
+           for switch in switches:
+            # 1. Connectivity Check (Increase timeout for external IPs)
+                timeout = 1.5 if is_local_ip(switch['ip']) else 3.0
+                is_up = is_pingable(switch['ip'], timeout=timeout) or is_port_open(switch['ip'], 80)
+    
+            # 2. Logic: Only fetch MAC if it's a private, local IP
+                mac = switch.get('mac_address') or ''
+                if is_up and not mac and is_local_ip(switch['ip']):
+                    fetched_mac = get_mac_address(switch['ip'])
+                    if fetched_mac: 
+                    pending_mac_updates.append(('switches', fetched_mac.upper(), switch['id']))
+    
+            # 3. Status Construction
+            new_status = 'UP' if is_up else 'DOWN'
 
             # --- 2. Process NVRs (Fast L3) ---
             for nvr in nvrs:

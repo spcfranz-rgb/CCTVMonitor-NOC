@@ -1,4 +1,3 @@
-# app.py
 # CRITICAL: Monkey patching must occur before ANY other imports
 import struct
 import select
@@ -233,12 +232,12 @@ def manage_idle_timeout():
         last_active = session.get('last_active', now)
         
         conn = get_db()
-        idle_row = conn.execute("SELECT value FROM settings WHERE key = 'idle_timeout'").fetchone()
+        idle_row = conn.execute("SELECT value FROM settings WHERE key = 'inactive_timeout'").fetchone()
         conn.close()
         
         idle_mins = int(idle_row['value']) if idle_row else 20
         
-        if (now - last_active) > (idle_mins * 60):
+        if idle_mins > 0 and (now - last_active) > (idle_mins * 60):
             log_audit('System', current_user.username, 'Auto-logged out (Idle Timeout)')
             logout_user()
             session.pop('last_active', None)
@@ -300,7 +299,7 @@ def init_db():
             ('mqtt_port', os.environ.get('DEFAULT_MQTT_PORT', '1883')),
             ('mqtt_prefix', os.environ.get('DEFAULT_MQTT_PREFIX', 'zabbix/cctv')),
             ('check_interval', os.environ.get('DEFAULT_CHECK_INTERVAL', '60')),
-            ('idle_timeout', '20'),
+            ('inactive_timeout', '20'),
             ('smtp_host', ''),     
             ('smtp_port', '587'),  
             ('smtp_user', ''),     
@@ -380,8 +379,8 @@ def log_prune_loop():
 # BACKGROUND MONITORING & NETWORK TASKS
 # ==========================================
 SNAPSHOT_SEMAPHORE = eventlet.semaphore.Semaphore(4)
-L7_POOL = eventlet.greenpool.GreenPool(size=15) # Decoupled deep-probing pool
-previous_hashes = {} # Extracted to global scope for the decoupled pool
+L7_POOL = eventlet.greenpool.GreenPool(size=15)
+previous_hashes = {}
 mqtt_client = None
 mqtt_prefix_global = 'zabbix/cctv'
 
@@ -400,15 +399,20 @@ def get_local_subnet():
     return f"{ip.rsplit('.', 1)[0]}.0/24" if ip else "192.168.1.0/24"
 
 def is_valid_target(target):
+    """Allows either valid IPv4/v6 addresses OR valid DNS hostnames."""
     if not target: return False
     target = str(target).strip()
-    if target.startswith('-'): return False
+    
     try:
         ipaddress.ip_address(target)
         return True
-    except ValueError: pass
-    if re.match(r'^[A-Za-z0-9_.-]+$', target): return True
-    return False
+    except ValueError:
+        pass
+        
+    if len(target) > 255: return False
+    if target[-1] == ".": target = target[:-1]
+    allowed = re.compile(r"(?!-)[A-Z0-9-]{1,63}(?<!-)$", re.IGNORECASE)
+    return all(allowed.match(x) for x in target.split("."))
 
 def _icmp_checksum(source_string):
     sum = 0
@@ -536,7 +540,6 @@ def get_snapshot_bytes(ip, mfg, user, pwd, stream_url):
 
 # --- STAGE 1: LIGHTWEIGHT L3 PROBE ---
 def fast_l3_camera_check(cam):
-    """Only checks Ping or Port 554/80. Returns instantly to unblock the main loop."""
     cam_up = is_pingable(cam['ip']) or is_port_open(cam['ip'], 554) or is_port_open(cam['ip'], 80)
     fetched_mac = None
     if cam_up and not cam.get('mac_address'):
@@ -546,7 +549,6 @@ def fast_l3_camera_check(cam):
 
 # --- STAGE 2: DECOUPLED L7 PROBE ---
 def perform_l7_camera_check(cam, cam_silenced, last_hash, check_time):
-    """Spawns in a background queue. Deeply probes video feeds without blocking the gateway."""
     global previous_hashes, mqtt_client, mqtt_prefix_global
     cam_id = cam['id']
     cam_name = cam['name']
@@ -586,8 +588,6 @@ def perform_l7_camera_check(cam, cam_silenced, last_hash, check_time):
             mqtt_client.publish(f"{mqtt_prefix_global}/{cam_name}/stream", "FROZEN" if is_frozen else ("UP" if stream_ok else "STREAM_ERROR"), retain=True)
         new_status = 'DOWN (Frozen)' if is_frozen else ('UP' if stream_ok else 'DOWN (Stream Error)')
         
-    # We must fetch the absolute latest status from SQLite to ensure we don't 
-    # overwrite a manual UI toggle (like 'EVALUATING...') if it happened mid-scan.
     conn = get_db()
     curr_row = conn.execute("SELECT status FROM cameras WHERE id = ?", (cam_id,)).fetchone()
     curr_status = curr_row['status'] if curr_row else cam['status']
@@ -607,7 +607,6 @@ def perform_l7_camera_check(cam, cam_silenced, last_hash, check_time):
             if not mqtt_client or not mqtt_client.is_connected():
                 send_failover_email(f"FAILOVER ALERT: {cam_name} is {new_status}", f"The Camera '{cam_name}' transitioned to a critical state ({new_status}).\n\nThis alert was routed via SMTP because the primary MQTT connection to Zabbix is currently offline.")
     conn.close()
-
 
 def send_failover_email(subject, body):
     conn = get_db()
@@ -630,7 +629,6 @@ def send_failover_email(subject, body):
         except Exception as e:
             log_audit('System', 'Email Failover', f'Failed to send email: {str(e)}')
     eventlet.spawn_n(_send, settings)
-
 
 def automated_speedtest_loop():
     global mqtt_client, mqtt_prefix_global
@@ -814,13 +812,11 @@ def monitor_loop():
                     new_s_stat = 'UP' if not silenced else 'UP (Silenced)'
                     queue_status('switches', switch_id, switch_name, 'Switch', switch['status'], new_s_stat)
                     
-                    # Switch is online, queue its cameras for L3 Ping Check
                     for cam in cameras_by_switch.get(switch_id, []):
                         cameras_to_l3_check.append((cam, silenced)) 
                 else:
                     new_s_stat = 'DOWN' if not silenced else 'DOWN (Silenced)'
                     queue_status('switches', switch_id, switch_name, 'Switch', switch['status'], new_s_stat)
-                    # Switch is offline, all child cameras are dead instantly
                     for cam in cameras_by_switch.get(switch_id, []):
                         cameras_dead_by_switch.append((cam, silenced))
 
@@ -859,7 +855,6 @@ def monitor_loop():
                 cam_silenced = (c_until > now) or switch_silenced
                 
                 if not cam_up:
-                    # Camera failed ICMP ping. Update DB immediately and skip L7.
                     if cam_silenced:
                         if mqtt_client and mqtt_client.is_connected():
                             mqtt_client.publish(f"{mqtt_prefix_global}/{cam['name']}/ping", "MAINTENANCE", retain=True)
@@ -872,10 +867,10 @@ def monitor_loop():
                         new_c_stat = 'DOWN (Offline)'
                     queue_status('cameras', cam['id'], cam['name'], 'Camera', cam['status'], new_c_stat)
                 else:
-                    # DECOUPLED HINTOFF: Camera is L3 UP. Dispatch to L7 Pool.
+                    # Camera is L3 UP. Dispatch to L7 Pool.
                     L7_POOL.spawn_n(perform_l7_camera_check, cam, cam_silenced, previous_hashes.get(c_id), now)
 
-            # Batch execute all L3 DB updates (NVRs, Switches, Offline Cameras)
+            # Batch execute all L3 DB updates
             if pending_db_updates or pending_mac_updates:
                 conn = get_db()
                 with conn:
@@ -972,12 +967,10 @@ def probe_onvif_camera(ip, user, pwd):
             return {"success": True, "make": make, "model": model, "mac": mac, "stream_url": stream_url}
         except Exception: continue
     return {"success": False, "error": "ONVIF negotiation failed on all standard ports."}
+
 # ==========================================
 # FLASK SPA & JSON API ROUTES
 # ==========================================
-
-import csv
-import io
 
 @app.route('/api/v1/system/export', methods=['GET'])
 @login_required
@@ -986,7 +979,6 @@ def export_config():
     """Generates a downloadable CSV payload."""
     conn = get_db()
     devices = []
-    # Combine all into one export stream
     for table in ['switches', 'nvrs', 'cameras']:
         for row in conn.execute(f"SELECT *, '{table}' as dev_type FROM {table}").fetchall():
             d = dict(row)
@@ -1009,26 +1001,72 @@ def import_analyze():
         return jsonify({'success': False, 'message': 'No file uploaded.'}), 400
         
     try:
-        # Parse CSV
-        file = request.files['file'].stream.read().decode("utf-8")
-        reader = csv.DictReader(io.StringIO(file))
+        # Use utf-8-sig to automatically handle Excel BOM (Byte Order Mark)
+        file_stream = request.files['file'].stream.read().decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(file_stream))
         imported_devices = [row for row in reader]
-        
-        # The logic for detecting conflicts remains identical to the JSON version
-        # but you iterate over imported_devices instead of data['cameras'] etc.
-        # [Conflict analysis logic follows the same pattern as previous JSON version]
-        # ...
+
+        if not imported_devices:
+            return jsonify({'success': False, 'message': 'CSV appears empty or malformed.'}), 400
+            
+        conn = get_db()
+        existing_switches = {row['id']: dict(row) for row in conn.execute("SELECT * FROM switches").fetchall()}
+        existing_nvrs = {row['id']: dict(row) for row in conn.execute("SELECT * FROM nvrs").fetchall()}
+        existing_cameras = {row['id']: dict(row) for row in conn.execute("SELECT * FROM cameras").fetchall()}
+        conn.close()
+
+        analysis = {
+            'conflicts': [],
+            'clean_inserts': []
+        }
+
+        for row in imported_devices:
+            dev_type = row.get('dev_type')
+            try:
+                dev_id = int(row.get('id', 0))
+            except ValueError:
+                continue
+
+            if not dev_type or not dev_id:
+                continue
+
+            exists = False
+            existing_data = None
+            
+            if dev_type == 'switch' and dev_id in existing_switches:
+                exists = True
+                existing_data = existing_switches[dev_id]
+            elif dev_type == 'nvr' and dev_id in existing_nvrs:
+                exists = True
+                existing_data = existing_nvrs[dev_id]
+            elif dev_type == 'camera' and dev_id in existing_cameras:
+                exists = True
+                existing_data = existing_cameras[dev_id]
+
+            if exists:
+                analysis['conflicts'].append({
+                    'type': dev_type,
+                    'id': dev_id,
+                    'name': row.get('name', 'Unknown'),
+                    'incoming': row,
+                    'existing': existing_data
+                })
+            else:
+                analysis['clean_inserts'].append({
+                    'type': dev_type,
+                    'data': row
+                })
+
         return jsonify({'success': True, 'analysis': analysis})
     except Exception as e:
-        return jsonify({'success': False, 'message': str(e)}), 500
+        print(f"IMPORT_ERROR: {str(e)}") 
+        return jsonify({'success': False, 'message': f"Parse error: {str(e)}"}), 500
 
 @app.route('/api/v1/system/import/apply', methods=['POST'])
 @login_required
 @admin_required
 def import_apply():
     payload = request.get_json()
-    # Assume the frontend now passes a list of objects, not the raw CSV
-    # The frontend parses the CSV using a library like 'papaparse'
     resolved_conflicts = payload.get('resolved_conflicts', [])
     clean_inserts = payload.get('clean_inserts', [])
     
@@ -1036,7 +1074,6 @@ def import_apply():
     try:
         with conn:
             def cast_device(dev):
-                """Helper to ensure types match SQLite schema"""
                 return {
                     "id": int(dev['id']),
                     "name": dev['name'],
@@ -1046,7 +1083,7 @@ def import_apply():
                     "manufacturer": dev.get('manufacturer', 'Other'),
                     "username": dev.get('username', ''),
                     "password": dev.get('password', ''),
-                    "silenced_until": float(dev.get('silenced_until', 0)),
+                    "silenced_until": float(dev.get('silenced_until', 0)) if dev.get('silenced_until') else 0,
                     "mac_address": dev.get('mac_address', '')
                 }
 
@@ -1060,12 +1097,27 @@ def import_apply():
                     conn.execute("INSERT INTO nvrs (id, name, ip, silenced_until, mac_address) VALUES (?, ?, ?, ?, ?)", 
                                  (dev['id'], dev['name'], dev['ip'], dev['silenced_until'], dev['mac_address']))
                 elif item['type'] == 'camera':
-                    # Encrypt password on import
                     pwd = encrypt_pwd(dev['password']) if dev['password'] else ''
                     conn.execute("INSERT INTO cameras (id, switch_id, name, ip, stream_url, manufacturer, username, password, silenced_until, mac_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
                                  (dev['id'], dev['switch_id'], dev['name'], dev['ip'], dev['stream_url'], dev['manufacturer'], dev['username'], pwd, dev['silenced_until'], dev['mac_address']))
             
-            # (Resolution logic for 'overwrite' remains similar, using cast_device())
+            # Process resolved conflicts (overwrites)
+            for item in resolved_conflicts:
+                dev = cast_device(item['data'])
+                if item['type'] == 'switch':
+                    conn.execute("UPDATE switches SET name=?, ip=?, silenced_until=?, mac_address=? WHERE id=?", 
+                                 (dev['name'], dev['ip'], dev['silenced_until'], dev['mac_address'], dev['id']))
+                elif item['type'] == 'nvr':
+                    conn.execute("UPDATE nvrs SET name=?, ip=?, silenced_until=?, mac_address=? WHERE id=?", 
+                                 (dev['name'], dev['ip'], dev['silenced_until'], dev['mac_address'], dev['id']))
+                elif item['type'] == 'camera':
+                    pwd = encrypt_pwd(dev['password']) if dev['password'] else ''
+                    if pwd:
+                        conn.execute("UPDATE cameras SET switch_id=?, name=?, ip=?, stream_url=?, manufacturer=?, username=?, password=?, silenced_until=?, mac_address=? WHERE id=?", 
+                                     (dev['switch_id'], dev['name'], dev['ip'], dev['stream_url'], dev['manufacturer'], dev['username'], pwd, dev['silenced_until'], dev['mac_address'], dev['id']))
+                    else:
+                        conn.execute("UPDATE cameras SET switch_id=?, name=?, ip=?, stream_url=?, manufacturer=?, username=?, silenced_until=?, mac_address=? WHERE id=?", 
+                                     (dev['switch_id'], dev['name'], dev['ip'], dev['stream_url'], dev['manufacturer'], dev['username'], dev['silenced_until'], dev['mac_address'], dev['id']))
         
         force_disk_sync()
         return jsonify({'success': True})
@@ -1083,36 +1135,41 @@ def serve_spa(path):
     2. Intercepts and proxies orphaned WebUI requests.
     3. Serves the Vue index.html for client-side routing.
     """
-    
-    # 1. If the path exists physically in the build folder (JS/CSS assets)
     if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
         return send_from_directory(app.static_folder, path)
 
-    # 2. CRITICAL PROXY FIX: Intercept orphaned WebUI absolute paths
-    # If a tunneled camera requests '/images/logo.png', it hits this catch-all.
-    # We inspect the Referer to detect if it originated from our tunnel, and proxy it back.
     referer = request.headers.get('Referer')
     if referer:
         parsed_referer = urlparse(referer)
         parts = parsed_referer.path.split('/')
-        # Example parsed path: /tunnel/switch/1/
         if len(parts) >= 4 and parts[1] == 'tunnel':
             if current_user.is_authenticated and current_user.role in ['admin', 'operator']:
-                # Pass it directly to the tunnel function with a leading slash
                 return tunnel(parts[2], parts[3], '/' + path)
 
-    # 3. Otherwise, serve index.html and let Vue Router take over
     return send_from_directory(app.static_folder, 'index.html')
     
 @app.route('/api/v1/auth/status', methods=['GET'])
+# CRITICAL: Do NOT add @csrf_protect or @login_required decorators to this specific route.
 def auth_status():
+    # Mint a fresh token to reset the expiration clock immediately
+    token = generate_csrf()
+    
     if current_user.is_authenticated:
         return jsonify({
             'authenticated': True, 
-            'user': {'username': current_user.username, 'role': current_user.role},
-            'csrf_token': generate_csrf()
+            'user': {
+                'id': current_user.id,
+                'username': current_user.username, 
+                'role': current_user.role
+            },
+            'csrf_token': token
         })
-    return jsonify({'authenticated': False, 'csrf_token': generate_csrf()}), 401
+    
+    # Return a fresh token even if unauthenticated so the login form functions
+    return jsonify({
+        'authenticated': False, 
+        'csrf_token': token
+    }), 401
 
 @app.route('/api/v1/auth/login', methods=['POST'])
 def api_login():
@@ -1216,8 +1273,6 @@ def api_system_init():
         try: latest_speedtest = json.loads(settings_dict['latest_speedtest'])
         except Exception: pass
         
-    # --- AIR-GAPPED WEBRTC ROUTING ---
-    # Dynamically grab the IP the browser used to access the gateway (LAN vs VPN)
     client_accessed_host = request.host.split(':')[0]
     
     webrtc_config = {
@@ -1240,7 +1295,7 @@ def api_system_init():
         'default_subnet': get_local_subnet(),
         'latest_speedtest': latest_speedtest,
         'logos': { 'company': LOCAL_COMPANY_LOGO, 'customer': LOCAL_CUSTOMER_LOGO },
-        'webrtc_config': webrtc_config  # <-- Injected into the boot payload
+        'webrtc_config': webrtc_config 
     })
 
 @app.route('/api/v1/history', methods=['GET'])
@@ -1373,12 +1428,9 @@ def edit_delete_camera(id):
         name = data.get('name')
         try:
             pwd_update = data.get('password', '').strip()
-            
-            # If the admin provided a new password, encrypt and save it
             if pwd_update:
                 conn.execute("""UPDATE cameras SET switch_id = ?, name = ?, ip = ?, stream_url = ?, manufacturer = ?, username = ?, password = ? WHERE id = ?""", 
                              (switch_id, name, data.get('ip'), data.get('stream_url'), data.get('manufacturer', 'Other'), data.get('username', ''), encrypt_pwd(pwd_update), id))
-            # If blank, update everything EXCEPT the password
             else:
                 conn.execute("""UPDATE cameras SET switch_id = ?, name = ?, ip = ?, stream_url = ?, manufacturer = ?, username = ? WHERE id = ?""", 
                              (switch_id, name, data.get('ip'), data.get('stream_url'), data.get('manufacturer', 'Other'), data.get('username', ''), id))
@@ -1393,7 +1445,6 @@ def edit_delete_camera(id):
         finally: conn.close()
         
     elif request.method == 'DELETE':
-        # ... (Your existing DELETE logic remains unchanged) ...
         row = conn.execute("SELECT name FROM cameras WHERE id = ?", (id,)).fetchone()
         name = row['name'] if row else "Unknown"
         conn.execute("DELETE FROM cameras WHERE id = ?", (id,))
@@ -1445,7 +1496,7 @@ def api_update_settings():
     data = request.get_json()
     conn = get_db()
     for key, val in data.items():
-        if key in ['mqtt_broker', 'mqtt_port', 'mqtt_prefix', 'check_interval', 'idle_timeout', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass', 'smtp_target', 'st_interval', 'st_alert_dl', 'st_alert_ul', 'st_alert_ping']:
+        if key in ['mqtt_broker', 'mqtt_port', 'mqtt_prefix', 'check_interval', 'inactive_timeout', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass', 'smtp_target', 'st_interval', 'st_alert_dl', 'st_alert_ul', 'st_alert_ping']:
             conn.execute("UPDATE settings SET value = ? WHERE key = ?", (str(val), key))
     conn.commit()
     conn.close()
@@ -1486,9 +1537,6 @@ def api_toggle_silence():
     conn.commit()
     conn.close()
 
-    # --- OPTIMISTIC UX EMIT ---
-    # Instantly tell the frontend we are checking the network. 
-    # We only show this when waking a device UP (hours == 0).
     if hours == 0:
         socketio.emit('state_change', {
             'type': table_name, 

@@ -742,22 +742,22 @@ def monitor_loop():
             pending_db_updates = []
             pending_mac_updates = []
 
-            # --- 1. Process Switches (Fast L3) ---
-           for switch in switches:
-            # 1. Connectivity Check (Increase timeout for external IPs)
+           # --- 1. Process Switches (Fast L3) ---
+            for switch in switches:
+                # 1. Connectivity Check (Increase timeout for external IPs)
                 timeout = 1.5 if is_local_ip(switch['ip']) else 3.0
                 is_up = is_pingable(switch['ip'], timeout=timeout) or is_port_open(switch['ip'], 80)
     
-            # 2. Logic: Only fetch MAC if it's a private, local IP
+                # 2. Logic: Only fetch MAC if it's a private, local IP
                 mac = switch.get('mac_address') or ''
                 if is_up and not mac and is_local_ip(switch['ip']):
                     fetched_mac = get_mac_address(switch['ip'])
                     if fetched_mac: 
-                    pending_mac_updates.append(('switches', fetched_mac.upper(), switch['id']))
+                        pending_mac_updates.append(('switches', fetched_mac.upper(), switch['id']))
     
-            # 3. Status Construction
-            new_status = 'UP' if is_up else 'DOWN'
-
+                # 3. Status Construction
+                new_status = 'UP' if is_up else 'DOWN'
+                
             # --- 2. Process NVRs (Fast L3) ---
             for nvr in nvrs:
                 is_up = is_pingable(nvr['ip']) or is_port_open(nvr['ip'], 80)

@@ -432,6 +432,25 @@ def is_valid_target(target):
     allowed = re.compile(r"(?!-)[A-Z0-9-]{1,63}(?<!-)$", re.IGNORECASE)
     return all(allowed.match(x) for x in target.split("."))
 
+def _icmp_checksum(source_string):
+    sum = 0
+    count_to = (len(source_string) // 2) * 2
+    count = 0
+    while count < count_to:
+        this_val = source_string[count + 1] * 256 + source_string[count]
+        sum = sum + this_val
+        sum = sum & 0xffffffff
+        count = count + 2
+    if count_to < len(source_string):
+        sum = sum + source_string[len(source_string) - 1]
+        sum = sum & 0xffffffff
+    sum = (sum >> 16) + (sum & 0xffff)
+    sum = sum + (sum >> 16)
+    answer = ~sum
+    answer = answer & 0xffff
+    answer = answer >> 8 | (answer << 8 & 0xff00)
+    return answer
+
 def is_pingable(target, timeout=1.5):
     try:
         dest_addr = socket.gethostbyname(target)
@@ -554,15 +573,6 @@ def get_snapshot_bytes(ip, mfg, user, pwd, stream_url):
                 if resp.status_code == 200 and 'image' in resp.headers.get('Content-Type', ''): return resp.content
             except Exception: pass 
     return eventlet.tpool.execute(_run_ffmpeg_snapshot, stream_url)
-
-# --- STAGE 1: LIGHTWEIGHT L3 PROBE ---
-def fast_l3_camera_check(cam):
-    cam_up = is_pingable(cam['ip']) or is_port_open(cam['ip'], 554) or is_port_open(cam['ip'], 80)
-    fetched_mac = None
-    if cam_up and not cam.get('mac_address'):
-        new_mac = get_mac_address(cam['ip'])
-        if new_mac: fetched_mac = new_mac.upper()
-    return cam['id'], cam_up, fetched_mac
 
 # --- STAGE 2: DECOUPLED L7 PROBE ---
 def perform_l7_camera_check(cam, cam_silenced, last_hash, check_time):
@@ -742,11 +752,11 @@ def monitor_loop():
             pending_db_updates = []
             pending_mac_updates = []
 
-           # --- 1. Process Switches (Fast L3) ---
+            # --- 1. Process Switches (Fast L3) ---
             for switch in switches:
                 # 1. Connectivity Check (Increase timeout for external IPs)
                 timeout = 1.5 if is_local_ip(switch['ip']) else 3.0
-                is_up = is_pingable(switch['ip'], timeout=timeout) or is_port_open(switch['ip'], 80)
+                is_up = is_pingable(switch['ip'], timeout=timeout) or is_port_open(switch['ip'], 80, timeout=timeout)
     
                 # 2. Logic: Only fetch MAC if it's a private, local IP
                 mac = switch.get('mac_address') or ''
@@ -757,10 +767,11 @@ def monitor_loop():
     
                 # 3. Status Construction
                 new_status = 'UP' if is_up else 'DOWN'
-                
-            # --- 2. Process NVRs (Fast L3) ---
+
+            # --- 2. Process NVRs (Fast L3 - LAN ONLY) ---
             for nvr in nvrs:
-                is_up = is_pingable(nvr['ip']) or is_port_open(nvr['ip'], 80)
+                # Fixed 1.5s timeout for local networks
+                is_up = is_pingable(nvr['ip'], timeout=1.5) or is_port_open(nvr['ip'], 80, timeout=1.5)
                 new_status = 'UP' if is_up else 'DOWN'
                 if nvr.get('silenced_until', 0) > now: new_status += " (Silenced)"
                 
@@ -770,10 +781,11 @@ def monitor_loop():
                 if mqtt_client and mqtt_client.is_connected():
                     mqtt_client.publish(f"{mqtt_prefix_global}/{nvr['name']}/ping", new_status, retain=True)
 
-            # --- 3. Process Cameras (L3 + L7 Queue) ---
+            # --- 3. Process Cameras (L3 + L7 Queue - LAN ONLY) ---
             for cam in cameras:
-                # Fast L3 check
-                cam_up = is_pingable(cam['ip'])
+                # Fixed 1.5s timeout for local networks. 
+                # Keep TCP fallbacks (554/80) in case a local VLAN firewall drops ICMP.
+                cam_up = is_pingable(cam['ip'], timeout=1.5) or is_port_open(cam['ip'], 554, timeout=1.5) or is_port_open(cam['ip'], 80, timeout=1.5)
                 
                 if cam_up:
                     # Producer: Queue the heavy L7 task for the worker pool
@@ -1144,14 +1156,6 @@ def api_system_init():
         'webrtc_config': webrtc_config 
     })
 
-@app.route('/api/v1/history', methods=['GET'])
-@login_required
-def api_history():
-    conn = get_db()
-    logs = conn.execute("SELECT * FROM event_logs ORDER BY timestamp DESC LIMIT 500").fetchall()
-    conn.close()
-    return jsonify([dict(l) for l in logs])
-
 @app.route('/api/v1/switches', methods=['POST'])
 @login_required
 @admin_required
@@ -1203,6 +1207,9 @@ def edit_delete_switch(id):
 @admin_required
 def add_nvr():
     data = request.get_json()
+    if not is_local_ip(data.get('ip')):
+        return jsonify({'success': False, 'message': 'NVRs must use local LAN IP addresses.'}), 400
+        
     name = data.get('name')
     conn = get_db()
     try:
@@ -1222,6 +1229,9 @@ def edit_delete_nvr(id):
     conn = get_db()
     if request.method == 'PUT':
         data = request.get_json()
+        if not is_local_ip(data.get('ip')):
+            return jsonify({'success': False, 'message': 'NVRs must use local LAN IP addresses.'}), 400
+            
         name = data.get('name')
         try:
             conn.execute("UPDATE nvrs SET name = ?, ip = ? WHERE id = ?", (name, data.get('ip'), id))
@@ -1248,6 +1258,9 @@ def edit_delete_nvr(id):
 @admin_required
 def add_camera():
     data = request.get_json()
+    if not is_local_ip(data.get('ip')):
+        return jsonify({'success': False, 'message': 'Cameras must use local LAN IP addresses.'}), 400
+        
     switch_id = data.get('switch_id') or None
     name = data.get('name')
     conn = get_db()
@@ -1270,6 +1283,9 @@ def edit_delete_camera(id):
     conn = get_db()
     if request.method == 'PUT':
         data = request.get_json()
+        if not is_local_ip(data.get('ip')):
+            return jsonify({'success': False, 'message': 'Cameras must use local LAN IP addresses.'}), 400
+            
         switch_id = data.get('switch_id') or None 
         name = data.get('name')
         try:

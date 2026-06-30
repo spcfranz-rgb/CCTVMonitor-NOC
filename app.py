@@ -247,9 +247,9 @@ class User(UserMixin):
 
 @login_manager.user_loader
 def load_user(user_id):
-    with closing(get_db()) as conn:
-        user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-        if user: return User(user['id'], user['username'], user['role'])
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if user: return User(user['id'], user['username'], user['role'])
     return None
 
 # ---> CRITICAL FIX: RBAC DECORATORS MUST BE DEFINED HERE BEFORE ANY ROUTES <---
@@ -283,9 +283,9 @@ def manage_idle_timeout():
         now = time.time()
         last_active = session.get('last_active', now)
         
-        with closing(get_db()) as conn:
-            idle_row = conn.execute("SELECT value FROM settings WHERE key = 'inactive_timeout'").fetchone()
-            idle_mins = int(idle_row['value']) if idle_row else 20
+        conn = get_db()
+        idle_row = conn.execute("SELECT value FROM settings WHERE key = 'inactive_timeout'").fetchone()
+        idle_mins = int(idle_row['value']) if idle_row else 20
         
         if idle_mins > 0 and (now - last_active) > (idle_mins * 60):
             log_audit('System', current_user.username, 'Auto-logged out (Idle Timeout)')

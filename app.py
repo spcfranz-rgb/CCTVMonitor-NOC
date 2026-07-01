@@ -1669,9 +1669,9 @@ def snapshot(id):
 @login_required
 @operator_required
 def tunnel(device_type, device_id, req_path):
-    # Enforce CSRF checks manually for non-GET requests since the route is globally exempt
-    if request.method in ['POST', 'PUT', 'DELETE', 'PATCH']:
-        csrf.protect()
+    # [CRITICAL FIX 1]: Dropped the manual csrf.protect() here. 
+    # Legacy embedded UIs cannot attach Lighthouse's CSRF token to their native forms/AJAX.
+    # Flask-WTF will throw a 400 Bad Request on every login attempt if we enforce it.
 
     with closing(get_db()) as conn:
         if device_type == 'switch': device = conn.execute("SELECT ip FROM switches WHERE id = ?", (device_id,)).fetchone()
@@ -1688,25 +1688,32 @@ def tunnel(device_type, device_id, req_path):
     except socket.gaierror: return f"DNS Error: Could not resolve hostname '{device['ip']}'", 400
     except ValueError: return "Invalid IP or Hostname format.", 400
 
+    # [CRITICAL FIX 2]: Added 'origin' to allowed headers so we can spoof it.
     ALLOWED_HEADERS = {
         'content-type', 'accept', 'cache-control', 'x-requested-with', 
-        'user-agent', 'authorization', 'cookie', 'referer'
+        'user-agent', 'authorization', 'cookie', 'referer', 'origin'
     }
+    
     clean_headers = {k: v for k, v in request.headers.items() if k.lower() in ALLOWED_HEADERS}
     clean_headers['Host'] = resolved_ip 
     
-    # [FIX]: Detect dynamic scheme upgrades statelessly
+    # [CRITICAL FIX 3]: Spoof Origin and Referer. 
+    # Strict NVRs check these headers to prevent CSRF attacks against themselves.
     target_scheme = request.args.get('__scheme', 'http')
+    
+    if 'origin' in clean_headers:
+        clean_headers['origin'] = f"{target_scheme}://{resolved_ip}"
+    if 'referer' in clean_headers:
+        clean_headers['referer'] = f"{target_scheme}://{resolved_ip}/"
+    
     target_url = f"{target_scheme}://{resolved_ip}/{req_path.lstrip('/')}"
     
-    # Strip our internal __scheme param from the query string sent to the target hardware
     original_args = request.args.copy()
     original_args.pop('__scheme', None)
     query_string = urlencode(original_args) if original_args else ''
     
     if query_string: target_url += f"?{query_string}"
 
-    # [FIX]: Isolate cookies. Do not bleed the massive Flask 'session' token to fragile embedded hardware
     clean_cookies = {k: v for k, v in request.cookies.items() if k != 'session'}
 
     try:
@@ -1735,14 +1742,12 @@ def tunnel(device_type, device_id, req_path):
             if name.lower() in excluded_headers:
                 continue
             
-            # [FIX]: Force Set-Cookie paths to scope strictly to this device's tunnel
             if name.lower() == 'set-cookie':
                 if re.search(r'path=[^;]+', value, re.IGNORECASE):
                     value = re.sub(r'path=[^;]+', f'Path={tunnel_base}', value, flags=re.IGNORECASE)
                 else:
                     value += f"; Path={tunnel_base}"
 
-            # [FIX]: Handle HTTP -> HTTPS Redirect Loops
             elif name.lower() == 'location':
                 absolute_loc = urljoin(target_url, value)
                 parsed = urlparse(absolute_loc)
@@ -1751,7 +1756,6 @@ def tunnel(device_type, device_id, req_path):
                     new_loc = f"{tunnel_base}{parsed.path}"
                     
                     params = []
-                    # If the device is forcing an HTTPS upgrade, append our stateless tracker
                     if parsed.scheme == 'https' and target_scheme == 'http':
                         params.append('__scheme=https')
                         

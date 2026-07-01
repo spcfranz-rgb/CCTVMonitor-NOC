@@ -38,7 +38,7 @@ import paho.mqtt.client as mqtt
 import imagehash
 from PIL import Image
 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from functools import wraps
 
 # --- ONVIF Integration ---
@@ -1703,23 +1703,20 @@ def tunnel(device_type, device_id, req_path):
             timeout=10, 
             verify=False
         )
-        if resp.status_code in [301, 302, 307, 308]:
-            loc = resp.headers.get('Location', '')
-            if loc.startswith(f"http://{device['ip']}") or loc.startswith(f"http://{resolved_ip}"):
-                target_url = f"http://{resolved_ip}/{req_path.lstrip('/')}"
-                resp = requests.request(method=request.method, url=target_url, headers=clean_headers, data=request.get_data(), cookies={}, allow_redirects=False, stream=True, timeout=10, verify=False)
         
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
         resp_headers = [(name, value) for (name, value) in resp.raw.headers.items() if name.lower() not in excluded_headers]
+        
         for i, (name, value) in enumerate(resp_headers):
             if name.lower() == 'location':
-                parsed = urlparse(value)
+                # Use urljoin to cleanly resolve relative redirects (e.g. 'index.html' -> 'http://ip/index.html')
+                absolute_loc = urljoin(target_url, value)
+                parsed = urlparse(absolute_loc)
+                
                 if parsed.hostname in [device['ip'], resolved_ip]:
                     new_loc = f"/tunnel/{device_type}/{device_id}{parsed.path}"
                     if parsed.query: new_loc += f"?{parsed.query}"
                     resp_headers[i] = (name, new_loc)
-                elif not parsed.hostname and value.startswith('/'):
-                    resp_headers[i] = (name, f"/tunnel/{device_type}/{device_id}{value}")
 
         content_type = resp.headers.get('Content-Type', '').lower()
         if 'text/html' in content_type or 'javascript' in content_type or 'json' in content_type:
@@ -1733,7 +1730,6 @@ def tunnel(device_type, device_id, req_path):
         else:
             return Response(resp.iter_content(chunk_size=10*1024), resp.status_code, resp_headers)
     except requests.exceptions.RequestException as e: return f"Tunnel Error: {str(e)}", 502
-
 
 @csrf.exempt
 @app.errorhandler(404)

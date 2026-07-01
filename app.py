@@ -857,6 +857,12 @@ def monitor_loop():
 
                 # Process Cameras
                 for i, cam in enumerate(cameras):
+                    # --- ADDED: Auto-populate missing MAC addresses ---
+                    mac = cam.get('mac_address') or ''
+                    if not mac and is_local_ip(cam['ip']):
+                        fetched_mac = get_mac_address(cam['ip'])
+                        if fetched_mac: 
+                            pending_mac_updates.append(('cameras', fetched_mac.upper(), cam['id']))
                     # Drift detection
                     if cam.get('mac_address') and cam['mac_address'] in current_arp_map:
                         if current_arp_map[cam['mac_address']] != cam['ip']:

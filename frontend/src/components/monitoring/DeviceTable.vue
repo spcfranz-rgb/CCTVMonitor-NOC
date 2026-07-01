@@ -32,7 +32,7 @@
                 <span class="badge" :class="statusClass(device.status)">{{ device.status }}</span>
               </td>
               <td class="text-end pe-3" v-if="canEdit">
-                1
+                
                 <div class="btn-group shadow-sm">
                   <a v-if="isPrivateLocation(device.ip)" :href="`/tunnel/${singularType}/${device.id}/`" target="_blank" class="btn btn-sm btn-info text-decoration-none" title="WebUI Tunnel">🌐</a>
   

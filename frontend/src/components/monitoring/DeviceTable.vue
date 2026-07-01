@@ -40,6 +40,7 @@
                     {{ device.is_silenced ? '🔇' : '🔔' }}
                   </button>
 
+                  <button class="btn btn-sm btn-outline-secondary" @click="refreshMac(device)" title="Refresh MAC">🔄</button>
                   <button v-if="isAdmin" class="btn btn-sm btn-outline-warning" @click="$emit('edit', device, type)" title="Edit Device">✏️</button>
                   <button v-if="isAdmin" class="btn btn-sm btn-outline-danger" @click="deleteDevice(device)" title="Delete Device">❌</button>
                 </div>
@@ -118,6 +119,24 @@ const deleteDevice = async (device) => {
     await store.fetchSystemData()
   } catch(e) {
     store.addToast(`Failed to delete ${device.name}.`, 'danger')
+  }
+}
+
+const refreshMac = async (device) => {
+  try {
+    const res = await axios.post('/api/v1/devices/refresh_mac', { 
+        type: props.type, 
+        id: device.id 
+    })
+    
+    if (res.data.success) {
+      device.mac_address = res.data.mac
+      store.addToast(`MAC address updated to ${res.data.mac}`)
+    } else {
+      store.addToast(res.data.message, 'warning')
+    }
+  } catch(e) {
+    store.addToast('Failed to refresh MAC address', 'danger')
   }
 }
 </script>

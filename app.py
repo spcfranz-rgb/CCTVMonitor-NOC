@@ -791,7 +791,7 @@ def monitor_loop():
         with closing(sqlite3.connect(DB_PATH_RAM, timeout=10)) as conn:
             conn.row_factory = sqlite3.Row
             
-try:
+            try:
                 settings = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
                 interval = int(settings.get('check_interval', 60))
                 

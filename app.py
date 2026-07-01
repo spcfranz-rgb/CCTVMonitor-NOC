@@ -1051,6 +1051,7 @@ def export_config():
     cw.writerows(devices)
     return Response(si.getvalue(), mimetype='text/csv', headers={'Content-Disposition': 'attachment;filename=lighthouse_config.csv'})
 
+# Revised strategy for app.py
 @app.route('/api/v1/system/import/analyze', methods=['POST'])
 @login_required
 @admin_required
@@ -1065,31 +1066,32 @@ def import_analyze():
             return jsonify({'success': False, 'message': 'CSV appears empty or malformed.'}), 400
             
         with closing(get_db()) as conn:
-            existing_switches = {row['id']: dict(row) for row in conn.execute("SELECT * FROM switches").fetchall()}
-            existing_nvrs = {row['id']: dict(row) for row in conn.execute("SELECT * FROM nvrs").fetchall()}
-            existing_cameras = {row['id']: dict(row) for row in conn.execute("SELECT * FROM cameras").fetchall()}
+            # Map devices by Type AND Name (lowercase) for O(1) lookup
+            existing_switches = {row['name'].lower(): dict(row) for row in conn.execute("SELECT * FROM switches").fetchall()}
+            existing_nvrs = {row['name'].lower(): dict(row) for row in conn.execute("SELECT * FROM nvrs").fetchall()}
+            existing_cameras = {row['name'].lower(): dict(row) for row in conn.execute("SELECT * FROM cameras").fetchall()}
             
         analysis = {'conflicts': [], 'clean_inserts': []}
         for row in imported_devices:
             dev_type = row.get('dev_type')
-            try: dev_id = int(row.get('id', 0))
-            except ValueError: continue
-            if not dev_type or not dev_id: continue
-            exists = False
+            name = row.get('name', '').lower()
+            
+            # Lookup based on Name
             existing_data = None
-            if dev_type == 'switch' and dev_id in existing_switches:
-                exists = True
-                existing_data = existing_switches[dev_id]
-            elif dev_type == 'nvr' and dev_id in existing_nvrs:
-                exists = True
-                existing_data = existing_nvrs[dev_id]
-            elif dev_type == 'camera' and dev_id in existing_cameras:
-                exists = True
-                existing_data = existing_cameras[dev_id]
-            if exists:
-                analysis['conflicts'].append({'type': dev_type, 'id': dev_id, 'name': row.get('name', 'Unknown'), 'incoming': row, 'existing': existing_data})
+            if dev_type == 'switch': existing_data = existing_switches.get(name)
+            elif dev_type == 'nvr': existing_data = existing_nvrs.get(name)
+            elif dev_type == 'camera': existing_data = existing_cameras.get(name)
+            
+            if existing_data:
+                analysis['conflicts'].append({
+                    'type': dev_type, 
+                    'name': row.get('name'), 
+                    'incoming': row, 
+                    'existing': existing_data
+                })
             else:
                 analysis['clean_inserts'].append({'type': dev_type, 'data': row})
+        
         return jsonify({'success': True, 'analysis': analysis})
     except Exception as e:
         return jsonify({'success': False, 'message': f"Parse error: {str(e)}"}), 500
@@ -1105,47 +1107,44 @@ def import_apply():
     try:
         with closing(get_db()) as conn:
             with conn:
-                def cast_device(dev):
-                    return {
-                        "id": int(dev['id']),
-                        "name": dev['name'],
-                        "ip": dev['ip'],
-                        "switch_id": int(dev['switch_id']) if dev.get('switch_id') else None,
-                        "stream_url": dev.get('stream_url', ''),
-                        "manufacturer": dev.get('manufacturer', 'Other'),
-                        "username": dev.get('username', ''),
-                        "password": dev.get('password', ''),
-                        "silenced_until": float(dev.get('silenced_until', 0)) if dev.get('silenced_until') else 0,
-                        "mac_address": dev.get('mac_address', '')
-                    }
+                # Helper to map CSV types to Database tables
+                type_to_table = {'switch': 'switches', 'nvr': 'nvrs', 'camera': 'cameras'}
+                
+                # Apply new inserts
                 for item in clean_inserts:
-                    dev = cast_device(item['data'])
-                    if item['type'] == 'switch':
-                        conn.execute("INSERT INTO switches (id, name, ip, silenced_until, mac_address) VALUES (?, ?, ?, ?, ?)", 
-                                     (dev['id'], dev['name'], dev['ip'], dev['silenced_until'], dev['mac_address']))
-                    elif item['type'] == 'nvr':
-                        conn.execute("INSERT INTO nvrs (id, name, ip, silenced_until, mac_address) VALUES (?, ?, ?, ?, ?)", 
-                                     (dev['id'], dev['name'], dev['ip'], dev['silenced_until'], dev['mac_address']))
-                    elif item['type'] == 'camera':
-                        pwd = encrypt_pwd(dev['password']) if dev['password'] else ''
-                        conn.execute("INSERT INTO cameras (id, switch_id, name, ip, stream_url, manufacturer, username, password, silenced_until, mac_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
-                                     (dev['id'], dev['switch_id'], dev['name'], dev['ip'], dev['stream_url'], dev['manufacturer'], dev['username'], pwd, dev['silenced_until'], dev['mac_address']))
+                    dev = item['data']
+                    table = type_to_table[item['type']]
+                    # Logic: Insert new record. We let SQLite auto-increment handle the new ID.
+                    if item['type'] == 'camera':
+                        pwd = encrypt_pwd(dev.get('password', ''))
+                        conn.execute(f"INSERT INTO {table} (name, ip, stream_url, manufacturer, username, password, mac_address) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                     (dev['name'], dev['ip'], dev['stream_url'], dev.get('manufacturer', 'Other'), dev.get('username', ''), pwd, dev.get('mac_address', '')))
+                    else:
+                        conn.execute(f"INSERT INTO {table} (name, ip, mac_address) VALUES (?, ?, ?)",
+                                     (dev['name'], dev['ip'], dev.get('mac_address', '')))
+
+                # Apply conflict resolutions
                 for item in resolved_conflicts:
-                    dev = cast_device(item['data'])
-                    if item['type'] == 'switch':
-                        conn.execute("UPDATE switches SET name=?, ip=?, silenced_until=?, mac_address=? WHERE id=?", 
-                                     (dev['name'], dev['ip'], dev['silenced_until'], dev['mac_address'], dev['id']))
-                    elif item['type'] == 'nvr':
-                        conn.execute("UPDATE nvrs SET name=?, ip=?, silenced_until=?, mac_address=? WHERE id=?", 
-                                     (dev['name'], dev['ip'], dev['silenced_until'], dev['mac_address'], dev['id']))
-                    elif item['type'] == 'camera':
-                        pwd = encrypt_pwd(dev['password']) if dev['password'] else ''
-                        if pwd:
-                            conn.execute("UPDATE cameras SET switch_id=?, name=?, ip=?, stream_url=?, manufacturer=?, username=?, password=?, silenced_until=?, mac_address=? WHERE id=?", 
-                                         (dev['switch_id'], dev['name'], dev['ip'], dev['stream_url'], dev['manufacturer'], dev['username'], pwd, dev['silenced_until'], dev['mac_address'], dev['id']))
+                    if item.get('resolution') == 'overwrite':
+                        dev = item['imported']
+                        table = type_to_table[item['type']]
+                        
+                        # Find the existing ID by Name
+                        existing = conn.execute(f"SELECT id FROM {table} WHERE name = ?", (dev['name'],)).fetchone()
+                        if not existing: continue
+                        
+                        if item['type'] == 'camera':
+                            pwd = encrypt_pwd(dev.get('password', ''))
+                            if pwd:
+                                conn.execute(f"UPDATE {table} SET ip=?, stream_url=?, manufacturer=?, username=?, password=?, mac_address=? WHERE id=?", 
+                                             (dev['ip'], dev['stream_url'], dev['manufacturer'], dev['username'], pwd, dev.get('mac_address', ''), existing['id']))
+                            else:
+                                conn.execute(f"UPDATE {table} SET ip=?, stream_url=?, manufacturer=?, username=?, mac_address=? WHERE id=?", 
+                                             (dev['ip'], dev['stream_url'], dev['manufacturer'], dev['username'], dev.get('mac_address', ''), existing['id']))
                         else:
-                            conn.execute("UPDATE cameras SET switch_id=?, name=?, ip=?, stream_url=?, manufacturer=?, username=?, silenced_until=?, mac_address=? WHERE id=?", 
-                                         (dev['switch_id'], dev['name'], dev['ip'], dev['stream_url'], dev['manufacturer'], dev['username'], dev['silenced_until'], dev['mac_address'], dev['id']))
+                            conn.execute(f"UPDATE {table} SET ip=?, mac_address=? WHERE id=?", 
+                                         (dev['ip'], dev.get('mac_address', ''), existing['id']))
+
         force_disk_sync()
         return jsonify({'success': True})
     except Exception as e:

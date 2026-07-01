@@ -14,6 +14,30 @@
             {{ analysis.conflicts.length }} naming/hardware conflicts found.
           </div>
 
+          <div v-if="analysis.clean_inserts.length > 0" class="mb-4">
+            <h6 class="text-success border-bottom border-secondary pb-2">Ready to Append ({{ analysis.clean_inserts.length }} Valid Devices)</h6>
+            <div class="card bg-dark border-secondary">
+              <div class="card-body p-0">
+                <table class="table table-sm table-dark table-hover mb-0">
+                  <thead>
+                    <tr>
+                      <th class="ps-3">Name</th>
+                      <th>Type</th>
+                      <th>IP Address</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="(item, idx) in analysis.clean_inserts" :key="idx">
+                      <td class="ps-3 fw-bold text-success">{{ item.data.name }}</td>
+                      <td><span class="badge bg-secondary">{{ item.type.toUpperCase() }}</span></td>
+                      <td class="font-monospace">{{ item.data.ip }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
           <div v-if="analysis.conflicts.length > 0">
             <h6 class="text-danger border-bottom border-secondary pb-2 mb-3">Resolve Conflicts</h6>
             
@@ -100,7 +124,7 @@ const submitMerge = async () => {
         .filter(c => c.resolution === 'overwrite')
         .map(c => ({
             type: c.type,
-            data: c.incoming // The data here includes any manual user edits
+            data: c.incoming // Sends the edited 'incoming' data to the backend
         }))
     }
     

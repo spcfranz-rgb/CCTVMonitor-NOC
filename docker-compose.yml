@@ -59,7 +59,6 @@ services:
     # CRITICAL FIX: Bypass Seccomp filters and allow massive concurrent socket pooling
     cap_add:
       - NET_RAW
-      - NET_ADMIN
     ulimits:
       nofile:
         soft: 65536

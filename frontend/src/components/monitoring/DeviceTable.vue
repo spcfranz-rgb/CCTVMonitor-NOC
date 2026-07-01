@@ -32,15 +32,15 @@
                 <span class="badge" :class="statusClass(device.status)">{{ device.status }}</span>
               </td>
               <td class="text-end pe-3" v-if="canEdit">
-                
+                1
                 <div class="btn-group shadow-sm">
                   <a v-if="isPrivateLocation(device.ip)" :href="`/tunnel/${singularType}/${device.id}/`" target="_blank" class="btn btn-sm btn-info text-decoration-none" title="WebUI Tunnel">🌐</a>
-                  
+  
+                  <button v-if="isPrivateLocation(device.ip)" class="btn btn-sm btn-outline-secondary" @click="refreshMac(device)" title="Refresh MAC">🔄</button>
+
                   <button class="btn btn-sm" :class="device.is_silenced ? 'btn-warning' : 'btn-outline-secondary'" @click="toggleSilence(device)" :disabled="working === device.id" title="Toggle Silence">
                     {{ device.is_silenced ? '🔇' : '🔔' }}
                   </button>
-
-                  <button class="btn btn-sm btn-outline-secondary" @click="refreshMac(device)" title="Refresh MAC">🔄</button>
                   <button v-if="isAdmin" class="btn btn-sm btn-outline-warning" @click="$emit('edit', device, type)" title="Edit Device">✏️</button>
                   <button v-if="isAdmin" class="btn btn-sm btn-outline-danger" @click="deleteDevice(device)" title="Delete Device">❌</button>
                 </div>

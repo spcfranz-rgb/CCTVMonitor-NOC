@@ -787,6 +787,9 @@ def monitor_loop():
 
     while True:
         now = time.time()
+        # Capture current ARP state once per loop
+        current_arp_map = {entry['mac']: entry['ip'] for entry in get_camlan_arp_table()}
+        
         with closing(sqlite3.connect(DB_PATH_RAM, timeout=10)) as conn:
             conn.row_factory = sqlite3.Row
             
@@ -800,6 +803,7 @@ def monitor_loop():
                 
                 pending_db_updates = []
                 pending_mac_updates = []
+                pending_ip_updates = [] # Stores (new_ip, dev_id, table_name)
 
                 probe_pool = eventlet.greenpool.GreenPool(size=100)
 
@@ -816,7 +820,14 @@ def monitor_loop():
                 nvr_status = list(probe_pool.imap(lambda d: probe_network_target('nvr', d), nvrs))
                 camera_status = list(probe_pool.imap(lambda d: probe_network_target('camera', d), cameras))
 
+                # Process Switches
                 for i, switch in enumerate(switches):
+                    # Drift detection
+                    if switch.get('mac_address') and switch['mac_address'] in current_arp_map:
+                        if current_arp_map[switch['mac_address']] != switch['ip']:
+                            pending_ip_updates.append((current_arp_map[switch['mac_address']], switch['id'], 'switches'))
+                            switch['ip'] = current_arp_map[switch['mac_address']]
+                    
                     is_up = switch_status[i]
                     mac = switch.get('mac_address') or ''
                     if is_up and not mac and is_local_ip(switch['ip']):
@@ -829,7 +840,14 @@ def monitor_loop():
                         pending_db_updates.append((now, 'Switch', switch['name'], new_status, 'switches', switch['id']))
                     if mqtt_client and mqtt_client.is_connected(): mqtt_client.publish(f"{mqtt_prefix_global}/{switch['name']}/ping", new_status, retain=True)
 
+                # Process NVRs
                 for i, nvr in enumerate(nvrs):
+                    # Drift detection
+                    if nvr.get('mac_address') and nvr['mac_address'] in current_arp_map:
+                        if current_arp_map[nvr['mac_address']] != nvr['ip']:
+                            pending_ip_updates.append((current_arp_map[nvr['mac_address']], nvr['id'], 'nvrs'))
+                            nvr['ip'] = current_arp_map[nvr['mac_address']]
+
                     is_up = nvr_status[i]
                     new_status = 'UP' if is_up else 'DOWN'
                     if nvr.get('silenced_until', 0) > now: new_status += " (Silenced)"
@@ -837,7 +855,14 @@ def monitor_loop():
                         pending_db_updates.append((now, 'NVR', nvr['name'], new_status, 'nvrs', nvr['id']))
                     if mqtt_client and mqtt_client.is_connected(): mqtt_client.publish(f"{mqtt_prefix_global}/{nvr['name']}/ping", new_status, retain=True)
 
+                # Process Cameras
                 for i, cam in enumerate(cameras):
+                    # Drift detection
+                    if cam.get('mac_address') and cam['mac_address'] in current_arp_map:
+                        if current_arp_map[cam['mac_address']] != cam['ip']:
+                            pending_ip_updates.append((current_arp_map[cam['mac_address']], cam['id'], 'cameras'))
+                            cam['ip'] = current_arp_map[cam['mac_address']]
+
                     if camera_status[i]:
                         L7_QUEUE.put((cam, cam.get('silenced_until', 0) > now, previous_hashes.get(cam['id']), now))
                         new_status = cam['status'] 
@@ -848,15 +873,24 @@ def monitor_loop():
                     if cam['status'] != new_status:
                         pending_db_updates.append((now, 'Camera', cam['name'], new_status, 'cameras', cam['id']))
 
-                if pending_db_updates or pending_mac_updates:
-                    with conn:
-                        for (t_stamp, dev_type, item_name, new_status, table, item_id) in pending_db_updates:
-                            conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (t_stamp, dev_type, item_name, new_status))
-                            conn.execute(f"UPDATE {table} SET status = ? WHERE id = ?", (new_status, item_id))
-                        for (table, mac, item_id) in pending_mac_updates:
-                            conn.execute(f"UPDATE {table} SET mac_address = ? WHERE id = ?", (mac, item_id))
-                        for update in pending_db_updates:
-                            socketio.emit('state_change', {'type': update[4], 'id': update[5], 'status': update[3]})
+                # Apply Database Updates
+                with conn:
+                    # Execute IP drifts
+                    for (new_ip, item_id, table) in pending_ip_updates:
+                        conn.execute(f"UPDATE {table} SET ip = ? WHERE id = ?", (new_ip, item_id))
+                    
+                    # Update logs and status
+                    for (t_stamp, dev_type, item_name, new_status, table, item_id) in pending_db_updates:
+                        conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (t_stamp, dev_type, item_name, new_status))
+                        conn.execute(f"UPDATE {table} SET status = ? WHERE id = ?", (new_status, item_id))
+                    
+                    # Update missing MAC addresses
+                    for (table, mac, item_id) in pending_mac_updates:
+                        conn.execute(f"UPDATE {table} SET mac_address = ? WHERE id = ?", (mac, item_id))
+                    
+                    # UI Notifications
+                    for update in pending_db_updates:
+                        socketio.emit('state_change', {'type': update[4], 'id': update[5], 'status': update[3]})
 
             except Exception as e:
                 print(f"Monitor loop iteration failed: {e}")

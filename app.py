@@ -1688,14 +1688,18 @@ def tunnel(device_type, device_id, req_path):
     except socket.gaierror: return f"DNS Error: Could not resolve hostname '{device['ip']}'", 400
     except ValueError: return "Invalid IP or Hostname format.", 400
 
-    # [CRITICAL FIX 2]: Added 'origin' to allowed headers so we can spoof it.
-    ALLOWED_HEADERS = {
-        'content-type', 'accept', 'cache-control', 'x-requested-with', 
-        'user-agent', 'authorization', 'cookie', 'referer', 'origin'
+# [CRITICAL FIX]: Use a Blocklist instead of an Allowlist.
+    # Embedded UI frameworks (like Vue/React) often send proprietary API headers (X-CSRF, Tokens).
+    # We must allow those to pass through to the hardware, only stripping proxy-breaking headers.
+    EXCLUDED_REQ_HEADERS = {
+        'host', 'content-length', 'connection', 'cookie', 
+        'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host', 'x-real-ip'
     }
     
-    clean_headers = {k: v for k, v in request.headers.items() if k.lower() in ALLOWED_HEADERS}
-    clean_headers['Host'] = resolved_ip 
+    clean_headers = {k: v for k, v in request.headers.items() if k.lower() not in EXCLUDED_REQ_HEADERS}
+    
+    # Spoof Host to impersonate a local LAN connection
+    clean_headers['Host'] = resolved_ip
     
     # [CRITICAL FIX 3]: Spoof Origin and Referer. 
     # Strict NVRs check these headers to prevent CSRF attacks against themselves.

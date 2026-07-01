@@ -76,6 +76,7 @@ csrf = CSRFProtect(app)
 app.config['SESSION_COOKIE_HTTPONLY'] = True 
 app.config['SESSION_COOKIE_SAMESITE'] = 'Strict'
 app.config['SESSION_COOKIE_SECURE'] = os.environ.get('REQUIRE_HTTPS', 'False').lower() == 'true'
+app.config['SESSION_COOKIE_NAME'] = 'lighthouse_session'
 
 # --- SECURITY: STRICT AIR-GAPPED CSP ---
 @app.after_request
@@ -1649,8 +1650,8 @@ def snapshot(id):
     else: return jsonify({'error': "Failed to grab snapshot"}), 500
 
 @csrf.exempt
-@app.route('/tunnel/<device_type>/<int:device_id>/', defaults={'req_path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
-@app.route('/tunnel/<device_type>/<int:device_id>/<path:req_path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
+@app.route('/tunnel/<device_type>/<int:device_id>/', defaults={'req_path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
+@app.route('/tunnel/<device_type>/<int:device_id>/<path:req_path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
 @login_required
 @operator_required
 def tunnel(device_type, device_id, req_path):
@@ -1671,7 +1672,7 @@ def tunnel(device_type, device_id, req_path):
 
     target_scheme = request.args.get('__scheme', 'http')
 
-    # Use a Blocklist instead of an Allowlist to permit proprietary embedded UI headers
+    # Allow proprietary embedded UI headers through
     EXCLUDED_REQ_HEADERS = {
         'host', 'content-length', 'connection', 'cookie', 
         'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host', 'x-real-ip',
@@ -1679,11 +1680,9 @@ def tunnel(device_type, device_id, req_path):
     }
     
     clean_headers = {k: v for k, v in request.headers.items() if k.lower() not in EXCLUDED_REQ_HEADERS}
-    
-    # 1. Spoof Host to impersonate a local LAN connection
     clean_headers['Host'] = resolved_ip 
     
-    # 2. Aggressively Spoof Origin and Referer to bypass Anti-DNS Rebinding
+    # Aggressively Spoof Origin and Referer
     clean_headers.pop('origin', None)
     clean_headers.pop('Origin', None)
     clean_headers.pop('referer', None)
@@ -1695,24 +1694,20 @@ def tunnel(device_type, device_id, req_path):
     if request.headers.get('Referer'):
         original_ref = request.headers.get('Referer')
         parsed_ref = urlparse(original_ref)
-        
-        # Strip the gateway's tunnel path out so the switch sees a native relative path
         ref_path = parsed_ref.path.replace(f"/tunnel/{device_type}/{device_id}", "", 1)
         if not ref_path.startswith('/'): 
             ref_path = '/' + ref_path
-            
         clean_headers['Referer'] = f"{target_scheme}://{resolved_ip}{ref_path}"
         
     target_url = f"{target_scheme}://{resolved_ip}/{req_path.lstrip('/')}"
     
-    original_args = request.args.copy()
-    original_args.pop('__scheme', None)
-    query_string = urlencode(original_args) if original_args else ''
-    
+    # [FIX]: Safely extract query parameters preserving array values for Vue apps
+    original_args = [(k, v) for k, v in request.args.items(multi=True) if k != '__scheme']
+    query_string = urlencode(original_args)
     if query_string: target_url += f"?{query_string}"
 
-    # Isolate cookies. Do not bleed the massive Flask 'session' token
-    clean_cookies = {k: v for k, v in request.cookies.items() if k != 'session'}
+    # [FIX]: Scrub our newly named Flask session, allowing the device's native cookies through
+    clean_cookies = {k: v for k, v in request.cookies.items() if k != 'lighthouse_session'}
 
     try:
         resp = requests.request(
@@ -1740,14 +1735,19 @@ def tunnel(device_type, device_id, req_path):
             if name.lower() in excluded_headers:
                 continue
             
-            # Force Set-Cookie paths to scope strictly to this device's tunnel
             if name.lower() == 'set-cookie':
-                if re.search(r'path=[^;]+', value, re.IGNORECASE):
-                    value = re.sub(r'path=[^;]+', f'Path={tunnel_base}', value, flags=re.IGNORECASE)
+                # Strip hardcoded Domain constraints the device might try to set
+                value = re.sub(r'(?i);\s*domain=[^;]+', '', value)
+                
+                # Strip Secure flags if you are testing locally over HTTP
+                if not request.is_secure:
+                    value = re.sub(r'(?i);\s*secure', '', value)
+
+                if re.search(r'(?i)path=[^;]+', value):
+                    value = re.sub(r'(?i)path=[^;]+', f'Path={tunnel_base}', value)
                 else:
                     value += f"; Path={tunnel_base}"
 
-            # Handle HTTP -> HTTPS Redirect Loops
             elif name.lower() == 'location':
                 absolute_loc = urljoin(target_url, value)
                 parsed = urlparse(absolute_loc)
@@ -1765,6 +1765,10 @@ def tunnel(device_type, device_id, req_path):
                     value = new_loc
 
             resp_headers.append((name, value))
+
+        # Pass OPTIONS preflight headers cleanly
+        if request.method == 'OPTIONS':
+            return Response('', status=resp.status_code, headers=resp_headers)
 
         content_type = resp.headers.get('Content-Type', '').lower()
         if 'text/html' in content_type or 'javascript' in content_type or 'json' in content_type:

@@ -258,7 +258,6 @@ def load_user(user_id):
     if user: return User(user['id'], user['username'], user['role'])
     return None
 
-# ---> CRITICAL FIX: RBAC DECORATORS MUST BE DEFINED HERE BEFORE ANY ROUTES <---
 def admin_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -536,7 +535,6 @@ def is_port_open(target, port, timeout=2):
 def is_stream_active(url):
     cmd = ['ffprobe', '-rtsp_transport', 'tcp', '-v', 'error', '-i', url]
     try:
-        # REMOVED tpool.execute. Monkey-patching handles the async yield naturally.
         result = subprocess.run( 
             cmd, 
             stdout=subprocess.DEVNULL, 
@@ -573,7 +571,6 @@ def get_camlan_arp_table():
 
 def _run_ffmpeg_snapshot(stream_url):
     cmd = ['ffmpeg', '-y', '-rtsp_transport', 'tcp', '-i', stream_url, '-vframes', '1', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-']
-    # Use context manager to prevent lingering File Descriptors
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
         try:
             stdout, _ = proc.communicate(timeout=5)
@@ -776,10 +773,7 @@ def is_local_ip(ip):
 def l7_worker_loop():
     while True:
         try:
-            # Block until an item is available in the queue
             cam, cam_silenced, last_hash, check_time = L7_QUEUE.get()
-            
-            # Spawn the heavy L7 check into the bounded GreenPool
             L7_WORKER_POOL.spawn_n(
                 perform_l7_camera_check, 
                 cam, cam_silenced, last_hash, check_time
@@ -792,7 +786,6 @@ def monitor_loop():
 
     while True:
         now = time.time()
-        # Using context manager for safe DB closure inside loops
         with closing(sqlite3.connect(DB_PATH_RAM, timeout=10)) as conn:
             conn.row_factory = sqlite3.Row
             
@@ -807,7 +800,6 @@ def monitor_loop():
                 pending_db_updates = []
                 pending_mac_updates = []
 
-                # --- NEW CONCURRENT PROBE POOL ---
                 probe_pool = eventlet.greenpool.GreenPool(size=100)
 
                 def probe_network_target(dev_type, dev):
@@ -816,15 +808,13 @@ def monitor_loop():
                         return is_pingable(dev['ip'], timeout=1.5) or is_port_open(dev['ip'], 554, timeout=1.5) or is_port_open(dev['ip'], 80, timeout=1.5)
                     elif dev_type == 'switch':
                         return is_pingable(dev['ip'], timeout=timeout) or is_port_open(dev['ip'], 80, timeout=timeout)
-                    else: # NVR
+                    else:
                         return is_pingable(dev['ip'], timeout=1.5) or is_port_open(dev['ip'], 80, timeout=1.5)
 
-                # Map all devices to the GreenPool to execute pings simultaneously
                 switch_status = list(probe_pool.imap(lambda d: probe_network_target('switch', d), switches))
                 nvr_status = list(probe_pool.imap(lambda d: probe_network_target('nvr', d), nvrs))
                 camera_status = list(probe_pool.imap(lambda d: probe_network_target('camera', d), cameras))
 
-                # --- 1. Process Switches ---
                 for i, switch in enumerate(switches):
                     is_up = switch_status[i]
                     mac = switch.get('mac_address') or ''
@@ -838,7 +828,6 @@ def monitor_loop():
                         pending_db_updates.append((now, 'Switch', switch['name'], new_status, 'switches', switch['id']))
                     if mqtt_client and mqtt_client.is_connected(): mqtt_client.publish(f"{mqtt_prefix_global}/{switch['name']}/ping", new_status, retain=True)
 
-                # --- 2. Process NVRs ---
                 for i, nvr in enumerate(nvrs):
                     is_up = nvr_status[i]
                     new_status = 'UP' if is_up else 'DOWN'
@@ -847,7 +836,6 @@ def monitor_loop():
                         pending_db_updates.append((now, 'NVR', nvr['name'], new_status, 'nvrs', nvr['id']))
                     if mqtt_client and mqtt_client.is_connected(): mqtt_client.publish(f"{mqtt_prefix_global}/{nvr['name']}/ping", new_status, retain=True)
 
-                # --- 3. Process Cameras (With Race Condition Fix applied) ---
                 for i, cam in enumerate(cameras):
                     if camera_status[i]:
                         L7_QUEUE.put((cam, cam.get('silenced_until', 0) > now, previous_hashes.get(cam['id']), now))
@@ -859,7 +847,6 @@ def monitor_loop():
                     if cam['status'] != new_status:
                         pending_db_updates.append((now, 'Camera', cam['name'], new_status, 'cameras', cam['id']))
 
-                # --- 4. Atomic Batch Database Write ---
                 if pending_db_updates or pending_mac_updates:
                     with conn:
                         for (t_stamp, dev_type, item_name, new_status, table, item_id) in pending_db_updates:
@@ -873,7 +860,6 @@ def monitor_loop():
             except Exception as e:
                 print(f"Monitor loop iteration failed: {e}")
 
-        # Throttling
         try:
             with eventlet.Timeout(interval): force_check_event.wait()
         except eventlet.Timeout:
@@ -962,7 +948,6 @@ def api_get_history():
     """Fetches the latest 500 system event logs for the frontend."""
     try:
         with closing(get_db()) as conn:
-            # Query the logs, sorting newest first
             logs = conn.execute(
                 "SELECT * FROM event_logs ORDER BY timestamp DESC LIMIT 500"
             ).fetchall()
@@ -1669,10 +1654,6 @@ def snapshot(id):
 @login_required
 @operator_required
 def tunnel(device_type, device_id, req_path):
-    # [CRITICAL FIX 1]: Dropped the manual csrf.protect() here. 
-    # Legacy embedded UIs cannot attach Lighthouse's CSRF token to their native forms/AJAX.
-    # Flask-WTF will throw a 400 Bad Request on every login attempt if we enforce it.
-
     with closing(get_db()) as conn:
         if device_type == 'switch': device = conn.execute("SELECT ip FROM switches WHERE id = ?", (device_id,)).fetchone()
         elif device_type == 'nvr': device = conn.execute("SELECT ip FROM nvrs WHERE id = ?", (device_id,)).fetchone()
@@ -1688,28 +1669,40 @@ def tunnel(device_type, device_id, req_path):
     except socket.gaierror: return f"DNS Error: Could not resolve hostname '{device['ip']}'", 400
     except ValueError: return "Invalid IP or Hostname format.", 400
 
-# [CRITICAL FIX]: Use a Blocklist instead of an Allowlist.
-    # Embedded UI frameworks (like Vue/React) often send proprietary API headers (X-CSRF, Tokens).
-    # We must allow those to pass through to the hardware, only stripping proxy-breaking headers.
+    target_scheme = request.args.get('__scheme', 'http')
+
+    # Use a Blocklist instead of an Allowlist to permit proprietary embedded UI headers
     EXCLUDED_REQ_HEADERS = {
         'host', 'content-length', 'connection', 'cookie', 
-        'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host', 'x-real-ip'
+        'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host', 'x-real-ip',
+        'accept-encoding' 
     }
     
     clean_headers = {k: v for k, v in request.headers.items() if k.lower() not in EXCLUDED_REQ_HEADERS}
     
-    # Spoof Host to impersonate a local LAN connection
-    clean_headers['Host'] = resolved_ip
+    # 1. Spoof Host to impersonate a local LAN connection
+    clean_headers['Host'] = resolved_ip 
     
-    # [CRITICAL FIX 3]: Spoof Origin and Referer. 
-    # Strict NVRs check these headers to prevent CSRF attacks against themselves.
-    target_scheme = request.args.get('__scheme', 'http')
-    
-    if 'origin' in clean_headers:
-        clean_headers['origin'] = f"{target_scheme}://{resolved_ip}"
-    if 'referer' in clean_headers:
-        clean_headers['referer'] = f"{target_scheme}://{resolved_ip}/"
-    
+    # 2. Aggressively Spoof Origin and Referer to bypass Anti-DNS Rebinding
+    clean_headers.pop('origin', None)
+    clean_headers.pop('Origin', None)
+    clean_headers.pop('referer', None)
+    clean_headers.pop('Referer', None)
+
+    if request.headers.get('Origin'):
+        clean_headers['Origin'] = f"{target_scheme}://{resolved_ip}"
+        
+    if request.headers.get('Referer'):
+        original_ref = request.headers.get('Referer')
+        parsed_ref = urlparse(original_ref)
+        
+        # Strip the gateway's tunnel path out so the switch sees a native relative path
+        ref_path = parsed_ref.path.replace(f"/tunnel/{device_type}/{device_id}", "", 1)
+        if not ref_path.startswith('/'): 
+            ref_path = '/' + ref_path
+            
+        clean_headers['Referer'] = f"{target_scheme}://{resolved_ip}{ref_path}"
+        
     target_url = f"{target_scheme}://{resolved_ip}/{req_path.lstrip('/')}"
     
     original_args = request.args.copy()
@@ -1718,6 +1711,7 @@ def tunnel(device_type, device_id, req_path):
     
     if query_string: target_url += f"?{query_string}"
 
+    # Isolate cookies. Do not bleed the massive Flask 'session' token
     clean_cookies = {k: v for k, v in request.cookies.items() if k != 'session'}
 
     try:
@@ -1746,12 +1740,14 @@ def tunnel(device_type, device_id, req_path):
             if name.lower() in excluded_headers:
                 continue
             
+            # Force Set-Cookie paths to scope strictly to this device's tunnel
             if name.lower() == 'set-cookie':
                 if re.search(r'path=[^;]+', value, re.IGNORECASE):
                     value = re.sub(r'path=[^;]+', f'Path={tunnel_base}', value, flags=re.IGNORECASE)
                 else:
                     value += f"; Path={tunnel_base}"
 
+            # Handle HTTP -> HTTPS Redirect Loops
             elif name.lower() == 'location':
                 absolute_loc = urljoin(target_url, value)
                 parsed = urlparse(absolute_loc)

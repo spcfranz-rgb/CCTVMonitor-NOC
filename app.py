@@ -930,6 +930,21 @@ def probe_onvif_camera(ip, user, pwd):
 # FLASK SPA & JSON API ROUTES
 # ==========================================
 
+@app.route('/api/v1/history', methods=['GET'])
+@login_required
+def api_get_history():
+    """Fetches the latest 500 system event logs for the frontend."""
+    try:
+        with closing(get_db()) as conn:
+            # Query the logs, sorting newest first
+            logs = conn.execute(
+                "SELECT * FROM event_logs ORDER BY timestamp DESC LIMIT 500"
+            ).fetchall()
+            
+        return jsonify([dict(row) for row in logs])
+    except Exception as e:
+        return jsonify({'error': f"Failed to fetch logs: {str(e)}"}), 500
+
 @app.route('/api/v1/system/export', methods=['GET'])
 @login_required
 @admin_required

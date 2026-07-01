@@ -1066,32 +1066,52 @@ def import_analyze():
             return jsonify({'success': False, 'message': 'CSV appears empty or malformed.'}), 400
             
         with closing(get_db()) as conn:
-            # Map devices by Type AND Name (lowercase) for O(1) lookup
+            # Create lookups for Name-based conflict detection
             existing_switches = {row['name'].lower(): dict(row) for row in conn.execute("SELECT * FROM switches").fetchall()}
             existing_nvrs = {row['name'].lower(): dict(row) for row in conn.execute("SELECT * FROM nvrs").fetchall()}
             existing_cameras = {row['name'].lower(): dict(row) for row in conn.execute("SELECT * FROM cameras").fetchall()}
             
+            # Flatten existing data for global collision checks (IP and MAC)
+            all_existing = {**existing_switches, **existing_nvrs, **existing_cameras}
+            existing_ips = {d['ip']: d['name'] for d in all_existing.values() if d.get('ip')}
+            existing_macs = {d['mac_address'].upper(): d['name'] for d in all_existing.values() if d.get('mac_address')}
+
         analysis = {'conflicts': [], 'clean_inserts': []}
-        for row in imported_devices:
-            dev_type = row.get('dev_type')
-            name = row.get('name', '').lower()
-            
-            # Lookup based on Name
-            existing_data = None
-            if dev_type == 'switch': existing_data = existing_switches.get(name)
-            elif dev_type == 'nvr': existing_data = existing_nvrs.get(name)
-            elif dev_type == 'camera': existing_data = existing_cameras.get(name)
-            
-            if existing_data:
-                analysis['conflicts'].append({
-                    'type': dev_type, 
-                    'name': row.get('name'), 
-                    'incoming': row, 
-                    'existing': existing_data
-                })
-            else:
-                analysis['clean_inserts'].append({'type': dev_type, 'data': row})
         
+        for row in imported_devices:
+            dev_type = row.get('dev_type', '').lower()
+            name = row.get('name', '').strip().lower()
+            incoming_ip = row.get('ip', '').strip()
+            incoming_mac = row.get('mac_address', '').strip().upper()
+            
+            # Identify which table to check
+            target_map = {'switch': existing_switches, 'nvr': existing_nvrs, 'camera': existing_cameras}
+            existing_data = target_map.get(dev_type, {}).get(name)
+            
+            # Scenario A: Name Match (Conflict)
+            if existing_data:
+                # 1. Structural Conflict (Type Mismatch)
+                if existing_data.get('dev_type') and existing_data['dev_type'] != dev_type:
+                     analysis['conflicts'].append({'type': dev_type, 'name': row.get('name'), 'reason': 'Type Mismatch', 'incoming': row, 'existing': existing_data})
+                # 2. Configuration Conflict (IP Mismatch)
+                elif existing_data['ip'] != incoming_ip:
+                    analysis['conflicts'].append({'type': dev_type, 'name': row.get('name'), 'reason': 'IP Mismatch', 'incoming': row, 'existing': existing_data})
+                else:
+                    continue # Identical device, skip
+            
+            # Scenario B: Hardware Conflict (Name differs, but MAC/IP taken)
+            else:
+                mac_conflict_name = existing_macs.get(incoming_mac) if incoming_mac else None
+                ip_conflict_name = existing_ips.get(incoming_ip)
+                
+                if mac_conflict_name:
+                    analysis['conflicts'].append({'type': dev_type, 'name': row.get('name'), 'reason': f'MAC already assigned to {mac_conflict_name}', 'incoming': row, 'existing': {'name': mac_conflict_name}})
+                elif ip_conflict_name:
+                    analysis['conflicts'].append({'type': dev_type, 'name': row.get('name'), 'reason': f'IP already assigned to {ip_conflict_name}', 'incoming': row, 'existing': {'name': ip_conflict_name}})
+                else:
+                    # No collisions, clean insert
+                    analysis['clean_inserts'].append({'type': dev_type, 'data': row})
+            
         return jsonify({'success': True, 'analysis': analysis})
     except Exception as e:
         return jsonify({'success': False, 'message': f"Parse error: {str(e)}"}), 500

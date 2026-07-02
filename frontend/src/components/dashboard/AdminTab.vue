@@ -45,6 +45,18 @@ Proprietary and confidential.
               </div>
             </div>
 
+            <h6 class="text-muted border-bottom border-secondary pb-1 mb-3 mt-4">Diagnostic Engine</h6>
+            <div class="row g-2 mb-4">
+              <div class="col-12">
+                <label class="form-label small text-muted mb-1">Active Speedtest Provider</label>
+                <select class="form-select form-select-sm bg-dark text-light border-secondary" v-model="form.speedtest_provider">
+                  <option value="ookla">Ookla (Proprietary / Global Network)</option>
+                  <option value="librespeed">LibreSpeed (FOSS / Community Network)</option>
+                </select>
+                <div class="form-text text-muted" style="font-size: 0.7rem;">LibreSpeed satisfies strict FOSS compliance rules. Ookla requires adherence to their EULA.</div>
+              </div>
+            </div>
+
             <h6 class="text-muted border-bottom border-secondary pb-1 mb-3 mt-4">Automated WAN Speedtest</h6>
             <div class="row g-2 mb-4">
               <div class="col-12">
@@ -171,6 +183,9 @@ const analysisData = ref(null)
 
 onMounted(() => {
   form.value = { ...store.settings }
+  if (!form.value.speedtest_provider) {
+      form.value.speedtest_provider = 'ookla'
+  }
 })
 
 const saveSettings = async () => {

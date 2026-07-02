@@ -1170,11 +1170,11 @@ def import_apply():
     except Exception as e:
         return jsonify({'success': False, 'message': f"Merge failed: {str(e)}"}), 500
 
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
+@csrf.exempt  # CRITICAL: Prevent Flask-WTF from blocking camera POST payloads
+@app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
+@app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
 def serve_spa(path):
-    if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
-        return send_from_directory(app.static_folder, path)
+    # 1. Forward tunneled absolute paths (from camera JS)
     referer = request.headers.get('Referer')
     if referer:
         parsed_referer = urlparse(referer)
@@ -1182,7 +1182,15 @@ def serve_spa(path):
         if len(parts) >= 4 and parts[1] == 'tunnel':
             if current_user.is_authenticated and current_user.role in ['admin', 'operator']:
                 return tunnel(parts[2], parts[3], '/' + path)
-    return send_from_directory(app.static_folder, 'index.html')
+                
+    # 2. Standard SPA file serving (Only applies to GET requests)
+    if request.method == 'GET':
+        if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
+            return send_from_directory(app.static_folder, path)
+        return send_from_directory(app.static_folder, 'index.html')
+        
+    # 3. Reject other rogue non-GET requests natively
+    return jsonify({'error': 'Method not allowed on static endpoint'}), 405
     
 @app.route('/api/v1/auth/status', methods=['GET'])
 def auth_status():
@@ -1870,12 +1878,43 @@ def tunnel(device_type, device_id, req_path):
             payload = resp.content.decode('utf-8', errors='ignore')
             payload = re.sub(rf"(https?|wss?)://{re.escape(device['ip'])}(:\d+)?", f"http://{request.host}{tunnel_base}", payload)
             payload = payload.replace(device['ip'], f"{request.host}{tunnel_base}")
+            
             if 'text/html' in content_type:
                 base_tag = f'<base href="{tunnel_base}/">\n'
-                payload = re.sub(r'(<head[^>]*>)', rf'\1\n{base_tag}', payload, flags=re.IGNORECASE)
+                
+                # NEW: XHR & Fetch interceptor to fix Cookie paths and absolute paths
+                js_shim = f"""
+                <script>
+                    (function() {{
+                        const PREFIX = '{tunnel_base}';
+                        
+                        // 1. Intercept Fetch API
+                        const originalFetch = window.fetch;
+                        window.fetch = async function() {{
+                            if (typeof arguments[0] === 'string' && arguments[0].startsWith('/') && !arguments[0].startsWith(PREFIX)) {{
+                                arguments[0] = PREFIX + arguments[0];
+                            }}
+                            return originalFetch.apply(this, arguments);
+                        }};
+                        
+                        // 2. Intercept Legacy XHR
+                        const originalOpen = XMLHttpRequest.prototype.open;
+                        XMLHttpRequest.prototype.open = function(method, url) {{
+                            if (typeof url === 'string' && url.startsWith('/') && !url.startsWith(PREFIX)) {{
+                                url = PREFIX + url;
+                            }}
+                            return originalOpen.apply(this, arguments);
+                        }};
+                    }})();
+                </script>
+                """
+                payload = re.sub(r'(<head[^>]*>)', rf'\1\n{base_tag}{js_shim}', payload, flags=re.IGNORECASE)
+                
             return Response(payload, resp.status_code, resp_headers)
         else:
-            return Response(resp.iter_content(chunk_size=10*1024), resp.status_code, resp_headers)
+            # direct_passthrough=True prevents Werkzeug from buffering the stream natively
+            return Response(resp.iter_content(chunk_size=10*1024), resp.status_code, resp_headers, direct_passthrough=True)
+            
     except requests.exceptions.RequestException as e: 
         return f"Tunnel Error: {str(e)}", 502
 
@@ -1884,12 +1923,15 @@ def tunnel(device_type, device_id, req_path):
 def proxy_absolute_paths(e):
     if not current_user.is_authenticated: return jsonify({'error': 'Not Found'}), 404
     if current_user.role not in ['admin', 'operator']: return jsonify({'error': 'Forbidden'}), 403 
+    
     referer = request.headers.get('Referer')
     if referer:
         parsed_referer = urlparse(referer)
         parts = parsed_referer.path.split('/')
         if len(parts) >= 4 and parts[1] == 'tunnel':
-            return tunnel(parts[2], parts[3], request.path)
+            # Ensure the proxy absolute fallback correctly forwards the EXACT subpath 
+            return tunnel(parts[2], parts[3], request.path.lstrip('/'))
+            
     return jsonify({'error': 'Not Found'}), 404
 
 def init_logos():

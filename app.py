@@ -1773,9 +1773,9 @@ def tunnel(device_type, device_id, req_path):
     except socket.gaierror: return f"DNS Error: Could not resolve hostname '{device['ip']}'", 400
     except ValueError: return "Invalid IP or Hostname format.", 400
 
-    target_scheme = request.args.get('__scheme', 'http')
+    # FIX 1: Track scheme via cookie to prevent URL parameter pollution on the target device
+    target_scheme = request.cookies.get(f't_scheme_{device_type}_{device_id}', 'http')
 
-    # Allow proprietary embedded UI headers through
     EXCLUDED_REQ_HEADERS = {
         'host', 'content-length', 'connection', 'cookie', 
         'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host', 'x-real-ip',
@@ -1785,7 +1785,19 @@ def tunnel(device_type, device_id, req_path):
     clean_headers = {k: v for k, v in request.headers.items() if k.lower() not in EXCLUDED_REQ_HEADERS}
     clean_headers['Host'] = resolved_ip 
     
-    # Aggressively Spoof Origin and Referer
+    # FIX 2: Pass raw cookies to avoid Python 'requests' mangling legacy embedded cookie formats
+    raw_cookie = request.headers.get('Cookie')
+    if raw_cookie:
+        cookies_list = []
+        for c in raw_cookie.split(';'):
+            c = c.strip()
+            # Strip both the primary session AND our internal proxy scheme tracker
+            if not c.startswith('lighthouse_session=') and not c.startswith('t_scheme_'):
+                cookies_list.append(c)
+        if cookies_list:
+            clean_headers['Cookie'] = '; '.join(cookies_list)
+
+    # FIX 3: Aggressively limit Origin/Referer spoofing to ONLY the base URL
     clean_headers.pop('origin', None)
     clean_headers.pop('Origin', None)
     clean_headers.pop('referer', None)
@@ -1795,22 +1807,13 @@ def tunnel(device_type, device_id, req_path):
         clean_headers['Origin'] = f"{target_scheme}://{resolved_ip}"
         
     if request.headers.get('Referer'):
-        original_ref = request.headers.get('Referer')
-        parsed_ref = urlparse(original_ref)
-        ref_path = parsed_ref.path.replace(f"/tunnel/{device_type}/{device_id}", "", 1)
-        if not ref_path.startswith('/'): 
-            ref_path = '/' + ref_path
-        clean_headers['Referer'] = f"{target_scheme}://{resolved_ip}{ref_path}"
+        clean_headers['Referer'] = f"{target_scheme}://{resolved_ip}/"
         
     target_url = f"{target_scheme}://{resolved_ip}/{req_path.lstrip('/')}"
     
-    # [FIX]: Safely extract query parameters preserving array values for Vue apps
-    original_args = [(k, v) for k, v in request.args.items(multi=True) if k != '__scheme']
-    query_string = urlencode(original_args)
-    if query_string: target_url += f"?{query_string}"
-
-    # [FIX]: Scrub our newly named Flask session, allowing the device's native cookies through
-    clean_cookies = {k: v for k, v in request.cookies.items() if k != 'lighthouse_session'}
+    # Append actual query parameters without injecting our own
+    if request.query_string:
+        target_url += f"?{request.query_string.decode('utf-8')}"
 
     try:
         resp = requests.request(
@@ -1818,7 +1821,6 @@ def tunnel(device_type, device_id, req_path):
             url=target_url, 
             headers=clean_headers, 
             data=request.get_data(), 
-            cookies=clean_cookies,
             allow_redirects=False, 
             stream=True, 
             timeout=10, 
@@ -1839,13 +1841,9 @@ def tunnel(device_type, device_id, req_path):
                 continue
             
             if name.lower() == 'set-cookie':
-                # Strip hardcoded Domain constraints the device might try to set
                 value = re.sub(r'(?i);\s*domain=[^;]+', '', value)
-                
-                # Strip Secure flags if you are testing locally over HTTP
                 if not request.is_secure:
                     value = re.sub(r'(?i);\s*secure', '', value)
-
                 if re.search(r'(?i)path=[^;]+', value):
                     value = re.sub(r'(?i)path=[^;]+', f'Path={tunnel_base}', value)
                 else:
@@ -1856,39 +1854,33 @@ def tunnel(device_type, device_id, req_path):
                 parsed = urlparse(absolute_loc)
                 
                 if parsed.hostname in [device['ip'], resolved_ip]:
-                    new_loc = f"{tunnel_base}{parsed.path}"
-                    
-                    params = []
+                    # If the switch forces HTTPS via redirect, store it in a cookie instead of the URL
                     if parsed.scheme == 'https' and target_scheme == 'http':
-                        params.append('__scheme=https')
-                        
-                    if parsed.query: params.append(parsed.query)
-                    if params: new_loc += "?" + "&".join(params)
+                        resp_headers.append(('Set-Cookie', f't_scheme_{device_type}_{device_id}=https; Path={tunnel_base}; SameSite=Lax'))
                     
+                    new_loc = f"{tunnel_base}{parsed.path}"
+                    if parsed.query: new_loc += "?" + parsed.query
                     value = new_loc
 
             resp_headers.append((name, value))
 
-        # Pass OPTIONS preflight headers cleanly
         if request.method == 'OPTIONS':
             return Response('', status=resp.status_code, headers=resp_headers)
 
         content_type = resp.headers.get('Content-Type', '').lower()
         if 'text/html' in content_type or 'javascript' in content_type or 'json' in content_type:
             payload = resp.content.decode('utf-8', errors='ignore')
+            
             payload = re.sub(rf"(https?|wss?)://{re.escape(device['ip'])}(:\d+)?", f"http://{request.host}{tunnel_base}", payload)
             payload = payload.replace(device['ip'], f"{request.host}{tunnel_base}")
             
             if 'text/html' in content_type:
                 base_tag = f'<base href="{tunnel_base}/">\n'
                 
-                # NEW: XHR & Fetch interceptor to fix Cookie paths and absolute paths
                 js_shim = f"""
                 <script>
                     (function() {{
                         const PREFIX = '{tunnel_base}';
-                        
-                        // 1. Intercept Fetch API
                         const originalFetch = window.fetch;
                         window.fetch = async function() {{
                             if (typeof arguments[0] === 'string' && arguments[0].startsWith('/') && !arguments[0].startsWith(PREFIX)) {{
@@ -1896,8 +1888,6 @@ def tunnel(device_type, device_id, req_path):
                             }}
                             return originalFetch.apply(this, arguments);
                         }};
-                        
-                        // 2. Intercept Legacy XHR
                         const originalOpen = XMLHttpRequest.prototype.open;
                         XMLHttpRequest.prototype.open = function(method, url) {{
                             if (typeof url === 'string' && url.startsWith('/') && !url.startsWith(PREFIX)) {{
@@ -1912,12 +1902,10 @@ def tunnel(device_type, device_id, req_path):
                 
             return Response(payload, resp.status_code, resp_headers)
         else:
-            # direct_passthrough=True prevents Werkzeug from buffering the stream natively
             return Response(resp.iter_content(chunk_size=10*1024), resp.status_code, resp_headers, direct_passthrough=True)
             
     except requests.exceptions.RequestException as e: 
         return f"Tunnel Error: {str(e)}", 502
-
 @csrf.exempt
 @app.errorhandler(404)
 def proxy_absolute_paths(e):

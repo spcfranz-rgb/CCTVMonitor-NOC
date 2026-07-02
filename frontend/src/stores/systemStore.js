@@ -1,3 +1,11 @@
+/*
+ * Copyright (c) 2026 Timothy Franz. All Rights Reserved.
+ *
+ * This file is part of Project Lighthouse.
+ * Unauthorized copying of this file, via any medium, is strictly prohibited.
+ * Proprietary and confidential.
+ */
+
 import { defineStore } from 'pinia'
 import { io } from 'socket.io-client'
 import axios from 'axios'

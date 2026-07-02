@@ -1,3 +1,11 @@
+<!--
+Copyright (c) 2026 Timothy Franz. All Rights Reserved.
+
+This file is part of Project Lighthouse.
+Unauthorized copying of this file, via any medium, is strictly prohibited.
+Proprietary and confidential.
+-->
+
 <template>
   <div class="card h-100 shadow-sm border-secondary">
     <div class="card-header bg-dark border-secondary">

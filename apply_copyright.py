@@ -75,7 +75,7 @@ def inject_header(file_path):
 
 def main():
     target_dirs = ['.', 'frontend', 'mosquitto']
-    ignore_dirs = ['node_modules', '.git', '__pycache__', 'dist']
+    ignore_dirs = ['node_modules', '.git', '__pycache__', 'dist', '.github']
 
     for d in target_dirs:
         base_path = Path(d)

@@ -12,14 +12,14 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout:v4
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0 # Fetches full history
 
       - name: Set up Python
-        uses: actions/setup-python:v5
+        uses: actions/setup-python@v5
         with:
-          python-python: '3.11'
+          python-version: '3.11' # Changed from python-python to python-version for accuracy
 
       - name: Execute Copyright Script
         run: |

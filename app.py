@@ -339,6 +339,19 @@ def init_db():
         except sqlite3.OperationalError: pass
         try: cursor.execute("ALTER TABLE cameras ADD COLUMN mac_address TEXT DEFAULT ''")
         except sqlite3.OperationalError: pass
+        try:
+            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_host', '')")
+            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_port', '587')")
+            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_user', '')")
+            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_pass', '')")
+            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_target', '')")
+        except sqlite3.OperationalError: pass
+        try:
+            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st_interval', '0')")
+            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st_alert_dl', '0')")
+            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st_alert_ul', '0')")
+            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st_alert_ping', '0')")
+        except sqlite3.OperationalError: pass
         
         cursor.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT, role TEXT)")
         
@@ -1725,6 +1738,7 @@ def run_speedtest():
                     servers = fb_data.get('servers', []) if fb_data else []
                     if servers: err_msg += " | Available Nearby Servers: " + ", ".join([f"{s['name']} ({s['location']})" for s in servers[:3]])
                 except Exception: pass
+                
                 socketio.emit('speedtest_result', {'success': False, 'error': err_msg}, to=sid)
         except Exception as e: socketio.emit('speedtest_result', {'success': False, 'error': str(e)}, to=sid)
     eventlet.spawn(execute_test)

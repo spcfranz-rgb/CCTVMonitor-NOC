@@ -103,6 +103,11 @@ const toggleSilence = async (device) => {
     await axios.post('/api/v1/devices/silence', { type: singularType.value, id: device.id, hours })
     device.is_silenced = !device.is_silenced
     store.addToast(`Silence updated for ${device.name}`)
+    
+    // FIX: If a switch was modified, instantly pull the fresh SQL JOIN to update child camera icons
+    if (singularType.value === 'switch') {
+      await store.fetchSystemData()
+    }
   } catch(e) {
     store.addToast('Failed to update silence', 'danger')
   } finally {
@@ -110,7 +115,6 @@ const toggleSilence = async (device) => {
   }
 }
 
-// NEW: Handled natively in the component
 const deleteDevice = async (device) => {
   if(!confirm(`Are you sure you want to permanently delete ${device.name}?`)) return;
   try {

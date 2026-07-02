@@ -4,7 +4,6 @@
 # Unauthorized copying of this file, via any medium, is strictly prohibited.
 # Proprietary and confidential.
 
-# Monkey patching must occur immediately after env vars but before standard libs
 import struct
 import select
 import eventlet

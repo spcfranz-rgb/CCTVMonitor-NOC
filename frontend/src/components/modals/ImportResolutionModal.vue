@@ -63,9 +63,8 @@
                         <div>Type: {{ conflict.existing.manufacturer || 'N/A' }}</div>
                       </td>
                       <td>
-                      <td>
                         <div v-if="conflict.resolution === 'overwrite'">
-                          <input type="text" class="form-control form-control-sm bg-dark text-light border-secondary mb-1" 
+                          <input type="text" class="form-control form-control-sm bg-dark text-light border-secondary mb-1"
                                  v-model="conflict.incoming.name" placeholder="Name">
                           <input type="text" class="form-control form-control-sm bg-dark text-light border-secondary" 
                                  v-model="conflict.incoming.ip" placeholder="IP Address">

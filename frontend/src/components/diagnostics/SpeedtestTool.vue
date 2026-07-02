@@ -9,7 +9,7 @@ Proprietary and confidential.
 <template>
   <div class="card shadow-sm border-secondary h-100">
     <div class="card-header bg-dark border-secondary d-flex justify-content-between align-items-center">
-      <h5 class="mb-0">WAN Bandwidth (Ookla Native)</h5>
+      <h5 class="mb-0">WAN Bandwidth ({{ store.settings.speedtest_provider === 'librespeed' ? 'LibreSpeed' : 'Ookla' }})</h5>
       
       <button v-if="canRun" class="btn btn-sm btn-outline-primary fw-bold" @click="runTest" :disabled="loading">Run Test</button>
     </div>

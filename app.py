@@ -4,17 +4,21 @@
 # Unauthorized copying of this file, via any medium, is strictly prohibited.
 # Proprietary and confidential.
 
-# CRITICAL: Disable Eventlet's custom DNS resolver which clashes with Docker networks
+import os
+
+# CRITICAL FIX 1: Disable Eventlet's custom DNS resolver to prevent Docker DNS timeouts
 os.environ['EVENTLET_NO_GREENDNS'] = 'yes'
-# CRITICAL: Monkey patching must occur before ANY other imports
+
+# CRITICAL FIX 2: Set eventlet thread pool size safely via env var
+os.environ['EVENTLET_THREADPOOL_SIZE'] = '100'
+
+# Monkey patching must occur immediately after env vars but before standard libs
 import struct
 import select
 import eventlet
 eventlet.monkey_patch()
 import eventlet.tpool
 
-eventlet.tpool.set_num_threads(100)
-import os
 import sys
 import time
 import socket

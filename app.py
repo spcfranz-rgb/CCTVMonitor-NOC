@@ -4,6 +4,8 @@
 # Unauthorized copying of this file, via any medium, is strictly prohibited.
 # Proprietary and confidential.
 
+# CRITICAL: Disable Eventlet's custom DNS resolver which clashes with Docker networks
+os.environ['EVENTLET_NO_GREENDNS'] = 'yes'
 # CRITICAL: Monkey patching must occur before ANY other imports
 import struct
 import select

@@ -82,7 +82,6 @@ app.config['SESSION_COOKIE_NAME'] = 'lighthouse_session'
 @app.after_request
 def apply_csp(response):
     # CRITICAL FIX: Do not apply strict CSP to tunneled legacy device UI.
-    # Legacy hardware relies heavily on inline scripts, framesets, and unsafe-eval.
     if request.path.startswith('/tunnel/'):
         return response
 
@@ -177,6 +176,7 @@ if KEYCLOAK_URL and KEYCLOAK_REALM:
         server_metadata_url=f"{KEYCLOAK_URL.rstrip('/')}/realms/{KEYCLOAK_REALM}/.well-known/openid-configuration",
         client_kwargs={'scope': 'openid profile email'}
     )
+
 # ==========================================
 # DATABASE & CONNECTION POOLING
 # ==========================================
@@ -185,7 +185,6 @@ DB_PATH_RAM = '/app/data_ram/cctv.db'
 force_check_event = Event()
 
 class RequestDBWrapper:
-    """Wraps the SQLite connection to prevent premature closure during a Flask request lifecycle."""
     def __init__(self, conn):
         self._conn = conn
         
@@ -198,16 +197,12 @@ class RequestDBWrapper:
     def __exit__(self, exc_type, exc_val, exc_tb):
         return self._conn.__exit__(exc_type, exc_val, exc_tb)
         
-    def close(self):
-        # Ignore premature closes from `contextlib.closing` in routes
-        pass 
+    def close(self): pass 
         
     def force_close(self):
-        # Called only by Flask teardown
         self._conn.close()
 
 def get_db():
-    """Returns a request-scoped connection if in a Flask request, otherwise a standalone connection."""
     if has_app_context():
         if 'db' not in g:
             os.makedirs(os.path.dirname(DB_PATH_RAM), exist_ok=True)
@@ -218,7 +213,6 @@ def get_db():
             g.db = RequestDBWrapper(conn)
         return g.db
         
-    # Fallback for background Eventlet threads (manual close required)
     conn = sqlite3.connect(DB_PATH_RAM, check_same_thread=False, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
@@ -235,7 +229,6 @@ def log_audit(device_type, device_name, status):
         conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)",
                      (time.time(), device_type, device_name, status))
         conn.commit()
-        # Clean up ONLY if this was spawned by an Eventlet background thread
         if not has_app_context():
             conn.close() 
     except Exception: pass
@@ -671,8 +664,10 @@ def perform_l7_camera_check(cam, cam_silenced, last_hash, check_time):
             })
             
             if 'DOWN' in new_status or 'ERR' in new_status:
-                if not mqtt_client or not mqtt_client.is_connected():
-                    send_failover_email(f"FAILOVER ALERT: {cam_name} is {new_status}", f"The Camera '{cam_name}' transitioned to a critical state ({new_status}).\n\nThis alert was routed via SMTP because the primary MQTT connection to Zabbix is currently offline.")
+                # SECURITY FIX: Do not fire SMTP failovers for deliberately silenced hardware
+                if 'Silenced' not in new_status:
+                    if not mqtt_client or not mqtt_client.is_connected():
+                        send_failover_email(f"FAILOVER ALERT: {cam_name} is {new_status}", f"The Camera '{cam_name}' transitioned to a critical state ({new_status}).\n\nThis alert was routed via SMTP because the primary MQTT connection to Zabbix is currently offline.")
 
 def send_failover_email(subject, body):
     with closing(get_db()) as conn:
@@ -787,7 +782,6 @@ def monitor_loop():
 
     while True:
         now = time.time()
-        # Capture current ARP state once per loop
         current_arp_map = {entry['mac']: entry['ip'] for entry in get_camlan_arp_table()}
         
         with closing(sqlite3.connect(DB_PATH_RAM, timeout=10)) as conn:
@@ -801,9 +795,12 @@ def monitor_loop():
                 nvrs = [dict(r) for r in conn.execute("SELECT * FROM nvrs").fetchall()]
                 cameras = [dict(r) for r in conn.execute("SELECT * FROM cameras").fetchall()]
                 
+                # NEW: Map switch IDs to their silence expiration to inherit silence for attached cameras
+                switch_silence_map = {s['id']: s.get('silenced_until', 0) for s in switches}
+
                 pending_db_updates = []
                 pending_mac_updates = []
-                pending_ip_updates = [] # Stores (new_ip, dev_id, table_name)
+                pending_ip_updates = [] 
 
                 probe_pool = eventlet.greenpool.GreenPool(size=100)
 
@@ -822,7 +819,6 @@ def monitor_loop():
 
                 # Process Switches
                 for i, switch in enumerate(switches):
-                    # Drift detection
                     if switch.get('mac_address') and switch['mac_address'] in current_arp_map:
                         if current_arp_map[switch['mac_address']] != switch['ip']:
                             pending_ip_updates.append((current_arp_map[switch['mac_address']], switch['id'], 'switches'))
@@ -842,7 +838,6 @@ def monitor_loop():
 
                 # Process NVRs
                 for i, nvr in enumerate(nvrs):
-                    # Drift detection
                     if nvr.get('mac_address') and nvr['mac_address'] in current_arp_map:
                         if current_arp_map[nvr['mac_address']] != nvr['ip']:
                             pending_ip_updates.append((current_arp_map[nvr['mac_address']], nvr['id'], 'nvrs'))
@@ -857,44 +852,44 @@ def monitor_loop():
 
                 # Process Cameras
                 for i, cam in enumerate(cameras):
-                    # --- ADDED: Auto-populate missing MAC addresses ---
                     mac = cam.get('mac_address') or ''
                     if not mac and is_local_ip(cam['ip']):
                         fetched_mac = get_mac_address(cam['ip'])
                         if fetched_mac: 
                             pending_mac_updates.append(('cameras', fetched_mac.upper(), cam['id']))
-                    # Drift detection
+                    
                     if cam.get('mac_address') and cam['mac_address'] in current_arp_map:
                         if current_arp_map[cam['mac_address']] != cam['ip']:
                             pending_ip_updates.append((current_arp_map[cam['mac_address']], cam['id'], 'cameras'))
                             cam['ip'] = current_arp_map[cam['mac_address']]
 
+                    # FIX: INHERIT SILENCE FROM UPLINK SWITCH
+                    switch_silenced_until = switch_silence_map.get(cam.get('switch_id'), 0)
+                    is_cam_silenced = (cam.get('silenced_until', 0) > now) or (switch_silenced_until > now)
+
                     if camera_status[i]:
-                        L7_QUEUE.put((cam, cam.get('silenced_until', 0) > now, previous_hashes.get(cam['id']), now))
+                        # Pass the inherited boolean into the L7 worker queue
+                        L7_QUEUE.put((cam, is_cam_silenced, previous_hashes.get(cam['id']), now))
                         new_status = cam['status'] 
                     else:
                         new_status = 'DOWN (Offline)'
-                        if cam.get('silenced_until', 0) > now: new_status = 'DOWN (Silenced)'
+                        if is_cam_silenced: new_status = 'DOWN (Silenced)'
 
                     if cam['status'] != new_status:
                         pending_db_updates.append((now, 'Camera', cam['name'], new_status, 'cameras', cam['id']))
 
                 # Apply Database Updates
                 with conn:
-                    # Execute IP drifts
                     for (new_ip, item_id, table) in pending_ip_updates:
                         conn.execute(f"UPDATE {table} SET ip = ? WHERE id = ?", (new_ip, item_id))
                     
-                    # Update logs and status
                     for (t_stamp, dev_type, item_name, new_status, table, item_id) in pending_db_updates:
                         conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (t_stamp, dev_type, item_name, new_status))
                         conn.execute(f"UPDATE {table} SET status = ? WHERE id = ?", (new_status, item_id))
                     
-                    # Update missing MAC addresses
                     for (table, mac, item_id) in pending_mac_updates:
                         conn.execute(f"UPDATE {table} SET mac_address = ? WHERE id = ?", (mac, item_id))
                     
-                    # UI Notifications
                     for update in pending_db_updates:
                         socketio.emit('state_change', {'type': update[4], 'id': update[5], 'status': update[3]})
 
@@ -988,7 +983,7 @@ def probe_onvif_camera(ip, user, pwd):
 @admin_required
 def refresh_mac():
     data = request.get_json()
-    device_type = data.get('type') # 'switches', 'nvrs', or 'cameras'
+    device_type = data.get('type') 
     device_id = data.get('id')
     
     if device_type not in ['switches', 'nvrs', 'cameras']:
@@ -999,13 +994,12 @@ def refresh_mac():
     
     if not device: return jsonify({'success': False, 'message': 'Device not found'}), 404
     
-    # Force ARP entry creation via quick UDP probe
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(0.5)
         s.sendto(b'\x00', (device['ip'], 53535))
         s.close()
-        eventlet.sleep(0.5) # Wait briefly for ARP reply
+        eventlet.sleep(0.5) 
     except Exception: pass
     
     mac = get_mac_address(device['ip'])
@@ -1022,7 +1016,6 @@ def refresh_mac():
 @app.route('/api/v1/history', methods=['GET'])
 @login_required
 def api_get_history():
-    """Fetches the latest 500 system event logs for the frontend."""
     try:
         with closing(get_db()) as conn:
             logs = conn.execute(
@@ -1051,7 +1044,6 @@ def export_config():
     cw.writerows(devices)
     return Response(si.getvalue(), mimetype='text/csv', headers={'Content-Disposition': 'attachment;filename=lighthouse_config.csv'})
 
-# Revised strategy for app.py
 @app.route('/api/v1/system/import/analyze', methods=['POST'])
 @login_required
 @admin_required
@@ -1066,13 +1058,13 @@ def import_analyze():
             return jsonify({'success': False, 'message': 'CSV appears empty or malformed.'}), 400
             
         with closing(get_db()) as conn:
-            # Create lookups for Name-based conflict detection
             existing_switches = {row['name'].lower(): dict(row) for row in conn.execute("SELECT * FROM switches").fetchall()}
             existing_nvrs = {row['name'].lower(): dict(row) for row in conn.execute("SELECT * FROM nvrs").fetchall()}
             existing_cameras = {row['name'].lower(): dict(row) for row in conn.execute("SELECT * FROM cameras").fetchall()}
             
-            # Flatten existing data for global collision checks (IP and MAC)
             all_existing = {**existing_switches, **existing_nvrs, **existing_cameras}
+            
+            # FIX: Store the full device dictionary for context, not just the name
             existing_ips = {d['ip']: d for d in all_existing.values() if d.get('ip')}
             existing_macs = {d['mac_address'].upper(): d for d in all_existing.values() if d.get('mac_address')}
 
@@ -1084,22 +1076,16 @@ def import_analyze():
             incoming_ip = row.get('ip', '').strip()
             incoming_mac = row.get('mac_address', '').strip().upper()
             
-            # Identify which table to check
             target_map = {'switch': existing_switches, 'nvr': existing_nvrs, 'camera': existing_cameras}
             existing_data = target_map.get(dev_type, {}).get(name)
             
-            # Scenario A: Name Match (Conflict)
             if existing_data:
-                # 1. Structural Conflict (Type Mismatch)
                 if existing_data.get('dev_type') and existing_data['dev_type'] != dev_type:
                      analysis['conflicts'].append({'type': dev_type, 'name': row.get('name'), 'reason': 'Type Mismatch', 'incoming': row, 'existing': existing_data})
-                # 2. Configuration Conflict (IP Mismatch)
                 elif existing_data['ip'] != incoming_ip:
                     analysis['conflicts'].append({'type': dev_type, 'name': row.get('name'), 'reason': 'IP Mismatch', 'incoming': row, 'existing': existing_data})
                 else:
-                    continue # Identical device, skip
-            
-            # Scenario B: Hardware Conflict (Name differs, but MAC/IP taken)
+                    continue 
             else:
                 mac_conflict_dev = existing_macs.get(incoming_mac) if incoming_mac else None
                 ip_conflict_dev = existing_ips.get(incoming_ip)
@@ -1121,7 +1107,6 @@ def import_analyze():
                         'existing': ip_conflict_dev
                     })
                 else:
-                    # No collisions, clean insert
                     analysis['clean_inserts'].append({'type': dev_type, 'data': row})
             
         return jsonify({'success': True, 'analysis': analysis})
@@ -1139,14 +1124,11 @@ def import_apply():
     try:
         with closing(get_db()) as conn:
             with conn:
-                # Helper to map CSV types to Database tables
                 type_to_table = {'switch': 'switches', 'nvr': 'nvrs', 'camera': 'cameras'}
                 
-                # Apply new inserts
                 for item in clean_inserts:
                     dev = item['data']
                     table = type_to_table[item['type']]
-                    # Logic: Insert new record. We let SQLite auto-increment handle the new ID.
                     if item['type'] == 'camera':
                         pwd = encrypt_pwd(dev.get('password', ''))
                         conn.execute(f"INSERT INTO {table} (name, ip, stream_url, manufacturer, username, password, mac_address) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1155,13 +1137,11 @@ def import_apply():
                         conn.execute(f"INSERT INTO {table} (name, ip, mac_address) VALUES (?, ?, ?)",
                                      (dev['name'], dev['ip'], dev.get('mac_address', '')))
 
-                # Apply conflict resolutions
                 for item in resolved_conflicts:
                     if item.get('resolution') == 'overwrite':
                         dev = item['imported']
                         table = type_to_table[item['type']]
                         
-                        # Find the existing ID by Name
                         existing = conn.execute(f"SELECT id FROM {table} WHERE name = ?", (dev['name'],)).fetchone()
                         if not existing: continue
                         
@@ -1182,11 +1162,10 @@ def import_apply():
     except Exception as e:
         return jsonify({'success': False, 'message': f"Merge failed: {str(e)}"}), 500
 
-@csrf.exempt  # CRITICAL: Prevent Flask-WTF from blocking camera POST payloads
+@csrf.exempt 
 @app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
 @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
 def serve_spa(path):
-    # 1. Forward tunneled absolute paths (from camera JS)
     referer = request.headers.get('Referer')
     if referer:
         parsed_referer = urlparse(referer)
@@ -1195,13 +1174,11 @@ def serve_spa(path):
             if current_user.is_authenticated and current_user.role in ['admin', 'operator']:
                 return tunnel(parts[2], parts[3], '/' + path)
                 
-    # 2. Standard SPA file serving (Only applies to GET requests)
     if request.method == 'GET':
         if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
             return send_from_directory(app.static_folder, path)
         return send_from_directory(app.static_folder, 'index.html')
         
-    # 3. Reject other rogue non-GET requests natively
     return jsonify({'error': 'Method not allowed on static endpoint'}), 405
     
 @app.route('/api/v1/auth/status', methods=['GET'])
@@ -1805,7 +1782,6 @@ def tunnel(device_type, device_id, req_path):
         cookies_list = []
         for c in raw_cookie.split(';'):
             c = c.strip()
-            # Strip both the primary session AND our internal proxy scheme tracker
             if not c.startswith('lighthouse_session=') and not c.startswith('t_scheme_'):
                 cookies_list.append(c)
         if cookies_list:
@@ -1825,7 +1801,6 @@ def tunnel(device_type, device_id, req_path):
         
     target_url = f"{target_scheme}://{resolved_ip}/{req_path.lstrip('/')}"
     
-    # Append actual query parameters without injecting our own
     if request.query_string:
         target_url += f"?{request.query_string.decode('utf-8')}"
 
@@ -1868,7 +1843,6 @@ def tunnel(device_type, device_id, req_path):
                 parsed = urlparse(absolute_loc)
                 
                 if parsed.hostname in [device['ip'], resolved_ip]:
-                    # If the switch forces HTTPS via redirect, store it in a cookie instead of the URL
                     if parsed.scheme == 'https' and target_scheme == 'http':
                         resp_headers.append(('Set-Cookie', f't_scheme_{device_type}_{device_id}=https; Path={tunnel_base}; SameSite=Lax'))
                     
@@ -1920,6 +1894,7 @@ def tunnel(device_type, device_id, req_path):
             
     except requests.exceptions.RequestException as e: 
         return f"Tunnel Error: {str(e)}", 502
+
 @csrf.exempt
 @app.errorhandler(404)
 def proxy_absolute_paths(e):
@@ -1931,7 +1906,6 @@ def proxy_absolute_paths(e):
         parsed_referer = urlparse(referer)
         parts = parsed_referer.path.split('/')
         if len(parts) >= 4 and parts[1] == 'tunnel':
-            # Ensure the proxy absolute fallback correctly forwards the EXACT subpath 
             return tunnel(parts[2], parts[3], request.path.lstrip('/'))
             
     return jsonify({'error': 'Not Found'}), 404
@@ -1967,7 +1941,6 @@ try:
     init_logos()
     os.makedirs('/app/data', exist_ok=True)
     
-    # Initialize hardened MQTT Client
     mqtt_user = os.environ.get('MQTT_USER')
     mqtt_pass = os.environ.get('MQTT_PASS')
     mqtt_client = mqtt.Client()

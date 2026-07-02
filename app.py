@@ -715,10 +715,17 @@ class LibreSpeedRunner(SpeedtestProvider):
             process = eventlet.tpool.execute(subprocess.run, cmd, capture_output=True, text=True, timeout=60)
             if process.returncode != 0: return {"error": "LibreSpeed failed", "details": process.stderr}
             data = json.loads(process.stdout)
+            
+            # Sanitize open-source raw floats to prevent UI overflow
+            raw_ping = float(data.get("ping", 0))
+            # Failsafe: if speedtest-cli bugs out and returns microseconds instead of ms
+            if raw_ping > 10000: 
+                raw_ping = raw_ping / 1000 
+                
             return {
-                "download": data.get("download", 0) / 1000000, 
-                "upload": data.get("upload", 0) / 1000000,
-                "ping": data.get("ping", 0),
+                "download": round(data.get("download", 0) / 1000000, 2), 
+                "upload": round(data.get("upload", 0) / 1000000, 2),
+                "ping": round(raw_ping, 1),
                 "isp": data.get("client", {}).get("isp", "Unknown"),
                 "server": f"{data.get('server', {}).get('name', 'Unknown')} ({data.get('server', {}).get('sponsor', 'Unknown')})",
                 "provider": "librespeed"

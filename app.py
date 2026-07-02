@@ -1073,8 +1073,8 @@ def import_analyze():
             
             # Flatten existing data for global collision checks (IP and MAC)
             all_existing = {**existing_switches, **existing_nvrs, **existing_cameras}
-            existing_ips = {d['ip']: d['name'] for d in all_existing.values() if d.get('ip')}
-            existing_macs = {d['mac_address'].upper(): d['name'] for d in all_existing.values() if d.get('mac_address')}
+            existing_ips = {d['ip']: d for d in all_existing.values() if d.get('ip')}
+            existing_macs = {d['mac_address'].upper(): d for d in all_existing.values() if d.get('mac_address')}
 
         analysis = {'conflicts': [], 'clean_inserts': []}
         
@@ -1101,13 +1101,25 @@ def import_analyze():
             
             # Scenario B: Hardware Conflict (Name differs, but MAC/IP taken)
             else:
-                mac_conflict_name = existing_macs.get(incoming_mac) if incoming_mac else None
-                ip_conflict_name = existing_ips.get(incoming_ip)
+                mac_conflict_dev = existing_macs.get(incoming_mac) if incoming_mac else None
+                ip_conflict_dev = existing_ips.get(incoming_ip)
                 
-                if mac_conflict_name:
-                    analysis['conflicts'].append({'type': dev_type, 'name': row.get('name'), 'reason': f'MAC already assigned to {mac_conflict_name}', 'incoming': row, 'existing': {'name': mac_conflict_name}})
-                elif ip_conflict_name:
-                    analysis['conflicts'].append({'type': dev_type, 'name': row.get('name'), 'reason': f'IP already assigned to {ip_conflict_name}', 'incoming': row, 'existing': {'name': ip_conflict_name}})
+                if mac_conflict_dev:
+                    analysis['conflicts'].append({
+                        'type': dev_type, 
+                        'name': row.get('name'), 
+                        'reason': f"MAC already assigned to {mac_conflict_dev['name']}", 
+                        'incoming': row, 
+                        'existing': mac_conflict_dev
+                    })
+                elif ip_conflict_dev:
+                    analysis['conflicts'].append({
+                        'type': dev_type, 
+                        'name': row.get('name'), 
+                        'reason': f"IP already assigned to {ip_conflict_dev['name']}", 
+                        'incoming': row, 
+                        'existing': ip_conflict_dev
+                    })
                 else:
                     # No collisions, clean insert
                     analysis['clean_inserts'].append({'type': dev_type, 'data': row})

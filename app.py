@@ -1773,8 +1773,10 @@ def tunnel(device_type, device_id, req_path):
     except socket.gaierror: return f"DNS Error: Could not resolve hostname '{device['ip']}'", 400
     except ValueError: return "Invalid IP or Hostname format.", 400
 
-    # FIX 1: Track scheme via cookie to prevent URL parameter pollution on the target device
-    target_scheme = request.cookies.get(f't_scheme_{device_type}_{device_id}', 'http')
+    # FIX 1: Track scheme via cookie to prevent URL parameter pollution.
+    # SECURITY: Strictly whitelist the scheme to prevent SSRF/URL Injection via forged cookies.
+    raw_scheme = request.cookies.get(f't_scheme_{device_type}_{device_id}', 'http').lower()
+    target_scheme = 'https' if raw_scheme == 'https' else 'http'
 
     EXCLUDED_REQ_HEADERS = {
         'host', 'content-length', 'connection', 'cookie', 

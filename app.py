@@ -345,19 +345,6 @@ def init_db():
         except sqlite3.OperationalError: pass
         try: cursor.execute("ALTER TABLE cameras ADD COLUMN mac_address TEXT DEFAULT ''")
         except sqlite3.OperationalError: pass
-        try:
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_host', '')")
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_port', '587')")
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_user', '')")
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_pass', '')")
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_target', '')")
-        except sqlite3.OperationalError: pass
-        try:
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st_interval', '0')")
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st_alert_dl', '0')")
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st_alert_ul', '0')")
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st_alert_ping', '0')")
-        except sqlite3.OperationalError: pass
         
         cursor.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT, role TEXT)")
         
@@ -377,7 +364,8 @@ def init_db():
                 ('st_interval', '0'),
                 ('st_alert_dl', '0'),
                 ('st_alert_ul', '0'),
-                ('st_alert_ping', '0')
+                ('st_alert_ping', '0'),
+                ('speedtest_provider', 'ookla')
             ]
             cursor.executemany("INSERT INTO settings (key, value) VALUES (?, ?)", settings)
             
@@ -724,12 +712,21 @@ def automated_speedtest_loop():
             st_interval = float(settings_dict.get('st_interval', 0))
             if st_interval > 0 and (time.time() - last_run) >= (st_interval * 3600):
                 last_run = time.time()
+                provider = settings_dict.get('speedtest_provider', 'ookla')
+                
                 env = os.environ.copy()
                 env['HOME'] = '/app/data_ram'
-                cmd = ['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json']
                 primary_ip = get_primary_ip()
-                if primary_ip: cmd.extend(['-i', primary_ip])
+                
+                if provider == 'librespeed':
+                    cmd = ['librespeed-cli', '--telemetry-level', 'disabled', '--json']
+                    if primary_ip: cmd.extend(['--local-ip', primary_ip])
+                else:
+                    cmd = ['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json']
+                    if primary_ip: cmd.extend(['-i', primary_ip])
+
                 process = eventlet.tpool.execute(subprocess.run, cmd, capture_output=True, text=True, timeout=60, env=env)
+                
                 if process.returncode == 0:
                     data = None
                     for line in reversed(process.stdout.splitlines()):
@@ -737,11 +734,21 @@ def automated_speedtest_loop():
                         if line.startswith('{') and line.endswith('}'):
                             try: data = json.loads(line); break
                             except Exception: continue
-                    if data and 'download' in data:
-                        download = round((data['download']['bandwidth'] * 8) / 1000000, 2)
-                        upload = round((data['upload']['bandwidth'] * 8) / 1000000, 2)
-                        ping = round(data['ping']['latency'], 1)
-                        server_string = f"{data.get('server', {}).get('name', 'Unknown')} ({data.get('server', {}).get('location', 'Unknown')})"
+                    
+                    if data:
+                        if provider == 'librespeed':
+                            download = round(float(data.get('download', 0)), 2)
+                            upload = round(float(data.get('upload', 0)), 2)
+                            ping = round(float(data.get('ping', 0)), 1)
+                            server_string = f"{data.get('server', {}).get('name', 'Unknown')}"
+                            isp = data.get('client', {}).get('isp', 'Unknown')
+                        else:
+                            download = round((data['download']['bandwidth'] * 8) / 1000000, 2)
+                            upload = round((data['upload']['bandwidth'] * 8) / 1000000, 2)
+                            ping = round(data['ping']['latency'], 1)
+                            server_string = f"{data.get('server', {}).get('name', 'Unknown')} ({data.get('server', {}).get('location', 'Unknown')})"
+                            isp = data.get('isp', 'Unknown')
+                        
                         now = time.time()
                         
                         if mqtt_client and mqtt_client.is_connected():
@@ -770,12 +777,12 @@ def automated_speedtest_loop():
                             else:
                                 if mqtt_client and mqtt_client.is_connected(): mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_alert", "OK", retain=True)
                                 
-                            st_data = json.dumps({'download': download, 'upload': upload, 'ping': ping, 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
+                            st_data = json.dumps({'download': download, 'upload': upload, 'ping': ping, 'isp': isp, 'server': server_string, 'timestamp': now})
                             conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('latest_speedtest', ?)", (st_data,))
                             conn.commit()
                             
                         force_disk_sync()
-                        socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
+                        socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': isp, 'server': server_string, 'timestamp': now})
         except Exception as e: print(f"Automated speedtest loop error: {e}")
 
 def is_local_ip(ip):
@@ -1518,7 +1525,7 @@ def api_update_settings():
     data = request.get_json()
     with closing(get_db()) as conn:
         for key, val in data.items():
-            if key in ['mqtt_broker', 'mqtt_port', 'mqtt_prefix', 'check_interval', 'inactive_timeout', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass', 'smtp_target', 'st_interval', 'st_alert_dl', 'st_alert_ul', 'st_alert_ping']:
+            if key in ['mqtt_broker', 'mqtt_port', 'mqtt_prefix', 'check_interval', 'inactive_timeout', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass', 'smtp_target', 'st_interval', 'st_alert_dl', 'st_alert_ul', 'st_alert_ping', 'speedtest_provider']:
                 conn.execute("UPDATE settings SET value = ? WHERE key = ?", (str(val), key))
         conn.commit()
     log_audit('User', current_user.username, 'Updated Global Gateway Settings') 
@@ -1699,52 +1706,77 @@ def run_speedtest():
     log_audit('User', current_user.username, 'Initiated WAN Speedtest (Manual)')
     def execute_test():
         try:
+            with closing(get_db()) as conn:
+                stgs = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
+            provider = stgs.get('speedtest_provider', 'ookla')
+            
             env = os.environ.copy()
             env['HOME'] = '/app/data_ram'
-            cmd = ['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json']
             primary_ip = get_primary_ip()
-            if primary_ip: cmd.extend(['-i', primary_ip])
+            
+            if provider == 'librespeed':
+                cmd = ['librespeed-cli', '--telemetry-level', 'disabled', '--json']
+                if primary_ip: cmd.extend(['--local-ip', primary_ip])
+            else:
+                cmd = ['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json']
+                if primary_ip: cmd.extend(['-i', primary_ip])
+                
             process = eventlet.tpool.execute(subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60, env=env)
-            data = None
-            for line in reversed(process.stdout.splitlines()):
-                line = line.strip()
-                if line.startswith('{') and line.endswith('}'):
-                    try: data = json.loads(line); break
-                    except Exception: continue
-            if process.returncode == 0 and data and 'download' in data:
-                download = round((data['download']['bandwidth'] * 8) / 1000000, 2)
-                upload = round((data['upload']['bandwidth'] * 8) / 1000000, 2)
-                ping = round(data['ping']['latency'], 1)
-                server_string = f"{data.get('server', {}).get('name', 'Unknown')} ({data.get('server', {}).get('location', 'Unknown')})"
-                now = time.time()
-                try:
-                    with closing(get_db()) as conn:
-                        log_status = f"DL: {download} Mbps | UL: {upload} Mbps | Ping: {ping} ms"
-                        conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Speedtest (Manual)', log_status))
-                        st_data = json.dumps({'download': download, 'upload': upload, 'ping': ping, 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
-                        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('latest_speedtest', ?)", (st_data,))
-                        conn.commit()
-                    force_disk_sync()
-                except Exception as e: print(f"DB Error saving speedtest: {e}")
-                socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now}, to=sid)
+            
+            if process.returncode == 0:
+                data = None
+                for line in reversed(process.stdout.splitlines()):
+                    line = line.strip()
+                    if line.startswith('{') and line.endswith('}'):
+                        try: data = json.loads(line); break
+                        except Exception: continue
+                        
+                if data:
+                    if provider == 'librespeed':
+                        download = round(float(data.get('download', 0)), 2)
+                        upload = round(float(data.get('upload', 0)), 2)
+                        ping = round(float(data.get('ping', 0)), 1)
+                        server_string = f"{data.get('server', {}).get('name', 'Unknown')}"
+                        isp = data.get('client', {}).get('isp', 'Unknown')
+                    else:
+                        download = round((data['download']['bandwidth'] * 8) / 1000000, 2)
+                        upload = round((data['upload']['bandwidth'] * 8) / 1000000, 2)
+                        ping = round(data['ping']['latency'], 1)
+                        server_string = f"{data.get('server', {}).get('name', 'Unknown')} ({data.get('server', {}).get('location', 'Unknown')})"
+                        isp = data.get('isp', 'Unknown')
+                        
+                    now = time.time()
+                    try:
+                        with closing(get_db()) as conn:
+                            log_status = f"DL: {download} Mbps | UL: {upload} Mbps | Ping: {ping} ms"
+                            conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Speedtest (Manual)', log_status))
+                            st_data = json.dumps({'download': download, 'upload': upload, 'ping': ping, 'isp': isp, 'server': server_string, 'timestamp': now})
+                            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('latest_speedtest', ?)", (st_data,))
+                            conn.commit()
+                        force_disk_sync()
+                    except Exception as e: print(f"DB Error saving speedtest: {e}")
+                    socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': isp, 'server': server_string, 'timestamp': now}, to=sid)
             else: 
                 err_msg = "Unknown execution error."
-                if data and 'error' in data: err_msg = data['error']
-                elif process.stderr: err_msg = process.stderr.strip()
-                try:
-                    fallback_cmd = ['speedtest', '--accept-license', '--accept-gdpr', '-L', '-f', 'json']
-                    if primary_ip: fallback_cmd.extend(['-i', primary_ip])
-                    fallback = eventlet.tpool.execute(subprocess.run, fallback_cmd, capture_output=True, text=True, timeout=10, env=env)
-                    fb_data = None
-                    for line in reversed(fallback.stdout.splitlines()):
-                        line = line.strip()
-                        if line.startswith('{') and line.endswith('}'):
-                            try: fb_data = json.loads(line); break
-                            except Exception: continue
-                    servers = fb_data.get('servers', []) if fb_data else []
-                    if servers: err_msg += " | Available Nearby Servers: " + ", ".join([f"{s['name']} ({s['location']})" for s in servers[:3]])
-                except Exception: pass
+                if process.stderr: err_msg = process.stderr.strip()
+                elif process.stdout: err_msg = process.stdout.strip()
                 
+                # Ookla specific fallback if JSON failed but it's installed
+                if provider != 'librespeed':
+                    try:
+                        fallback_cmd = ['speedtest', '--accept-license', '--accept-gdpr', '-L', '-f', 'json']
+                        if primary_ip: fallback_cmd.extend(['-i', primary_ip])
+                        fallback = eventlet.tpool.execute(subprocess.run, fallback_cmd, capture_output=True, text=True, timeout=10, env=env)
+                        fb_data = None
+                        for line in reversed(fallback.stdout.splitlines()):
+                            line = line.strip()
+                            if line.startswith('{') and line.endswith('}'):
+                                try: fb_data = json.loads(line); break
+                                except Exception: continue
+                        servers = fb_data.get('servers', []) if fb_data else []
+                        if servers: err_msg += " | Available Nearby Servers: " + ", ".join([f"{s['name']} ({s['location']})" for s in servers[:3]])
+                    except Exception: pass
+                    
                 socketio.emit('speedtest_result', {'success': False, 'error': err_msg}, to=sid)
         except Exception as e: socketio.emit('speedtest_result', {'success': False, 'error': str(e)}, to=sid)
     eventlet.spawn(execute_test)

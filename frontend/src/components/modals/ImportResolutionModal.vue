@@ -59,9 +59,10 @@
                     <tr>
                       <td class="ps-3 border-end border-secondary text-muted small">
                         <div>Name: {{ conflict.existing.name }}</div>
-                        <div>IP: {{ conflict.existing.ip }}</div>
-                        <div>Type: {{ conflict.existing.manufacturer }}</div>
+                        <div>IP: {{ conflict.existing.ip || 'N/A' }}</div>
+                        <div>Type: {{ conflict.existing.manufacturer || 'N/A' }}</div>
                       </td>
+                      <td>
                       <td>
                         <div v-if="conflict.resolution === 'overwrite'">
                           <input type="text" class="form-control form-control-sm bg-dark text-light border-secondary mb-1" 

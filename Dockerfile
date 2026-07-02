@@ -36,8 +36,10 @@ RUN apt-get update && \
     ARCH=$(dpkg --print-architecture) && \
     if [ "$ARCH" = "arm64" ]; then \
         wget -qO- https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz | tar xvz -C /usr/local/bin speedtest; \
+        wget -qO- https://github.com/librespeed/speedtest-cli/releases/download/v1.0.10/librespeed-cli_1.0.10_linux_arm64.tar.gz | tar xvz -C /usr/local/bin librespeed-cli; \
     elif [ "$ARCH" = "amd64" ]; then \
         wget -qO- https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz | tar xvz -C /usr/local/bin speedtest; \
+        wget -qO- https://github.com/librespeed/speedtest-cli/releases/download/v1.0.10/librespeed-cli_1.0.10_linux_amd64.tar.gz | tar xvz -C /usr/local/bin librespeed-cli; \
     else \
         echo "Unsupported architecture" && exit 1; \
     fi && \
@@ -52,7 +54,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy backend application code
 COPY . .
-
 # CRITICAL: Ingest the compiled SPA from Stage 1 into Flask's static directory
 COPY --from=frontend-builder /vue-app/dist /app/static
 

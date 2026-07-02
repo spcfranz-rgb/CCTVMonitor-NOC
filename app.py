@@ -4,14 +4,12 @@
 # Unauthorized copying of this file, via any medium, is strictly prohibited.
 # Proprietary and confidential.
 
-# CRITICAL: Monkey patching must occur before ANY other imports
 import struct
 import select
 import eventlet
 eventlet.monkey_patch()
 import eventlet.tpool
 
-eventlet.tpool.set_num_threads(100)
 import os
 import sys
 import time
@@ -29,6 +27,8 @@ import atexit
 import signal
 import smtplib
 import secrets
+import platform
+import urllib.request
 from contextlib import closing
 from email.message import EmailMessage
 from datetime import datetime
@@ -87,7 +87,6 @@ app.config['SESSION_COOKIE_NAME'] = 'lighthouse_session'
 # --- SECURITY: STRICT AIR-GAPPED CSP ---
 @app.after_request
 def apply_csp(response):
-    # CRITICAL FIX: Do not apply strict CSP to tunneled legacy device UI.
     if request.path.startswith('/tunnel/'):
         return response
 
@@ -345,19 +344,6 @@ def init_db():
         except sqlite3.OperationalError: pass
         try: cursor.execute("ALTER TABLE cameras ADD COLUMN mac_address TEXT DEFAULT ''")
         except sqlite3.OperationalError: pass
-        try:
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_host', '')")
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_port', '587')")
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_user', '')")
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_pass', '')")
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_target', '')")
-        except sqlite3.OperationalError: pass
-        try:
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st_interval', '0')")
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st_alert_dl', '0')")
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st_alert_ul', '0')")
-            cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st_alert_ping', '0')")
-        except sqlite3.OperationalError: pass
         
         cursor.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT, role TEXT)")
         
@@ -377,7 +363,8 @@ def init_db():
                 ('st_interval', '0'),
                 ('st_alert_dl', '0'),
                 ('st_alert_ul', '0'),
-                ('st_alert_ping', '0')
+                ('st_alert_ping', '0'),
+                ('speedtest_provider', 'librespeed')
             ]
             cursor.executemany("INSERT INTO settings (key, value) VALUES (?, ?)", settings)
             
@@ -399,7 +386,7 @@ def init_db():
         conn.commit()
         conn.close()
     except sqlite3.OperationalError as e:
-        print(f"CRITICAL ERROR: Database initialization failed (Check for lingering file locks or zombie containers): {e}")
+        print(f"CRITICAL ERROR: Database initialization failed: {e}")
         raise
 
 def _perform_disk_sync():
@@ -683,7 +670,6 @@ def perform_l7_camera_check(cam, cam_silenced, last_hash, check_time):
             })
             
             if 'DOWN' in new_status or 'ERR' in new_status:
-                # SECURITY FIX: Do not fire SMTP failovers for deliberately silenced hardware
                 if 'Silenced' not in new_status:
                     if not mqtt_client or not mqtt_client.is_connected():
                         send_failover_email(f"FAILOVER ALERT: {cam_name} is {new_status}", f"The Camera '{cam_name}' transitioned to a critical state ({new_status}).\n\nThis alert was routed via SMTP because the primary MQTT connection to Zabbix is currently offline.")
@@ -711,6 +697,78 @@ def send_failover_email(subject, body):
             log_audit('System', 'Email Failover', f'Failed to send email: {str(e)}')
     eventlet.spawn_n(_send, settings)
 
+# ==========================================
+# SPEEDTEST PROVIDER PATTERN
+# ==========================================
+OOKLA_BIN_DIR = "/app/data/plugins/ookla"
+OOKLA_BIN_PATH = os.path.join(OOKLA_BIN_DIR, "speedtest")
+
+class SpeedtestProvider:
+    def run(self, primary_ip=None): raise NotImplementedError()
+
+class LibreSpeedRunner(SpeedtestProvider):
+    def run(self, primary_ip=None):
+        cmd = ["speedtest-cli", "--json"]
+        if primary_ip: cmd.extend(["--source", primary_ip])
+        try:
+            process = eventlet.tpool.execute(subprocess.run, cmd, capture_output=True, text=True, timeout=60)
+            if process.returncode != 0: return {"error": "LibreSpeed failed", "details": process.stderr}
+            data = json.loads(process.stdout)
+            
+            raw_ping = float(data.get("ping", 0))
+            
+            # Detect the hardcoded speedtest-cli failure state
+            if raw_ping >= 1800000 or raw_ping == 1800: 
+                final_ping = "Timeout"
+            else:
+                final_ping = round(raw_ping, 1)
+                
+            return {
+                "download": round(data.get("download", 0) / 1000000, 2), 
+                "upload": round(data.get("upload", 0) / 1000000, 2),
+                "ping": final_ping,
+                "isp": data.get("client", {}).get("isp", "Unknown"),
+                "server": f"{data.get('server', {}).get('name', 'Unknown')} ({data.get('server', {}).get('sponsor', 'Unknown')})",
+                "provider": "librespeed"
+            }
+        except Exception as e: return {"error": str(e)}
+
+class OoklaRunner(SpeedtestProvider):
+    def is_installed(self):
+        return os.path.isfile(OOKLA_BIN_PATH) and os.access(OOKLA_BIN_PATH, os.X_OK)
+
+    def run(self, primary_ip=None):
+        if not self.is_installed(): return {"error": "LICENSE_REQUIRED"}
+        env = os.environ.copy()
+        env['HOME'] = '/app/data_ram'
+        cmd = [OOKLA_BIN_PATH, "--accept-license", "--accept-gdpr", "-f", "json"]
+        if primary_ip: cmd.extend(['-i', primary_ip])
+        try:
+            process = eventlet.tpool.execute(subprocess.run, cmd, capture_output=True, text=True, timeout=60, env=env)
+            data = None
+            for line in reversed(process.stdout.splitlines()):
+                line = line.strip()
+                if line.startswith('{') and line.endswith('}'):
+                    try: data = json.loads(line); break
+                    except Exception: continue
+            if data and 'download' in data:
+                return {
+                    "download": round((data['download']['bandwidth'] * 8) / 1000000, 2),
+                    "upload": round((data['upload']['bandwidth'] * 8) / 1000000, 2),
+                    "ping": round(data['ping']['latency'], 1),
+                    "isp": data.get('isp', 'Unknown'),
+                    "server": f"{data.get('server', {}).get('name', 'Unknown')} ({data.get('server', {}).get('location', 'Unknown')})",
+                    "provider": "ookla"
+                }
+            return {"error": "Ookla failed to return valid JSON", "details": process.stderr}
+        except Exception as e: return {"error": str(e)}
+
+class SpeedtestRegistry:
+    @staticmethod
+    def get_runner(provider_type):
+        if provider_type == 'ookla': return OoklaRunner()
+        return LibreSpeedRunner()
+
 def automated_speedtest_loop():
     global mqtt_client, mqtt_prefix_global
     eventlet.sleep(30)
@@ -722,60 +780,53 @@ def automated_speedtest_loop():
                 settings_dict = {row['key']: row['value'] for row in conn.execute("SELECT key, value FROM settings").fetchall()}
             
             st_interval = float(settings_dict.get('st_interval', 0))
+            st_provider = settings_dict.get('speedtest_provider', 'librespeed')
+
             if st_interval > 0 and (time.time() - last_run) >= (st_interval * 3600):
                 last_run = time.time()
-                env = os.environ.copy()
-                env['HOME'] = '/app/data_ram'
-                cmd = ['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json']
-                primary_ip = get_primary_ip()
-                if primary_ip: cmd.extend(['-i', primary_ip])
-                process = eventlet.tpool.execute(subprocess.run, cmd, capture_output=True, text=True, timeout=60, env=env)
-                if process.returncode == 0:
-                    data = None
-                    for line in reversed(process.stdout.splitlines()):
-                        line = line.strip()
-                        if line.startswith('{') and line.endswith('}'):
-                            try: data = json.loads(line); break
-                            except Exception: continue
-                    if data and 'download' in data:
-                        download = round((data['download']['bandwidth'] * 8) / 1000000, 2)
-                        upload = round((data['upload']['bandwidth'] * 8) / 1000000, 2)
-                        ping = round(data['ping']['latency'], 1)
-                        server_string = f"{data.get('server', {}).get('name', 'Unknown')} ({data.get('server', {}).get('location', 'Unknown')})"
-                        now = time.time()
+                runner = SpeedtestRegistry.get_runner(st_provider)
+                
+                # Halt auto-tests if Ookla was selected but EULA not accepted
+                if isinstance(runner, OoklaRunner) and not runner.is_installed(): continue
+                
+                result = runner.run(primary_ip=get_primary_ip())
+                if "error" not in result:
+                    download, upload, ping = result['download'], result['upload'], result['ping']
+                    now = time.time()
+                    
+                    if mqtt_client and mqtt_client.is_connected():
+                        try:
+                            mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_download", str(download), retain=True)
+                            mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_upload", str(upload), retain=True)
+                            mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_ping", str(ping), retain=True)
+                        except Exception: pass
                         
-                        if mqtt_client and mqtt_client.is_connected():
-                            try:
-                                mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_download", str(download), retain=True)
-                                mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_upload", str(upload), retain=True)
-                                mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_ping", str(ping), retain=True)
-                            except Exception: pass
-                            
-                        with closing(get_db()) as conn:
-                            log_status = f"DL: {download} Mbps | UL: {upload} Mbps | Ping: {ping} ms"
-                            conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Auto-Speedtest', log_status))
-                            st_alert_dl = float(settings_dict.get('st_alert_dl', 0))
-                            st_alert_ul = float(settings_dict.get('st_alert_ul', 0))
-                            st_alert_ping = float(settings_dict.get('st_alert_ping', 0))
-                            alerts = []
-                            if st_alert_dl > 0 and download < st_alert_dl: alerts.append(f"DL {download} < {st_alert_dl} Mbps")
-                            if st_alert_ul > 0 and upload < st_alert_ul: alerts.append(f"UL {upload} < {st_alert_ul} Mbps")
-                            if st_alert_ping > 0 and ping > st_alert_ping: alerts.append(f"Ping {ping} > {st_alert_ping} ms")
-                            
-                            if alerts:
-                                alert_text = "WARNING: " + " | ".join(alerts)
-                                conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Speedtest Alert', alert_text))
-                                if mqtt_client and mqtt_client.is_connected(): mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_alert", alert_text, retain=True)
-                                else: send_failover_email("WAN Auto-Speedtest Alert", f"The automated gateway speed test breached configured thresholds:\n\n{alert_text}\n\nTarget Server: {server_string}")
-                            else:
-                                if mqtt_client and mqtt_client.is_connected(): mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_alert", "OK", retain=True)
-                                
-                            st_data = json.dumps({'download': download, 'upload': upload, 'ping': ping, 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
-                            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('latest_speedtest', ?)", (st_data,))
-                            conn.commit()
-                            
-                        force_disk_sync()
-                        socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
+                    with closing(get_db()) as conn:
+                        log_status = f"DL: {download} Mbps | UL: {upload} Mbps | Ping: {ping} ms ({result['provider']})"
+                        conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Auto-Speedtest', log_status))
+                        
+                        st_alert_dl = float(settings_dict.get('st_alert_dl', 0))
+                        st_alert_ul = float(settings_dict.get('st_alert_ul', 0))
+                        st_alert_ping = float(settings_dict.get('st_alert_ping', 0))
+                        alerts = []
+                        if st_alert_dl > 0 and download < st_alert_dl: alerts.append(f"DL {download} < {st_alert_dl} Mbps")
+                        if st_alert_ul > 0 and upload < st_alert_ul: alerts.append(f"UL {upload} < {st_alert_ul} Mbps")
+                        if st_alert_ping > 0 and ping > st_alert_ping: alerts.append(f"Ping {ping} > {st_alert_ping} ms")
+                        
+                        if alerts:
+                            alert_text = "WARNING: " + " | ".join(alerts)
+                            conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Speedtest Alert', alert_text))
+                            if mqtt_client and mqtt_client.is_connected(): mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_alert", alert_text, retain=True)
+                            else: send_failover_email("WAN Auto-Speedtest Alert", f"The automated gateway speed test breached configured thresholds:\n\n{alert_text}\n\nTarget Server: {result['server']}")
+                        else:
+                            if mqtt_client and mqtt_client.is_connected(): mqtt_client.publish(f"{mqtt_prefix_global}/gateway/speedtest_alert", "OK", retain=True)
+                        
+                        st_data = json.dumps({'download': download, 'upload': upload, 'ping': ping, 'isp': result['isp'], 'server': result['server'], 'timestamp': now, 'provider': result['provider']})
+                        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('latest_speedtest', ?)", (st_data,))
+                        conn.commit()
+                        
+                    force_disk_sync()
+                    socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': result['isp'], 'server': result['server'], 'timestamp': now, 'provider': result['provider']})
         except Exception as e: print(f"Automated speedtest loop error: {e}")
 
 def is_local_ip(ip):
@@ -814,7 +865,6 @@ def monitor_loop():
                 nvrs = [dict(r) for r in conn.execute("SELECT * FROM nvrs").fetchall()]
                 cameras = [dict(r) for r in conn.execute("SELECT * FROM cameras").fetchall()]
                 
-                # NEW: Map switch IDs to their silence expiration to inherit silence for attached cameras
                 switch_silence_map = {s['id']: s.get('silenced_until', 0) for s in switches}
 
                 pending_db_updates = []
@@ -882,12 +932,10 @@ def monitor_loop():
                             pending_ip_updates.append((current_arp_map[cam['mac_address']], cam['id'], 'cameras'))
                             cam['ip'] = current_arp_map[cam['mac_address']]
 
-                    # FIX: INHERIT SILENCE FROM UPLINK SWITCH
                     switch_silenced_until = switch_silence_map.get(cam.get('switch_id'), 0)
                     is_cam_silenced = (cam.get('silenced_until', 0) > now) or (switch_silenced_until > now)
 
                     if camera_status[i]:
-                        # Pass the inherited boolean into the L7 worker queue
                         L7_QUEUE.put((cam, is_cam_silenced, previous_hashes.get(cam['id']), now))
                         new_status = cam['status'] 
                     else:
@@ -997,6 +1045,101 @@ def probe_onvif_camera(ip, user, pwd):
 # FLASK SPA & JSON API ROUTES
 # ==========================================
 
+@app.route('/api/speedtest/status', methods=['GET'])
+@login_required
+@operator_required
+def get_ookla_status():
+    runner = OoklaRunner()
+    return jsonify({"ookla_installed": runner.is_installed()})
+
+@app.route('/api/speedtest/install_ookla', methods=['POST'])
+@login_required
+@operator_required
+def install_ookla():
+    os.makedirs(OOKLA_BIN_DIR, exist_ok=True)
+    
+    # Dynamically resolve architecture for mixed edge/server deployments
+    arch = platform.machine().lower()
+    if arch in ['amd64', 'x86_64']:
+        dl_arch = 'x86_64'
+    elif arch in ['arm64', 'aarch64']:
+        dl_arch = 'aarch64'
+    else:
+        return jsonify({"status": "error", "message": f"Unsupported architecture: {arch}"}), 500
+
+    ookla_url = f"https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-{dl_arch}.tgz"
+    tar_path = os.path.join(OOKLA_BIN_DIR, "ookla.tgz")
+    
+    try:
+        # Spoof User-Agent to bypass strict CDN rules
+        headers = {'User-Agent': 'Mozilla/5.0 (Lighthouse Edge Gateway)'}
+        resp = requests.get(ookla_url, headers=headers, timeout=15, stream=True)
+        resp.raise_for_status()
+        
+        # Stream chunks to prevent RAM spiking on constrained edge hardware
+        with open(tar_path, 'wb') as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+                
+        # Offload blocking tar extraction to a background thread
+        eventlet.tpool.execute(
+            subprocess.run, 
+            ["tar", "-xzf", tar_path, "-C", OOKLA_BIN_DIR, "speedtest"], 
+            check=True, 
+            stdout=subprocess.DEVNULL
+        )
+        
+        os.chmod(OOKLA_BIN_PATH, 0o755)
+        os.remove(tar_path)
+        
+        log_audit('System', current_user.username, f'Provisioned Ookla CLI ({dl_arch})')
+        return jsonify({"status": "success", "message": "Ookla CLI installed successfully."})
+        
+    except requests.exceptions.RequestException as e:
+        return jsonify({"status": "error", "message": f"Download failed: {str(e)}"}), 502
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Extraction failed: {str(e)}"}), 500
+
+@app.route('/api/speedtest', methods=['POST'])
+@login_required
+@operator_required
+def run_speedtest_manual():
+    data = request.get_json()
+    sid = data.get('sid')
+    provider_type = data.get('provider', 'librespeed')
+    
+    # Save user preference
+    with closing(get_db()) as conn:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('speedtest_provider', ?)", (provider_type,))
+        conn.commit()
+
+    log_audit('User', current_user.username, f'Initiated WAN Speedtest ({provider_type})')
+    
+    def execute_test():
+        runner = SpeedtestRegistry.get_runner(provider_type)
+        result = runner.run(primary_ip=get_primary_ip())
+        
+        if "error" in result:
+            socketio.emit('speedtest_result', {'success': False, 'error': result['error']}, to=sid)
+        else:
+            now = time.time()
+            try:
+                with closing(get_db()) as conn:
+                    log_status = f"DL: {result['download']} Mbps | UL: {result['upload']} Mbps | Ping: {result['ping']} ms"
+                    conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Speedtest (Manual)', log_status))
+                    st_data = json.dumps({'download': result['download'], 'upload': result['upload'], 'ping': result['ping'], 'isp': result['isp'], 'server': result['server'], 'timestamp': now, 'provider': result['provider']})
+                    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('latest_speedtest', ?)", (st_data,))
+                    conn.commit()
+                force_disk_sync()
+            except Exception as e: print(f"DB Error saving speedtest: {e}")
+            
+            result['success'] = True
+            result['timestamp'] = now
+            socketio.emit('speedtest_result', result, to=sid)
+
+    eventlet.spawn(execute_test)
+    return jsonify({'status': 'running'})
+
 @app.route('/api/v1/devices/refresh_mac', methods=['POST'])
 @login_required
 @admin_required
@@ -1083,7 +1226,6 @@ def import_analyze():
             
             all_existing = {**existing_switches, **existing_nvrs, **existing_cameras}
             
-            # FIX: Store the full device dictionary for context, not just the name
             existing_ips = {d['ip']: d for d in all_existing.values() if d.get('ip')}
             existing_macs = {d['mac_address'].upper(): d for d in all_existing.values() if d.get('mac_address')}
 
@@ -1511,6 +1653,26 @@ def api_delete_user(id):
     force_disk_sync()
     return jsonify({'success': True, 'message': 'User deleted.'})
 
+@app.route('/api/v1/users/<int:id>/password', methods=['PUT'])
+@login_required
+@admin_required
+def api_update_password(id):
+    data = request.get_json()
+    new_password = data.get('password')
+    
+    if not new_password or len(new_password) < 6:
+        return jsonify({'success': False, 'message': 'Password must be at least 6 characters.'}), 400
+        
+    hashed_pwd = generate_password_hash(new_password)
+    
+    with closing(get_db()) as conn:
+        conn.execute("UPDATE users SET password = ? WHERE id = ?", (hashed_pwd, id))
+        conn.commit()
+        
+    force_disk_sync()
+    log_audit('System', current_user.username, f'Admin reset password for user ID: {id}')
+    return jsonify({'success': True, 'message': 'Password updated successfully.'})
+
 @app.route('/api/v1/settings', methods=['PUT'])
 @login_required
 @admin_required
@@ -1690,66 +1852,6 @@ def run_traceroute():
     eventlet.spawn(execute_trace)
     return jsonify({'status': 'running'})
 
-@app.route('/api/speedtest', methods=['POST'])
-@login_required
-@operator_required
-def run_speedtest():
-    data = request.get_json()
-    sid = data.get('sid')
-    log_audit('User', current_user.username, 'Initiated WAN Speedtest (Manual)')
-    def execute_test():
-        try:
-            env = os.environ.copy()
-            env['HOME'] = '/app/data_ram'
-            cmd = ['speedtest', '--accept-license', '--accept-gdpr', '-f', 'json']
-            primary_ip = get_primary_ip()
-            if primary_ip: cmd.extend(['-i', primary_ip])
-            process = eventlet.tpool.execute(subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60, env=env)
-            data = None
-            for line in reversed(process.stdout.splitlines()):
-                line = line.strip()
-                if line.startswith('{') and line.endswith('}'):
-                    try: data = json.loads(line); break
-                    except Exception: continue
-            if process.returncode == 0 and data and 'download' in data:
-                download = round((data['download']['bandwidth'] * 8) / 1000000, 2)
-                upload = round((data['upload']['bandwidth'] * 8) / 1000000, 2)
-                ping = round(data['ping']['latency'], 1)
-                server_string = f"{data.get('server', {}).get('name', 'Unknown')} ({data.get('server', {}).get('location', 'Unknown')})"
-                now = time.time()
-                try:
-                    with closing(get_db()) as conn:
-                        log_status = f"DL: {download} Mbps | UL: {upload} Mbps | Ping: {ping} ms"
-                        conn.execute("INSERT INTO event_logs (timestamp, device_type, device_name, status) VALUES (?, ?, ?, ?)", (now, 'Gateway', 'Speedtest (Manual)', log_status))
-                        st_data = json.dumps({'download': download, 'upload': upload, 'ping': ping, 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now})
-                        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('latest_speedtest', ?)", (st_data,))
-                        conn.commit()
-                    force_disk_sync()
-                except Exception as e: print(f"DB Error saving speedtest: {e}")
-                socketio.emit('speedtest_result', {'success': True, 'download': f"{download} Mbps", 'upload': f"{upload} Mbps", 'ping': f"{ping} ms", 'isp': data.get('isp', 'Unknown'), 'server': server_string, 'timestamp': now}, to=sid)
-            else: 
-                err_msg = "Unknown execution error."
-                if data and 'error' in data: err_msg = data['error']
-                elif process.stderr: err_msg = process.stderr.strip()
-                try:
-                    fallback_cmd = ['speedtest', '--accept-license', '--accept-gdpr', '-L', '-f', 'json']
-                    if primary_ip: fallback_cmd.extend(['-i', primary_ip])
-                    fallback = eventlet.tpool.execute(subprocess.run, fallback_cmd, capture_output=True, text=True, timeout=10, env=env)
-                    fb_data = None
-                    for line in reversed(fallback.stdout.splitlines()):
-                        line = line.strip()
-                        if line.startswith('{') and line.endswith('}'):
-                            try: fb_data = json.loads(line); break
-                            except Exception: continue
-                    servers = fb_data.get('servers', []) if fb_data else []
-                    if servers: err_msg += " | Available Nearby Servers: " + ", ".join([f"{s['name']} ({s['location']})" for s in servers[:3]])
-                except Exception: pass
-                
-                socketio.emit('speedtest_result', {'success': False, 'error': err_msg}, to=sid)
-        except Exception as e: socketio.emit('speedtest_result', {'success': False, 'error': str(e)}, to=sid)
-    eventlet.spawn(execute_test)
-    return jsonify({'status': 'running'})
-
 @app.route('/api/snapshot/<int:id>')
 @login_required
 def snapshot(id):
@@ -1782,8 +1884,6 @@ def tunnel(device_type, device_id, req_path):
     except socket.gaierror: return f"DNS Error: Could not resolve hostname '{device['ip']}'", 400
     except ValueError: return "Invalid IP or Hostname format.", 400
 
-    # FIX 1: Track scheme via cookie to prevent URL parameter pollution.
-    # SECURITY: Strictly whitelist the scheme to prevent SSRF/URL Injection via forged cookies.
     raw_scheme = request.cookies.get(f't_scheme_{device_type}_{device_id}', 'http').lower()
     target_scheme = 'https' if raw_scheme == 'https' else 'http'
 
@@ -1796,7 +1896,6 @@ def tunnel(device_type, device_id, req_path):
     clean_headers = {k: v for k, v in request.headers.items() if k.lower() not in EXCLUDED_REQ_HEADERS}
     clean_headers['Host'] = resolved_ip 
     
-    # FIX 2: Pass raw cookies to avoid Python 'requests' mangling legacy embedded cookie formats
     raw_cookie = request.headers.get('Cookie')
     if raw_cookie:
         cookies_list = []
@@ -1807,7 +1906,6 @@ def tunnel(device_type, device_id, req_path):
         if cookies_list:
             clean_headers['Cookie'] = '; '.join(cookies_list)
 
-    # FIX 3: Aggressively limit Origin/Referer spoofing to ONLY the base URL
     clean_headers.pop('origin', None)
     clean_headers.pop('Origin', None)
     clean_headers.pop('referer', None)
@@ -1951,7 +2049,15 @@ def init_logos():
         return val
     LOCAL_COMPANY_LOGO = process_logo('COMPANY_LOGO_URL', 'company_logo.png')
     LOCAL_CUSTOMER_LOGO = process_logo('CUSTOMER_LOGO_URL', 'customer_logo.png')
-
+    
+@app.errorhandler(500)
+def handle_500_error(e):
+    # Ensures the Vue frontend always receives JSON, even if Python crashes
+    return jsonify({
+        "status": "error", 
+        "message": "Internal Server Error: Check gateway console logs."
+    }), 500
+    
 @app.route('/static/logos/<filename>')
 def serve_local_logo(filename):
     return send_from_directory('/app/data/logos', filename)

@@ -8,23 +8,62 @@
         </div>
         <div class="card-body bg-body-tertiary">
           <form @submit.prevent="saveSettings">
+            
             <h6 class="text-muted border-bottom border-secondary pb-1 mb-3">MQTT Broker</h6>
             <div class="row g-2 mb-4">
               <div class="col-md-8">
-                <label class="form-label small text-muted">Host</label>
+                <label class="form-label small text-muted mb-1">Host</label>
                 <input type="text" class="form-control form-control-sm bg-dark text-light border-secondary" v-model="form.mqtt_broker">
               </div>
               <div class="col-md-4">
-                <label class="form-label small text-muted">Port</label>
+                <label class="form-label small text-muted mb-1">Port</label>
                 <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary" v-model="form.mqtt_port">
               </div>
               <div class="col-12 mt-2">
-                <label class="form-label small text-muted">Topic Prefix</label>
+                <label class="form-label small text-muted mb-1">Topic Prefix</label>
                 <input type="text" class="form-control form-control-sm bg-dark text-light border-secondary" v-model="form.mqtt_prefix">
               </div>
             </div>
 
-            <h6 class="text-muted border-bottom border-secondary pb-1 mb-3">SMTP Failover (Offline Alerts)</h6>
+            <h6 class="text-muted border-bottom border-secondary pb-1 mb-3 mt-4">System Behavior</h6>
+            <div class="row g-2 mb-4">
+              <div class="col-md-6">
+                <label class="form-label small text-muted mb-1">Device Check Interval (sec)</label>
+                <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary" v-model="form.check_interval" min="15" title="How often the backend pings hardware">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label small text-muted mb-1">Idle Timeout (min)</label>
+                <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary" v-model="form.inactive_timeout" min="0" placeholder="0 = Never">
+              </div>
+            </div>
+
+            <h6 class="text-muted border-bottom border-secondary pb-1 mb-3 mt-4">Automated WAN Speedtest</h6>
+            <div class="row g-2 mb-4">
+              <div class="col-12">
+                <label class="form-label small text-muted mb-1">Test Frequency</label>
+                <select class="form-select form-select-sm bg-dark text-light border-secondary" v-model="form.st_interval">
+                  <option value="0">Disabled (Manual Only)</option>
+                  <option value="1">Every 1 Hour</option>
+                  <option value="4">Every 4 Hours</option>
+                  <option value="12">Every 12 Hours</option>
+                  <option value="24">Every 24 Hours</option>
+                </select>
+              </div>
+              <div class="col-md-4 mt-2">
+                <label class="form-label small text-muted mb-1">Min DL (Mbps)</label>
+                <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary" v-model="form.st_alert_dl" placeholder="0 = Ignore">
+              </div>
+              <div class="col-md-4 mt-2">
+                <label class="form-label small text-muted mb-1">Min UL (Mbps)</label>
+                <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary" v-model="form.st_alert_ul" placeholder="0 = Ignore">
+              </div>
+              <div class="col-md-4 mt-2">
+                <label class="form-label small text-muted mb-1">Max Ping (ms)</label>
+                <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary" v-model="form.st_alert_ping" placeholder="0 = Ignore">
+              </div>
+            </div>
+
+            <h6 class="text-muted border-bottom border-secondary pb-1 mb-3 mt-4">SMTP Failover (Offline Alerts)</h6>
             <div class="row g-2 mb-4">
               <div class="col-md-8">
                 <input type="text" class="form-control form-control-sm bg-dark text-light border-secondary" v-model="form.smtp_host" placeholder="smtp.gmail.com">
@@ -43,7 +82,7 @@
               </div>
             </div>
 
-            <button type="submit" class="btn btn-warning w-100 fw-bold mt-2" :disabled="saving">
+            <button type="submit" class="btn btn-warning w-100 fw-bold mt-3" :disabled="saving">
               {{ saving ? 'Saving...' : 'Apply Global Configuration' }}
             </button>
           </form>
@@ -162,20 +201,19 @@ const handleAnalyze = async (event) => {
   formData.append('file', file) 
 
   try {
-    await store.checkAuth() // Ensure CSRF token is fresh
+    await store.checkAuth() 
     const response = await axios.post('/api/v1/system/import/analyze', formData, {
       headers: { 'Content-Type': 'multipart/form-data', 'X-CSRFToken': store.csrfToken }
     })
     
     if (response.data.success) {
-      // The analysisData object will now contain 'conflicts' keyed by device name
       analysisData.value = response.data.analysis
     }
   } catch (error) {
     store.addToast(error.response?.data?.message || 'Failed to analyze CSV.', 'danger')
   } finally {
     analyzing.value = false
-    event.target.value = '' // Reset input
+    event.target.value = '' 
   }
 }
 

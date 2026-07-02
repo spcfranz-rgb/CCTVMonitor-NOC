@@ -1654,6 +1654,26 @@ def api_delete_user(id):
     force_disk_sync()
     return jsonify({'success': True, 'message': 'User deleted.'})
 
+@app.route('/api/v1/users/<int:id>/password', methods=['PUT'])
+@login_required
+@admin_required
+def api_update_password(id):
+    data = request.get_json()
+    new_password = data.get('password')
+    
+    if not new_password or len(new_password) < 6:
+        return jsonify({'success': False, 'message': 'Password must be at least 6 characters.'}), 400
+        
+    hashed_pwd = generate_password_hash(new_password)
+    
+    with closing(get_db()) as conn:
+        conn.execute("UPDATE users SET password = ? WHERE id = ?", (hashed_pwd, id))
+        conn.commit()
+        
+    force_disk_sync()
+    log_audit('System', current_user.username, f'Admin reset password for user ID: {id}')
+    return jsonify({'success': True, 'message': 'Password updated successfully.'})
+
 @app.route('/api/v1/settings', methods=['PUT'])
 @login_required
 @admin_required

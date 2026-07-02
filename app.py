@@ -29,6 +29,7 @@ import atexit
 import signal
 import smtplib
 import secrets
+import platform
 import urllib.request
 from contextlib import closing
 from email.message import EmailMessage

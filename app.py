@@ -2022,7 +2022,15 @@ def init_logos():
         return val
     LOCAL_COMPANY_LOGO = process_logo('COMPANY_LOGO_URL', 'company_logo.png')
     LOCAL_CUSTOMER_LOGO = process_logo('CUSTOMER_LOGO_URL', 'customer_logo.png')
-
+    
+@app.errorhandler(500)
+def handle_500_error(e):
+    # Ensures the Vue frontend always receives JSON, even if Python crashes
+    return jsonify({
+        "status": "error", 
+        "message": "Internal Server Error: Check gateway console logs."
+    }), 500
+    
 @app.route('/static/logos/<filename>')
 def serve_local_logo(filename):
     return send_from_directory('/app/data/logos', filename)

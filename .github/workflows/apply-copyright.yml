@@ -1,0 +1,42 @@
+name: Automated Copyright Stamping
+
+on:
+  workflow_dispatch: # Allows manual execution from the GitHub Actions tab
+
+permissions:
+  contents: write # Crucial: Allows the workflow to commit and push changes back
+
+jobs:
+  stamp-codebase:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout:v4
+        with:
+          fetch-depth: 0 # Fetches full history
+
+      - name: Set up Python
+        uses: actions/setup-python:v5
+        with:
+          python-python: '3.11'
+
+      - name: Execute Copyright Script
+        run: |
+          chmod +x apply_copyright.py
+          python apply_copyright.py
+
+      - name: Commit and Push Changes
+        run: |
+          # Configure a generic GitHub Actions bot identity
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          # Check if there are actually any unstamped files modified
+          if [ -n "$(git status --porcelain)" ]; then
+            git add .
+            git commit -m "chore: automated copyright stamping for Timothy Franz"
+            git push origin ${{ github.ref_name }}
+          else
+            echo "No files required stamping. Codebase is up to date."
+          fi

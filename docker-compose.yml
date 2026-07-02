@@ -19,24 +19,84 @@ services:
         max-file: "5"
         compress: "true"
 
+  cctv-coturn:
+    image: coturn/coturn:latest
+    container_name: lighthouse-coturn
+    restart: unless-stopped
+    network_mode: "host"
+    command: >
+      -n
+      --log-file=stdout
+      --min-port=49152
+      --max-port=65535
+      --realm=lighthouse.local
+      --user=lighthouse:lighthouse_webrtc
+      --lt-cred-mech
+      --stale-nonce
+      --no-cli
+
+  webrtc-relay:
+    image: bluenviron/mediamtx:latest
+    container_name: cctv-webrtc
+    restart: unless-stopped
+    network_mode: "host"
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+        compress: "true"
+
   cctv-dashboard:
     build: .
     container_name: lighthouse-dashboard
     restart: unless-stopped
     network_mode: "host" 
     user: root
+    
+    # CRITICAL FIX: Bypass Seccomp filters and allow massive concurrent socket pooling
     cap_add:
-      - NET_ADMIN
       - NET_RAW
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+        
     environment:
       - SECRET_KEY=${SECRET_KEY}
+      - DB_ENCRYPTION_KEY=${DB_ENCRYPTION_KEY}
       - COMPANY_LOGO_URL=${COMPANY_LOGO_URL}
       - CUSTOMER_LOGO_URL=${CUSTOMER_LOGO_URL}
       - DEFAULT_MQTT_BROKER=127.0.0.1 
       - DEFAULT_MQTT_PORT=1883
+      
+      # SSO: Authentik
       - AUTHENTIK_URL=${AUTHENTIK_URL}
       - AUTHENTIK_CLIENT_ID=${AUTHENTIK_CLIENT_ID}
       - AUTHENTIK_CLIENT_SECRET=${AUTHENTIK_CLIENT_SECRET}
+      
+      # SSO: Microsoft / Entra ID
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+      
+      # SSO: Google Workspace
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      
+      # SSO: Okta
+      - OKTA_DOMAIN=${OKTA_DOMAIN}
+      - OKTA_CLIENT_ID=${OKTA_CLIENT_ID}
+      - OKTA_CLIENT_SECRET=${OKTA_CLIENT_SECRET}
+      
+      # SSO: Keycloak
+      - KEYCLOAK_URL=${KEYCLOAK_URL}
+      - KEYCLOAK_REALM=${KEYCLOAK_REALM}
+      - KEYCLOAK_CLIENT_ID=${KEYCLOAK_CLIENT_ID}
+      - KEYCLOAK_CLIENT_SECRET=${KEYCLOAK_CLIENT_SECRET}
+      
     volumes:
       # DATA: Absolute mount for the Python backend database (Survives repo wipes)
       - /opt/cctv-data/dashboard:/app/data

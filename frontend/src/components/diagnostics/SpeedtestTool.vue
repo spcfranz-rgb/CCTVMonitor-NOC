@@ -127,18 +127,31 @@ const checkStatus = async () => {
 }
 
 const installOokla = async () => {
-  isInstalling.value = true
-  error.value = ''
+  isInstalling.value = true;
+  error.value = '';
   try {
-    await axios.post('/api/speedtest/install_ookla')
-    ooklaInstalled.value = true
-    store.addToast("Ookla Speedtest CLI installed successfully.")
+    // Ensure your CSRF token is attached. Update 'store.csrfToken' 
+    // to wherever you cache the token from /api/v1/auth/status
+    await axios.post('/api/speedtest/install_ookla', {}, {
+      headers: {
+        'X-CSRFToken': store.csrfToken 
+      }
+    });
+    
+    ooklaInstalled.value = true;
+    store.addToast("Ookla Speedtest CLI installed successfully.");
   } catch (e) {
-    error.value = "Installation failed. Check internet connectivity."
+    console.error("Installation Debug:", e.response?.data || e.message);
+    
+    if (e.response?.status === 400) {
+      error.value = "Security Error: Missing CSRF Token in request headers.";
+    } else {
+      error.value = e.response?.data?.message || "Provisioning failed. Check browser console for details.";
+    }
   } finally {
-    isInstalling.value = false
+    isInstalling.value = false;
   }
-}
+};
 
 const runTest = async () => {
   loading.value = true;

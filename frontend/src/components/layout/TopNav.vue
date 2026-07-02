@@ -1,3 +1,11 @@
+<!--
+Copyright (c) 2026 Timothy Franz. All Rights Reserved.
+
+This file is part of Project Lighthouse.
+Unauthorized copying of this file, via any medium, is strictly prohibited.
+Proprietary and confidential.
+-->
+
 <template>
   <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center mb-4 border-bottom border-secondary pb-3 gap-3">
     
